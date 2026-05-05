@@ -1,0 +1,8 @@
+mix_ping_tcp
+mix_ping_quic
+nimcache/
+nimbledeps/
+.agents/
+.codex
+nimble.paths
+nimble.develop
