@@ -1,0 +1,29 @@
+{
+    "nim.nimsuggestPath": "/home/mc2/.nimble/bin/nimsuggest",
+    "nim.timeout": 120000,
+    "nim.autoRestart": true,
+    "nim.useNimCheck": true,
+    "nim.autoCheckFile": true,
+    "nim.checkOnSave": true,
+    "nim.autoCheckProject": true,
+    "nim.nimsuggestIdleTimeout": 120000,
+    "nim.projectMapping": [
+        {
+            "projectFile": "mix_ping_tcp.nim",
+            "fileRegex": "^mix_ping_tcp\\.nim$"
+        },
+        {
+            "projectFile": "mix_ping_quic.nim",
+            "fileRegex": "^mix_ping_quic\\.nim$"
+        },
+        {
+            "projectFile": "mix_ping_tcp.nim",
+            "fileRegex": "^nimbledeps/.*\\.nim$"
+        }
+    ],
+    "nim.project": [
+        "mix_ping_tcp.nim",
+        "mix_ping_quic.nim"
+    ],
+    "nim.buildOnSave": false
+}
