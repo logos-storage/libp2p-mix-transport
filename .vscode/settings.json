@@ -25,5 +25,6 @@
         "mix_ping_tcp.nim",
         "mix_ping_quic.nim"
     ],
-    "nim.buildOnSave": false
+    "nim.buildOnSave": false,
+    "markdown-preview-enhanced.mathRenderingOption": "MathJax"
 }
