@@ -5,7 +5,11 @@ This is another document from the [[Mix Implementation]] series. In the other tw
 
 you can find a high level overview I created interactively with OpenAI Codex. This note is fully hand-crafted though.
 
+We also have a detailed illustrated example in [[Sphinx Header Processing Infographic]] with the web version available at https://link.excalidraw.com/readonly/6y7DRQlUhkkBMZScEONS.
+
 In this note we are documenting how the [Sphinx](https://cypherpunks.ca/~iang/pubs/Sphinx_Oakland09.pdf) headers are created in our current [MIX Protocol Implementation](https://github.com/vacp2p/nim-libp2p/tree/master/libp2p/protocols/mix) and how they are processed by the mix nodes in the reply path. Where handy, comments about forward processing are also included.
+
+> We are actually focusing on the $\beta$ part of the header here, but I will keep use the word "header" where convenient.
 
 The objective is to have something that illustrates the complex mechanics of maintaining the constant size of the $\beta$ elements (part of the Sphinx header) using the so called _fillers_. It should help those who are working with Sphinx implementation and want to have a reference example to "quickly" visualize how the whole machinery works. As such it can be useful also for those who already know Sphinx very well.
 
@@ -303,92 +307,6 @@ But let's focus back at $\beta$. As we will see in a moment, its size - $r(t+1)\
 ### Constructing the filler
 
 What may make construction of the filler hard to understand is that three things: construction of the filler, construction of the $\beta$, and then finally processing of $\beta$ in the forward and the reply path, all must be perfectly aligned. Moreover, because the header (and so also $\beta$) for the very first hop must contain the routing information for all the remaining hops, the header construction needs to happen in the backward direction (starting from the destination address). 
-
-When processing, at each hop $i$ the node removes its own routing information, i.e. the $(t+1)\kappa=112$ bytes, containing sequence $(A_{i+1}\,\Vert\,D_i\,\Vert\,\gamma_{i+1})$, where $A_{i+1}$ is the address of the next hop, $D_i$ is the delay for the current hop, and $\gamma_{i+1}$ is the MAC of the (encrypted) next $\beta$ (so, $\beta_{i+1}$). The tricky part is that the whole $\beta$ is encrypted and $\beta_{i+1}$ (further encrypted with $\mathcal{S}_{i+1}$) inside of it is missing the last $112$ bytes that were removed during header construction to accommodate the routing information of the **previous** hop (remember we are be going backward during header construction) while keeping the header size constant. We already know that the current node cannot just directly decrypt the whole $\beta_i$, and pad the last $112$ bytes with e.g. $\{0\}^{112}$, because this would leak the information about the message position in the mix path. Instead it makes sure that the last $112$ bytes are random. It achieves this by using its own decryption keystream (derived from its secret $s_i$) it uses to decrypt $\beta_i$. It does so, by appending $\{0\}^{112}$ **before** decrypting its own $\beta_i$. Thus, the received $\beta_i$ is:
-
-$$
-\begin{matrix}
-\beta_i \; = \ \\
-\vphantom{a}
-\end{matrix}
-\begin{array}{l}  
-(A_{i+1}\,\Vert\,D_i\,\Vert\,\gamma_{i+1}) \\
-\,\left\vert
-\begin{matrix}
-\small\;\mathcal{S}_i[0,112)  
-\end{matrix}  
-\right.  
-\end{array}
-\begin{matrix}
-\quad\Large\Vert\quad \\
-\vphantom{a}
-\end{matrix}
-\begin{array}{l}
-\mathsf{trunc}(\beta_{i+1}) \\
-\,\left\vert
-\begin{matrix}
-\small\;\mathcal{S}_i[112,576)  
-\end{matrix}  
-\right.  
-\end{array}
-$$
-
-and while decrypting it with $\mathcal{S}_i$, we first append $\{0\}^{112}$, which gives us decrypted $\beta_i$, denoted $\widetilde\beta_{i}$: 
-
-$$
-\begin{matrix}
-\widetilde\beta_i \; = \ \\
-\vphantom{a} \\
-\vphantom{a}
-\end{matrix}
-\begin{array}{l}  
-(A_{i+1}\,\Vert\,D_i\,\Vert\,\gamma_{i+1}) \\
-\,\left\vert
-\begin{matrix}  
-\small\enclose{horizontalstrike}{\mathcal{S}_i[0,112)} \\
-\small\enclose{horizontalstrike}{\mathcal{S}_i[0,112)}  
-\end{matrix}  
-\right.  
-\end{array}
-\begin{matrix}
-\quad\Large\Vert\quad \\
-\vphantom{a} \\
-\vphantom{a}
-\end{matrix}
-\begin{array}{l}  
-\mathsf{trunc}(\beta_{i+1}) \\
-\,\left\vert
-\begin{matrix}  
-\small\enclose{horizontalstrike}{\mathcal{S}_i[112,576)} \\
-\small\enclose{horizontalstrike}{\mathcal{S}_i[112,576)}  
-\end{matrix}  
-\right.  
-\end{array}
-\begin{matrix}
-\quad\Large\Vert\quad \\
-\vphantom{a} \\
-\vphantom{a}
-\end{matrix}
-\begin{array}{l}  
-\{0\}^{112} \\
-\,\left\vert
-\begin{matrix}  
-\small\vphantom{a} \\  
-\small\;\mathcal{S}_i[576,688)  
-\end{matrix}  
-\right.  
-\end{array}
-$$
-
-which is nothing more than $(\beta_i\;\Vert\;\{0\}^{112})\;\oplus\;\mathcal{S}_i[0,688)$.
-
-After XOR-ing, we are left with cleartext $(A_{i+1}\,\Vert\,D_i\,\Vert\,\gamma_{i+1})$ and encrypted $\widetilde\beta_{i+1}$:
-
-$$
-\beta_{i+1} = \mathsf{trunc}(\beta_{i+1})\;\Vert\;\mathcal{S}^0_i[576,688)
-$$
-
-This $\beta_{i+1}$ is the $\beta$ the next hop will receive and its MAC will have to match $\gamma_{i+1}$. The $\mathcal{S}^0_i[576,688)$ in the equation above, is part of the filler, and we should now at least understand it has to be carefully constructed so that each hope is able to reconstruct the next hop's $\beta$ using only its own secret. 
 
 The `filler` is pre-computed before the construction of successive $\beta$-as is even started:
 
@@ -688,7 +606,7 @@ $$
 \end{array}
 $$
 
-and after encryption:
+and after encryption $\widetilde\beta_3\;\oplus\;(\mathcal{S}_3[0,240)\;\Vert\;\{0\}^{3\times 112})$:
 
 $$
 \begin{matrix}
@@ -757,6 +675,8 @@ $$
 \end{array}
 $$
 
+Notice that in this first iteration only $(\{0\}^{94}\,\Vert\,\{0\}^{2}\,\Vert\,\mathcal{id}_{\mathsf{SURB}}\,\Vert\,\{0\}^{128})$ is encrypted and the filler is used pre-computed.
+
 **i = 2**:
 
 From $\beta_3$, we drop the last filler segment ($112$ bytes) and prepend the routing info:
@@ -824,7 +744,7 @@ $$
 \end{array}
 $$
 
-and after encrypting $\widetilde\beta_2\;\oplus\mathcal{S}_2[0,576)$:
+and after encrypting $\widetilde\beta_2\;\oplus\mathcal{S}_2[0,576)$ w:
 
 $$
 \begin{matrix}
@@ -1307,7 +1227,160 @@ All those computations are happening in the entry layer of the node that wishes 
 
 ## Processing the header
 
-Let's take a look at the processing in the reply path. It is largely identical to the forward path, only the processing at the final destination, which in case of SURB packets is the original sender, will be different.
+When processing, at each hop $i$ the node removes its own routing information, i.e. the $(t+1)\kappa=112$ bytes, containing sequence $(A_{i+1}\,\Vert\,D_i\,\Vert\,\gamma_{i+1})$, where $A_{i+1}$ is the address of the next hop, $D_i$ is the delay for the current hop, and $\gamma_{i+1}$ is the MAC of the (encrypted) next $\beta$ (so, $\beta_{i+1}$). The tricky part is that the whole $\beta$ is encrypted and $\beta_{i+1}$ (further encrypted with $\mathcal{S}_{i+1}$) inside of it is missing the last $112$ bytes that were removed during header construction to accommodate the routing information of the **previous** hop (remember we are be going backward during header construction) while keeping the header size constant. We already know that the current node cannot just directly decrypt the whole $\beta_i$, and pad the last $112$ bytes with e.g. $\{0\}^{112}$, because this would leak the information about the message position in the mix path. Instead it makes sure that the last $112$ bytes are random. It achieves this by using its own decryption keystream (derived from its secret $s_i$) it uses to decrypt $\beta_i$. It does so, by appending $\{0\}^{112}$ **before** decrypting its own $\beta_i$. Thus, for all hops except the final one, the received $\beta_i$ is:
+
+$$
+\beta_i = ((A_{i+1}\,\Vert\,D_i\,\Vert\,\gamma_{i+1})\;\Vert\;\mathsf{trunc}_{[0,464)}(\beta_{i+1}))\oplus\mathcal{S}_i[0,576)
+$$
+
+Or using our special notation:
+
+$$
+\begin{matrix}
+\beta_i \; = \ \\
+\vphantom{a}
+\end{matrix}
+\begin{array}{l}  
+(A_{i+1}\,\Vert\,D_i\,\Vert\,\gamma_{i+1}) \\
+\,\left\vert
+\begin{matrix}
+\small\;\mathcal{S}_i[0,112)  
+\end{matrix}  
+\right.  
+\end{array}
+\begin{matrix}
+\quad\Large\Vert\quad \\
+\vphantom{a}
+\end{matrix}
+\begin{array}{l}
+\mathsf{trunc}(\beta_{i+1}) \\
+\,\left\vert
+\begin{matrix}
+\small\;\mathcal{S}_i[112,576)  
+\end{matrix}  
+\right.  
+\end{array}
+$$
+
+Before decrypting $\beta_i$ using $\mathcal{S}_i$, we first append $\{0\}^{112}$ to it. Then we perform XOR operation
+using $\mathcal{S}_i[0,688)$:
+
+$$
+\begin{matrix}
+\mathcal{B}_i \; = \ \\
+\vphantom{a} \\
+\vphantom{a}
+\end{matrix}
+\begin{array}{l}  
+(A_{i+1}\,\Vert\,D_i\,\Vert\,\gamma_{i+1}) \\
+\,\left\vert
+\begin{matrix}  
+\small\enclose{horizontalstrike}{\mathcal{S}_i[0,112)} \\
+\small\enclose{horizontalstrike}{\mathcal{S}_i[0,112)}  
+\end{matrix}  
+\right.  
+\end{array}
+\begin{matrix}
+\quad\Large\Vert\quad \\
+\vphantom{a} \\
+\vphantom{a}
+\end{matrix}
+\begin{array}{l}  
+\mathsf{trunc}(\beta_{i+1}) \\
+\,\left\vert
+\begin{matrix}  
+\small\enclose{horizontalstrike}{\mathcal{S}_i[112,576)} \\
+\small\enclose{horizontalstrike}{\mathcal{S}_i[112,576)}  
+\end{matrix}  
+\right.  
+\end{array}
+\begin{matrix}
+\quad\Large\Vert\quad \\
+\vphantom{a} \\
+\vphantom{a}
+\end{matrix}
+\begin{array}{l}  
+\{0\}^{112} \\
+\,\left\vert
+\begin{matrix}  
+\small\vphantom{a} \\  
+\small\;\mathcal{S}_i[576,688)  
+\end{matrix}  
+\right.  
+\end{array}
+$$
+
+which is nothing more than $(\beta_i\;\Vert\;\{0\}^{112})\;\oplus\;\mathcal{S}_i[0,688)$:
+
+$$
+\begin{matrix}
+\mathcal{B}_i \; = \ \\
+\small\vphantom{a}
+\end{matrix}
+\begin{matrix}
+(A_{i+1}\,\Vert\,D_i\,\Vert\,\gamma_{i+1}) \\
+\small\vphantom{a}
+\end{matrix}
+\begin{matrix}
+\;\Large\Vert\; \\
+\vphantom{a}
+\end{matrix}
+\begin{matrix}
+\mathsf{trunc}(\beta_{i+1}) \\
+\small\vphantom{a}
+\end{matrix}
+\begin{matrix}
+\;\Large\Vert\; \\
+\vphantom{a}
+\end{matrix}
+\begin{array}{l}  
+\{0\}^{112} \\
+\,\left\vert
+\begin{matrix}  
+\small\;\mathcal{S}_i[576,688)  
+\end{matrix}  
+\right.  
+\end{array}
+\begin{matrix}
+\; = \; \\
+\small\vphantom{a}
+\end{matrix}
+\begin{matrix}
+(A_{i+1}\,\Vert\,D_i\,\Vert\,\gamma_{i+1}) \\
+\small\vphantom{a}
+\end{matrix}
+\begin{matrix}
+\;\Large\Vert\; \\
+\vphantom{a}
+\end{matrix}
+\begin{matrix}
+\beta_{i+1} \\
+\small\vphantom{a}
+\end{matrix}
+$$
+
+$\beta_{i+1}$ above is the $\beta$ that the next hop will receive and its MAC will have to match $\gamma_{i+1}$. The $\{0\}^{112}\;\oplus\;\mathcal{S}_i[576,688)$ in the equation above, is part of the filler, and each hop will reveal another fragment of it. On arriving at the last hop, the whole filler will be reconstructed. For example, for a 4-hop reply path, the $\beta_3$ received by the last Mix node on the path will be:
+
+$$
+\beta_3 = ((\{0\}^{94}\,\Vert\,\{0\}^{2}\,\Vert\,\mathcal{id}_{\mathsf{SURB}}\,\Vert\,\{0\}^{128})\;\oplus\;\mathcal{S}_3[0,240))\;\Vert\;\mathsf{filler}
+$$
+
+Also, here, it will be extended and XORed using $\mathcal{S}_3[0,688)$ resulting in:
+
+$$
+(\{0\}^{94}\,\Vert\,\{0\}^{2}\,\Vert\,\mathcal{id}_{\mathsf{SURB}}\,\Vert\,\{0\}^{128})\;\Vert\;(\mathsf{filler}\;\oplus\;\mathcal{S}_3[240,688))
+$$
+
+The filler part will be dropped leaving us with:
+
+$$
+(\{0\}^{94}\,\Vert\,\{0\}^{2}\,\Vert\,\mathcal{id}_{\mathsf{SURB}}\,\Vert\,\{0\}^{128})
+$$
+
+For the forward path the processing will be analogical, the only difference is that instead of $(\{0\}^{94}\,\Vert\,\{0\}^{2}\,\Vert\,\mathcal{id}_{\mathsf{SURB}}\,\Vert\,\{0\}^{128})$ in $\beta_3$ we will have $(A_\mathsf{DST}\,\Vert\,\{0\}^{2}\,\Vert\,\{0\}^{16}\,\Vert\,\{0\}^{128})$.
+
+
+Let's take a look at an example processing in the reply path. It is largely identical to the forward path, only the processing at the final destination, which in case of SURB packets is the original sender, will be different.
 
 The exit node sends the encrypted payload (with the key included in the given SURB), to the first hop on the return path. The address of the corresponding mix node is included in the SURB packet. Thus, our processing example starts at thevery fist hop - hop 0. 
 
