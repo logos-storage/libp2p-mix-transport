@@ -13,8 +13,6 @@
 import chronicles, chronos, results
 import std/[sequtils, sugar]
 import libp2p/[
-    protocols/mix,
-    protocols/mix/mix_protocol,
     protocols/ping,
     peerid,
     multiaddress,
@@ -23,25 +21,37 @@ import libp2p/[
     crypto/crypto,
     crypto/secp,
   ]
+import libp2p_mix
+import libp2p_mix/mix_protocol
 
 const NumMixNodes = 10
 
 proc createSwitch(
-    multiAddr: MultiAddress, libp2pPrivKey: Opt[SkPrivateKey] = Opt.none(SkPrivateKey)
+    multiAddr: MultiAddress,
+    rng: Rng,
+    libp2pPrivKey: Opt[SkPrivateKey] = Opt.none(SkPrivateKey),
 ): Switch =
-  var rng = newRng()
-  let skkey = libp2pPrivKey.valueOr(SkKeyPair.random(rng[]).seckey)
+  let skkey = libp2pPrivKey.valueOr(SkKeyPair.random(rng).seckey)
   let privKey = PrivateKey(scheme: Secp256k1, skkey: skkey)
-  newStandardSwitchBuilder(privKey = Opt.some(privKey), addrs = multiAddr).build()
+  SwitchBuilder
+    .new()
+    .withRng(rng)
+    .withPrivateKey(privKey)
+    .withAddress(multiAddr)
+    .withTcpTransport()
+    .withMplex()
+    .withNoise()
+    .build()
 
 proc mixPingSimulation() {.async: (raises: [Exception]).} =
-  let mixNodeInfos = MixNodeInfo.generateRandomMany(NumMixNodes)
+  let rng = newRng()
+  let mixNodeInfos = MixNodeInfo.generateRandomMany(NumMixNodes, rng)
   var switches: seq[Switch] = @[]
   var mixProtos: seq[MixProtocol] = @[]
 
   # Start switches first so wildcard listen addresses are resolved to dialable addresses.
   for nodeInfo in mixNodeInfos:
-    var switch = createSwitch(nodeInfo.multiAddr, Opt.some(nodeInfo.libp2pPrivKey))
+    var switch = createSwitch(nodeInfo.multiAddr, rng, Opt.some(nodeInfo.libp2pPrivKey))
     await switch.start()
     info "Mix node switch",
       peerId = switch.peerInfo.peerId,
@@ -81,11 +91,11 @@ proc mixPingSimulation() {.async: (raises: [Exception]).} =
     mixProtos.add(proto)
 
   # Create a destination node (not part of the mix network)
-  let destNode = createSwitch(MultiAddress.init("/ip4/0.0.0.0/tcp/0").tryGet())
+  let destNode = createSwitch(MultiAddress.init("/ip4/0.0.0.0/tcp/0").tryGet(), rng)
   defer:
     await destNode.stop()
 
-  let pingProto = Ping.new()
+  let pingProto = Ping.new(rng = rng)
   destNode.mount(pingProto)
 
   # Start destination switch after mounting Ping.
