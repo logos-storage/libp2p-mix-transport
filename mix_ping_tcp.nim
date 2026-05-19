@@ -84,8 +84,6 @@ proc mixPingSimulation() {.async: (raises: [Exception]).} =
     # Populate nodePool with all other nodes' public info
     proto.nodePool.add(resolvedInfos.includeAllExcept(nodeInfo))
 
-    # Register how to read ping responses (32 bytes exactly)
-    proto.registerDestReadBehavior(PingCodec, readExactly(32))
     switch.mount(proto)
 
     mixProtos.add(proto)
@@ -113,7 +111,11 @@ proc mixPingSimulation() {.async: (raises: [Exception]).} =
     .toConnection(
       MixDestination.init(destNode.peerInfo.peerId, destNode.peerInfo.addrs[0]),
       PingCodec,
-      MixParameters(expectReply: Opt.some(true), numSurbs: Opt.some(byte(1))),
+      MixParameters(
+        expectReply: Opt.some(true),
+        numSurbs: Opt.some(byte(1)),
+        readSpec: Opt.some(MixReadSpec(readMethod: ReadExactly, limit: 32)),
+      ),
     )
     .expect("could not build connection")
 
