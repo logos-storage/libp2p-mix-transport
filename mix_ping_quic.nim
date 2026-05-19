@@ -13,9 +13,6 @@
 import chronicles, chronos, results
 import std/[strformat, sequtils, sugar]
 import libp2p/[
-    protocols/mix,
-    protocols/mix/mix_protocol,
-    protocols/mix/curve25519,
     protocols/ping,
     peerid,
     multiaddress,
@@ -24,13 +21,16 @@ import libp2p/[
     crypto/crypto,
     crypto/secp,
   ]
+import libp2p_mix
+import libp2p_mix/mix_protocol
+import libp2p_mix/curve25519
 
 const NumMixNodes = 10
 
 proc generateLocalQuicMixNodeInfo(): MixNodeInfo =
   let
     (mixPrivKey, mixPubKey) = generateKeyPair().expect("Generate key pair error")
-    keyPair = SkKeyPair.random(newRng()[])
+    keyPair = SkKeyPair.random(newRng())
     pubKeyProto = PublicKey(scheme: Secp256k1, skkey: keyPair.pubkey)
 
   MixNodeInfo(
@@ -52,9 +52,15 @@ proc createSwitch(
     multiAddr: MultiAddress, libp2pPrivKey: Opt[SkPrivateKey] = Opt.none(SkPrivateKey)
 ): Switch =
   var rng = newRng()
-  let skkey = libp2pPrivKey.valueOr(SkKeyPair.random(rng[]).seckey)
+  let skkey = libp2pPrivKey.valueOr(SkKeyPair.random(rng).seckey)
   let privKey = PrivateKey(scheme: Secp256k1, skkey: skkey)
-  newStandardSwitchBuilder(privKey = Opt.some(privKey), addrs = multiAddr, transport = TransportType.QUIC).build()
+  SwitchBuilder
+    .new()
+    .withRng(rng)
+    .withPrivateKey(privKey)
+    .withAddress(multiAddr)
+    .withQuicTransport()
+    .build()
 
 
 proc mixPingSimulation() {.async: (raises: [Exception]).} =
@@ -109,7 +115,7 @@ proc mixPingSimulation() {.async: (raises: [Exception]).} =
   defer:
     await destNode.stop()
 
-  let pingProto = Ping.new()
+  let pingProto = Ping.new(rng = newRng())
   destNode.mount(pingProto)
 
   # Start destination switch after mounting Ping.
