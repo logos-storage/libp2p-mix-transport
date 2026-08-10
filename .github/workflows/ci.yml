@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  NIMBLE_FLAGS: "-y"
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.10"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install dependencies
+        run: |
+          nim --version
+          nimble --version
+          make setup NIMBLE_FLAGS="$NIMBLE_FLAGS"
+
+      - name: Test
+        run: make test NIMBLE_FLAGS="$NIMBLE_FLAGS"
+
+      - name: Build examples
+        run: make example NIMBLE_FLAGS="$NIMBLE_FLAGS"
