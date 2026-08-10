@@ -47,7 +47,9 @@ jobs:
             nimbledeps/bin
             nimbledeps/pkgs2
             nimbledeps/nimbledata2.json
-          key: nimble-${{ runner.os }}-2.2.10-${{ steps.mix-revision.outputs.revision }}-${{ hashFiles('libp2p_mix_transport.nimble', '.github/workflows/ci.yml') }}
+          key: nimble-${{ runner.os }}-2.2.10-${{ steps.mix-revision.outputs.revision }}-${{ hashFiles('libp2p_mix_transport.nimble') }}
+          restore-keys: |
+            nimble-${{ runner.os }}-2.2.10-${{ steps.mix-revision.outputs.revision }}-
 
       - name: Install dependencies
         run: |
