@@ -6,10 +6,8 @@ license = "MIT"
 srcDir = "mix_transport"
 skipDirs = @["examples", "tests"]
 entryPoints = @[
-  "mix_transport/libp2p_mix_transport.nim",
-  "tests/test_all.nim",
-  "examples/mix_ping_tcp.nim",
-  "examples/mix_ping_quic.nim",
+  "mix_transport/libp2p_mix_transport.nim", "tests/test_all.nim",
+  "examples/mix_ping_tcp.nim", "examples/mix_ping_quic.nim",
 ]
 
 requires "nim >= 2.2.4"

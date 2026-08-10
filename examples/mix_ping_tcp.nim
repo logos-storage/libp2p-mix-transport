@@ -12,15 +12,9 @@
 
 import chronicles, chronos, results
 import std/[sequtils, sugar]
-import libp2p/[
-    protocols/ping,
-    peerid,
-    multiaddress,
-    switch,
-    builders,
-    crypto/crypto,
-    crypto/secp,
-  ]
+import
+  libp2p/
+    [protocols/ping, peerid, multiaddress, switch, builders, crypto/crypto, crypto/secp]
 import libp2p_mix
 import libp2p_mix/mix_protocol
 
@@ -59,7 +53,7 @@ proc mixPingSimulation() {.async: (raises: [Exception]).} =
       listenAddrs = switch.peerInfo.listenAddrs
 
     switches.add(switch)
-  
+
   defer:
     await switches.mapIt(it.stop()).allFutures()
 
@@ -73,7 +67,7 @@ proc mixPingSimulation() {.async: (raises: [Exception]).} =
         nodeInfo.libp2pPubKey,
         nodeInfo.libp2pPrivKey,
       )
-  
+
   # Mount Mix protocols using the resolved, dialable node addresses.
   for i, nodeInfo in resolvedInfos:
     var switch = switches[i]
