@@ -4,8 +4,9 @@
 
 import chronos, results
 import libp2p_mix
+import ./libp2p_mix_transport/wire
 
-const MixTransportCodec* = "/libp2p/mix-transport/1.0.0"
+export wire
 
 type MixTransport* = ref object
   mix: MixProtocol
@@ -30,7 +31,9 @@ proc newMixTransport*(mix: MixProtocol): MixTransport =
   doAssert not mix.isNil, "MixProtocol must not be nil"
   MixTransport(mix: mix)
 
-proc start*(self: MixTransport): Future[Result[void, string]] {.async: (raises: []).} =
+proc start*(
+    self: MixTransport
+): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
   if self.started:
     return ok()
 
@@ -54,7 +57,7 @@ proc start*(self: MixTransport): Future[Result[void, string]] {.async: (raises: 
   self.started = true
   ok()
 
-proc stop*(self: MixTransport): Future[void] {.async: (raises: []).} =
+proc stop*(self: MixTransport): Future[void] {.async: (raises: [CancelledError]).} =
   if not self.started:
     return
 
