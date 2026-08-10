@@ -29,6 +29,25 @@ jobs:
           nim-version: "2.2.10"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Resolve Mix revision
+        id: mix-revision
+        run: |
+          revision="$(git ls-remote \
+            https://github.com/logos-co/nim-libp2p-mix.git \
+            refs/heads/feat/mix-transport | cut -f1)"
+          test -n "$revision"
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Nimble dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.nimble/pkgcache
+            nimbledeps/bin
+            nimbledeps/pkgs2
+            nimbledeps/nimbledata2.json
+          key: nimble-${{ runner.os }}-2.2.10-${{ steps.mix-revision.outputs.revision }}-${{ hashFiles('libp2p_mix_transport.nimble', '.github/workflows/ci.yml') }}
+
       - name: Install dependencies
         run: |
           nim --version
