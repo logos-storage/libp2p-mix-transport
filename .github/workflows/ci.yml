@@ -36,6 +36,7 @@ jobs:
             https://github.com/logos-co/nim-libp2p-mix.git \
             refs/heads/feat/mix-transport | cut -f1)"
           test -n "$revision"
+          echo "Mix revision: $revision"
           echo "revision=$revision" >> "$GITHUB_OUTPUT"
 
       - name: Cache Nimble dependencies
