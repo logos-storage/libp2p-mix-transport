@@ -1,6 +1,7 @@
-.PHONY: all setup test example format clean
+.PHONY: all setup test example format clean clean-all clean-nimble-cache clean-nimbledeps
 
 NIMBLE_FLAGS ?=
+NIMBLE_DIR ?= $(HOME)/.nimble
 
 # Choosenim puts a proxy in ~/.nimble/bin, but Nimble needs the underlying
 # installation containing nim.nimble in order to recognize a system compiler.
@@ -29,3 +30,14 @@ clean:
 	$(RM) -r nimbledeps nimcache
 	$(RM) nimble.paths nimble.develop
 	$(RM) examples/mix_ping_tcp examples/mix_ping_quic tests/test_all
+
+clean-nimble-cache:
+	$(RM) "$(NIMBLE_DIR)/pkgcache/tagged_versions.json"
+	$(RM) "$(NIMBLE_DIR)/packages_official.json"
+	$(RM) "$(NIMBLE_DIR)/packages_temp.json"
+
+clean-nimbledeps:
+	$(RM) -r nimbledeps
+	$(RM) nimble.paths nimble.develop
+
+clean-all: clean clean-nimble-cache
