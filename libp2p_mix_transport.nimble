@@ -3,11 +3,10 @@ version = "0.1.0"
 author = "local"
 description = "Generic byte-stream transport over the libp2p Mix protocol"
 license = "MIT"
-srcDir = "mix_transport"
 skipDirs = @["examples", "tests"]
 entryPoints = @[
-  "mix_transport/libp2p_mix_transport.nim", "tests/test_all.nim",
-  "examples/mix_ping_tcp.nim", "examples/mix_ping_quic.nim",
+  "libp2p_mix_transport.nim", "tests/test_all.nim", "examples/mix_ping_tcp.nim",
+  "examples/mix_ping_quic.nim",
 ]
 
 requires "nim >= 2.2.4"
@@ -15,6 +14,7 @@ requires "libp2p == 2.2.0"
 requires "https://github.com/logos-co/nim-libp2p-mix.git#feat/mix-transport"
 requires "chronicles >= 0.11.0"
 requires "chronos >= 4.2.2"
+requires "protobuf_serialization >= 0.5.3"
 requires "results >= 0.5.0"
 
 import os, strutils

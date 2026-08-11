@@ -1,5 +1,5 @@
 switch("nimcache", "nimcache")
-switch("path", thisDir() & "/mix_transport")
+switch("path", thisDir())
 
 # begin Nimble config (version 2)
 when withDir(thisDir(), system.fileExists("nimble.paths")):

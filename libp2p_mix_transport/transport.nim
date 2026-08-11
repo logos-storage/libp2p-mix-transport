@@ -4,9 +4,7 @@
 
 import chronos, results
 import libp2p_mix
-import ./libp2p_mix_transport/wire
-
-export wire
+import ./wire
 
 type MixTransport* = ref object
   mix: MixProtocol
