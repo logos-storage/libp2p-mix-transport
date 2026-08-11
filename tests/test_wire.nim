@@ -13,6 +13,19 @@ import libp2p_mix_transport
 proc randomSessionId(): PeerId =
   PeerId.random(newRng()).expect("could not generate session identifier")
 
+proc testSurb(marker: byte): SURB =
+  var key = newSeq[byte](k)
+  for value in key.mitems:
+    value = marker
+
+  SURB(
+    hop: Hop.init(newSeq[byte](AddrSize)),
+    header: Header.init(
+      newSeq[byte](AlphaSize), newSeq[byte](BetaSize), newSeq[byte](GammaSize)
+    ),
+    key: move(key),
+  )
+
 suite "MixTransport wire format":
   test "data frame survives a Protobuf round trip":
     let frame = MixTransportFrame(
@@ -56,6 +69,19 @@ suite "MixTransport wire format":
       decoded.partIndex == frame.partIndex
       decoded.partCount == frame.partCount
       decoded.surbGroups == frame.surbGroups
+
+  test "SURB groups use the canonical Mix serialization boundary":
+    let
+      original = @[testSurb(1), testSurb(2)]
+      group = SurbGroup.init(original).expect("could not encode SURB group")
+      decoded = group.decodeSurbs().expect("could not decode SURB group")
+
+    check:
+      decoded.len == original.len
+      decoded[0].serializeSurb() == original[0].serializeSurb()
+      decoded[1].serializeSurb() == original[1].serializeSurb()
+      SurbGroup.init(newSeq[SURB]()).isErr
+      SurbGroup(surbs: @[@[0'u8]]).decodeSurbs().isErr
 
   test "frame fields must agree with their declared kind":
     let frame = MixTransportFrame(

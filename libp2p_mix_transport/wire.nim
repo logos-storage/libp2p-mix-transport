@@ -62,6 +62,24 @@ template require(condition: bool, message: string): untyped =
   if not condition:
     return err(message)
 
+proc init*(T: type SurbGroup, surbs: openArray[SURB]): Result[T, string] =
+  require surbs.len > 0, "SURB groups must not be empty"
+
+  var encoded = newSeqOfCap[seq[byte]](surbs.len)
+  for surb in surbs:
+    encoded.add(surb.serializeSurb())
+  ok(T(surbs: encoded))
+
+proc decodeSurbs*(group: SurbGroup): Result[seq[SURB], string] =
+  require group.surbs.len > 0, "SURB groups must not be empty"
+
+  var decoded = newSeqOfCap[SURB](group.surbs.len)
+  for encoded in group.surbs:
+    let surb = encoded.deserializeSurb().valueOr:
+      return err("could not deserialize SURB: " & error)
+    decoded.add(surb)
+  ok(decoded)
+
 proc validateSurbGroups(groups: openArray[SurbGroup]): Result[void, string] =
   var surbCount = 0
   for group in groups:
