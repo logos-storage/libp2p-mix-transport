@@ -24,6 +24,10 @@ type
     credential*: ReplyCredential
     group*: ReplyCredentialGroup
 
+  RecoveredReply* = object
+    sessionId*: PeerId
+    payload*: seq[byte]
+
   ReplyCredentialStore* = ref object
     credentials: Table[SURBIdentifier, StoredReplyCredential]
     ttl: Duration
@@ -92,6 +96,20 @@ proc consume*(store: ReplyCredentialStore, group: ReplyCredentialGroup) =
   for identifier in group.identifiers:
     store.credentials.del(identifier)
   group.identifiers.clear()
+
+proc recoverReply*(
+    store: ReplyCredentialStore, reply: RawSurbReply
+): Result[Opt[RecoveredReply], ReplyRecoveryError] =
+  let stored = store.get(reply.identifier).valueOr:
+    return ok(Opt.none(RecoveredReply))
+
+  let payload = recoverReply(stored.credential, reply).valueOr:
+    if error.kind == ReplyRecoveryErrorKind.PayloadDecodingFailed:
+      store.consume(stored.group)
+    return err(error)
+
+  store.consume(stored.group)
+  ok(Opt.some(RecoveredReply(sessionId: stored.group.sessionId, payload: payload)))
 
 proc clear*(store: ReplyCredentialStore) =
   store.credentials.clear()

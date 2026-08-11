@@ -3,31 +3,47 @@
 {.push raises: [].}
 
 import chronos, results
+import libp2p/utils/opt
 import libp2p_mix
-import ./wire
+import ./[reply_credentials, wire]
 
 type MixTransport* = ref object
   mix: MixProtocol
+  replyCredentials: ReplyCredentialStore
   started: bool
+
+proc handleFrame(
+    self: MixTransport, frame: MixTransportFrame
+): Future[void] {.async: (raises: [CancelledError]).} =
+  ## Session dispatch will be added with the session store.
+  discard self
+  discard frame
 
 proc handleDelivery(
     self: MixTransport, delivery: MixDelivery
 ): Future[void] {.async: (raises: [CancelledError]).} =
-  ## Transport-frame dispatch will be added with the wire envelope.
-  discard self
-  discard delivery
+  let frame = MixTransportFrame.decode(delivery.payload).valueOr:
+    return
+  await self.handleFrame(frame)
 
 proc handleRawSurbReply(
     self: MixTransport, reply: RawSurbReply
 ): Future[RawSurbReplyDisposition] {.async: (raises: [CancelledError]).} =
-  ## Until the transport owns credentials, every reply belongs to the embedded path.
-  discard self
-  discard reply
-  return RawSurbReplyDisposition.Unhandled
+  let recovered = self.replyCredentials.recoverReply(reply).valueOr:
+    return RawSurbReplyDisposition.Handled
+
+  recovered.withValue(value):
+    let frame = MixTransportFrame.decode(value.payload).valueOr:
+      return RawSurbReplyDisposition.Handled
+    if frame.sessionId == value.sessionId:
+      await self.handleFrame(frame)
+    return RawSurbReplyDisposition.Handled
+
+  RawSurbReplyDisposition.Unhandled
 
 proc newMixTransport*(mix: MixProtocol): MixTransport =
   doAssert not mix.isNil, "MixProtocol must not be nil"
-  MixTransport(mix: mix)
+  MixTransport(mix: mix, replyCredentials: ReplyCredentialStore.new())
 
 proc start*(
     self: MixTransport
@@ -61,6 +77,7 @@ proc stop*(self: MixTransport): Future[void] {.async: (raises: [CancelledError])
 
   self.mix.unregisterRawSurbReplyHandler()
   self.mix.unregisterMixDeliveryHandler(MixTransportCodec)
+  self.replyCredentials.clear()
   self.started = false
 
 {.pop.}
