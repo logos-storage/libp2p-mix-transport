@@ -131,6 +131,48 @@ These files and directories are local artifacts and should not be committed:
 - `examples/mix_ping_tcp`
 - `examples/mix_ping_quic`
 
+## Dependency Cache Troubleshooting
+
+The Mix dependency currently follows a mutable Git branch. Nimble can keep using an older checkout from its global `pkgcache` after that branch advances, even when the project-local `nimbledeps/` directory is rebuilt.
+
+First inspect the cached Mix checkouts:
+
+```bash
+nimble_dir="${NIMBLE_DIR:-$HOME/.nimble}"
+find "$nimble_dir/pkgcache" -mindepth 1 -maxdepth 1 -type d -name '*nimlibp2pmix*' -print
+```
+
+When the stale directory has been identified, remove that exact directory manually and rebuild the local dependencies:
+
+```bash
+rm -rf "$nimble_dir/pkgcache/<verified-mix-cache-directory>"
+make clean
+make setup NIMBLE_FLAGS="-y"
+```
+
+Do not pass an unresolved wildcard to `rm`. Inspect the paths first and remove only the intended checkout.
+
+If selective cleanup is insufficient, completely reset Nimble's downloaded package and resolver state before retrying:
+
+```bash
+rm -rf "$nimble_dir/pkgcache" "$nimble_dir/pkgs2" "$nimble_dir/buildtemp"
+rm -f "$nimble_dir/nimbledata2.json" \
+  "$nimble_dir/packages_official.json" "$nimble_dir/packages_temp.json"
+make clean
+make setup NIMBLE_FLAGS="-y"
+```
+
+This is destructive global cleanup. It affects other projects, removes globally installed package sources, and can leave launchers in `$nimble_dir/bin` that need to be reinstalled.
+
+For a less destructive metadata-only retry, use:
+
+```bash
+make clean-all
+make setup NIMBLE_FLAGS="-y"
+```
+
+`clean-nimble-cache` removes only the cached package registry and SAT tag index. It does not remove downloaded package checkouts. `clean-nimbledeps` removes only this project's `nimbledeps/`, `nimble.paths`, and `nimble.develop`.
+
 ## Clean Rebuild
 
 To verify the project can be rebuilt from committed files:
