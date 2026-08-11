@@ -83,7 +83,7 @@ suite "MixTransport wire format":
       SurbGroup.init(newSeq[SURB]()).isErr
       SurbGroup(surbs: @[@[0'u8]]).decodeSurbs().isErr
 
-  test "frame fields must agree with their declared kind":
+  test "frame fields must agree with their declared kind - e.g. ConnectAck should not include payload":
     let frame = MixTransportFrame(
       version: MixTransportVersion,
       sessionId: randomSessionId(),
