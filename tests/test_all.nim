@@ -5,4 +5,5 @@
 {.used.}
 
 import ./test_lifecycle
+import ./test_reply_credentials
 import ./test_wire
