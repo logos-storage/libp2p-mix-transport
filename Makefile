@@ -10,7 +10,7 @@ NIMBLE_NIM := $(shell if command -v choosenim >/dev/null 2>&1; then printf '%s/b
 endif
 
 NIMBLE = nimble --useSystemNim --nim:"$(NIMBLE_NIM)"
-NPH_FILES = $(shell git ls-files '*.nim' '*.nimble' '*.nims')
+NPH_FILES = $(shell git ls-files --cached --others --exclude-standard -- '*.nim' '*.nimble' '*.nims')
 
 all: test example
 
