@@ -12,9 +12,9 @@ vim.lsp.config("nim_langserver", {
       nimsuggestPath = nimble_bin .. "/nimsuggest",
       projectMapping = {
         {
-          projectFile = "mix_transport/libp2p_mix_transport.nim",
+          projectFile = "libp2p_mix_transport.nim",
           fileRegex =
-            "^mix_transport/.*[.]nim$",
+            "^(libp2p_mix_transport[.]nim|libp2p_mix_transport/.*[.]nim)$",
         },
         {
           projectFile = "tests/test_all.nim",

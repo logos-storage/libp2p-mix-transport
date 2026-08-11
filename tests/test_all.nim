@@ -5,3 +5,4 @@
 {.used.}
 
 import ./test_lifecycle
+import ./test_wire
