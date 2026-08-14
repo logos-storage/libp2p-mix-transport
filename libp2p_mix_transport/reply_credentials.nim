@@ -8,7 +8,6 @@ import chronos, results
 import libp2p/peerid
 import libp2p/utils/opt
 import libp2p_mix
-from libp2p_mix/serialization import SURBIdentifier
 
 const
   DefaultReplyCredentialTtl* = 30.minutes
