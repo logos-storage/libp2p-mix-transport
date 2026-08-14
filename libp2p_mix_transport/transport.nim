@@ -5,11 +5,12 @@
 import chronos, results
 import libp2p/utils/opt
 import libp2p_mix
-import ./[reply_credentials, wire]
+import ./[reply_credentials, sessions, wire]
 
 type MixTransport* = ref object
   mix: MixProtocol
   replyCredentials: ReplyCredentialStore
+  sessions: SessionStore
   started: bool
 
 proc handleFrame(
@@ -43,7 +44,9 @@ proc handleRawSurbReply(
 
 proc newMixTransport*(mix: MixProtocol): MixTransport =
   doAssert not mix.isNil, "MixProtocol must not be nil"
-  MixTransport(mix: mix, replyCredentials: ReplyCredentialStore.new())
+  MixTransport(
+    mix: mix, replyCredentials: ReplyCredentialStore.new(), sessions: newSessionStore()
+  )
 
 proc start*(
     self: MixTransport
@@ -78,6 +81,7 @@ proc stop*(self: MixTransport): Future[void] {.async: (raises: [CancelledError])
   self.mix.unregisterRawSurbReplyHandler()
   self.mix.unregisterMixDeliveryHandler(MixTransportCodec)
   self.replyCredentials.clear()
+  self.sessions.clear()
   self.started = false
 
 {.pop.}
