@@ -88,12 +88,21 @@ suite "MixTransport reply credentials":
 
     check:
       store.len == 0
+      store.retiredLen == 2
       store.get(first.identifier).isNone
       store.get(second.identifier).isNone
+      store.isRetiredIdentifier(first.identifier)
+      store.isRetiredIdentifier(second.identifier)
+
+    # Reusing an identifier while its tombstone is active would cause the raw
+    # reply handler to mistake the new reply for a late redundant packet.
+    check store.addGroup(randomSessionId(rng), [first]).isErr
 
     # A late redundant reply may try to consume the group again.
     store.consume(group)
-    check store.len == 0
+    check:
+      store.len == 0
+      store.retiredLen == 2
 
   test "capacity rejects a new group without evicting in-flight credentials":
     let
@@ -111,6 +120,61 @@ suite "MixTransport reply credentials":
       store.get(first.identifier).isSome
       store.get(second.identifier).isSome
       store.get(rejected.identifier).isNone
+
+  test "removing one session preserves credentials owned by another session":
+    let
+      rng = newRng()
+      store = ReplyCredentialStore.new()
+      removedSessionId = randomSessionId(rng)
+      retainedSessionId = randomSessionId(rng)
+      removed = createReply(rng).credential
+      retained = createReply(rng).credential
+
+    discard store.addGroup(removedSessionId, [removed]).expect(
+        "could not add credentials for removed session"
+      )
+    discard store.addGroup(retainedSessionId, [retained]).expect(
+        "could not add credentials for retained session"
+      )
+
+    check store.removeSession(removedSessionId) == 1
+    check:
+      store.get(removed.identifier).isNone
+      store.get(retained.identifier).isSome
+      store.isRetiredIdentifier(removed.identifier)
+      not store.isRetiredIdentifier(retained.identifier)
+      store.len == 1
+
+  test "retired reply identifiers expire and remain bounded":
+    let
+      rng = newRng()
+      store = ReplyCredentialStore.new(ttl = 1.seconds, maxRetiredIdentifiers = 1)
+      first = createReply(rng).credential
+      second = createReply(rng).credential
+      createdAt = Moment.now()
+      group = store.addGroup(randomSessionId(rng), [first, second], createdAt).expect(
+          "could not add credential group"
+        )
+
+    store.consume(group, createdAt)
+
+    # The bound keeps only one tombstone. Which identifier remains depends on
+    # hash-table iteration order, but either retained entry still suppresses a
+    # late redundant reply until the original credential group expires.
+    check:
+      store.len == 0
+      store.retiredLen == 1
+      store.isRetiredIdentifier(first.identifier, createdAt) !=
+        store.isRetiredIdentifier(second.identifier, createdAt)
+
+    # Querying after expiry is pure: an expired identifier is no longer
+    # considered retired, but storage cleanup remains explicit.
+    check:
+      not store.isRetiredIdentifier(first.identifier, createdAt + 1.seconds)
+      not store.isRetiredIdentifier(second.identifier, createdAt + 1.seconds)
+      store.retiredLen == 1
+      store.purgeExpired(createdAt + 1.seconds) == 1
+      store.retiredLen == 0
 
   test "expired credentials are invisible before they are purged":
     let

@@ -5,6 +5,7 @@
 {.used.}
 
 import ./test_lifecycle
+import ./test_connect
 import ./test_reply_credentials
 import ./test_sessions
 import ./test_wire
