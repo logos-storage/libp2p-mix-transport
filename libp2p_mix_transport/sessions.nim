@@ -2,11 +2,13 @@
 
 {.push raises: [].}
 
-import std/tables
+import std/[deques, tables]
 
+import chronos
 import results
 import libp2p/peerid
 import libp2p/utils/opt
+import libp2p_mix
 
 type
   SessionRole* {.pure.} = enum
@@ -22,6 +24,8 @@ type
     destination: Opt[PeerId]
     role: SessionRole
     state: SessionState
+    established: AsyncEvent
+    receivedSurbGroups: Deque[seq[SURB]]
 
   SessionStore* = ref object
     bySessionId: Table[PeerId, TransportSession]
@@ -38,6 +42,9 @@ func role*(session: TransportSession): SessionRole =
 
 func state*(session: TransportSession): SessionState =
   session.state
+
+func receivedSurbGroupCount*(session: TransportSession): int =
+  session.receivedSurbGroups.len
 
 func peerId*(session: TransportSession): PeerId =
   ## Identity exposed to consumers of this transport. The initiator knows the
@@ -76,6 +83,8 @@ proc addInitiatorSession*(
     destination: Opt.some(destination),
     role: SessionRole.Initiator,
     state: SessionState.Pending,
+    established: newAsyncEvent(),
+    receivedSurbGroups: initDeque[seq[SURB]](),
   )
   store.bySessionId[sessionId] = session
   store.byDestination[destination] = session
@@ -94,12 +103,36 @@ proc addRecipientSession*(
     destination: Opt.none(PeerId),
     role: SessionRole.Recipient,
     state: SessionState.Pending,
+    established: newAsyncEvent(),
+    receivedSurbGroups: initDeque[seq[SURB]](),
   )
   store.bySessionId[sessionId] = session
   ok(session)
 
 proc establish*(session: TransportSession) =
   session.state = SessionState.Established
+  session.established.fire()
+
+proc waitUntilEstablished*(session: TransportSession): Future[void] =
+  session.established.wait()
+
+proc addReceivedSurbGroups*(
+    session: TransportSession, groups: sink seq[seq[SURB]]
+): Result[void, string] =
+  if session.role != SessionRole.Recipient:
+    return err("only recipient sessions can store received SURB groups")
+  for group in groups:
+    if group.len == 0:
+      return err("received SURB groups must not be empty")
+
+  for group in groups.mitems:
+    session.receivedSurbGroups.addLast(move(group))
+  ok()
+
+proc takeReceivedSurbGroup*(session: TransportSession): Result[seq[SURB], string] =
+  if session.receivedSurbGroups.len == 0:
+    return err("session has no received SURB groups")
+  ok(session.receivedSurbGroups.popFirst())
 
 proc remove*(store: SessionStore, sessionId: PeerId): Opt[TransportSession] =
   let session = store.get(sessionId).valueOr:

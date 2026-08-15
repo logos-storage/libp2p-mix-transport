@@ -6,6 +6,7 @@ import std/unittest
 
 import results
 import libp2p/[crypto/crypto, peerid]
+import libp2p_mix
 
 import libp2p_mix_transport
 
@@ -49,6 +50,26 @@ suite "MixTransport sessions":
       session.peerId == sessionId
       store.get(sessionId).get() == session
       store.getByDestination(sessionId).isNone
+
+  test "recipient sessions retain and consume complete SURB groups":
+    let
+      rng = newRng()
+      store = newSessionStore()
+      session = store.addRecipientSession(randomPeerId(rng)).expect(
+          "could not add recipient session"
+        )
+      first = @[SURB(), SURB()]
+      second = @[SURB()]
+
+    store.get(session.sessionId).get().addReceivedSurbGroups(@[first, second]).expect(
+      "could not add received SURB groups"
+    )
+
+    check session.receivedSurbGroupCount == 2
+    check session.takeReceivedSurbGroup().expect("could not take first group").len == 2
+    check session.receivedSurbGroupCount == 1
+    check session.takeReceivedSurbGroup().expect("could not take second group").len == 1
+    check session.takeReceivedSurbGroup().isErr
 
   test "duplicate indexes are rejected without replacing existing sessions":
     let
