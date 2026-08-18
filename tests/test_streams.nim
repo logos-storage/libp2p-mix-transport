@@ -4,7 +4,7 @@
 
 import std/unittest
 
-import results
+import chronos, results
 import libp2p/[crypto/crypto, peerid]
 import libp2p_mix
 
@@ -109,3 +109,20 @@ suite "MixTransport streams":
       session.streamCount == 0
       session.getStream(stream.streamId).isNone
       store.get(sessionId).get() == session
+
+  test "rejection resolves a pending stream without establishing it":
+    let
+      rng = newRng()
+      store = newSessionStore()
+      session = store.addInitiatorSession(randomPeerId(rng), randomPeerId(rng)).expect(
+          "could not add initiator session"
+        )
+
+    session.establish()
+    let stream = session.addOutboundStream("/test/1").expect("could not add stream")
+    stream.reject("test rejection")
+    waitFor stream.waitUntilResolved()
+
+    check:
+      stream.state == StreamState.Rejected
+      stream.rejectionReason == "test rejection"

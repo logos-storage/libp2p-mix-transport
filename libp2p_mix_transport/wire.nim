@@ -14,6 +14,7 @@ const
   MixTransportCodec* = "/libp2p/mix-transport/1.0.0"
   MixTransportVersion* = 1'u32
   MaxCodecBytes* = 255
+  MaxStreamRejectionReasonBytes* = 255
   MaxAckRanges* = 32
 
 let MaxTransportFrameBytes* = getMaxMessageSizeForCodec(MixTransportCodec, 0).expect(
@@ -34,6 +35,7 @@ type
     ResetStream = 10
     Disconnect = 11
     ResetSession = 12
+    StreamReject = 13
 
   AckRange* {.proto2.} = object
     first* {.fieldNumber: 1, required, pint.}: uint64
@@ -57,6 +59,7 @@ type
     partIndex* {.fieldNumber: 12, pint.}: Opt[uint32]
     partCount* {.fieldNumber: 13, pint.}: Opt[uint32]
     surbGroups* {.fieldNumber: 14.}: seq[SurbGroup]
+    rejectionReason* {.fieldNumber: 15.}: Opt[string]
 
 template require(condition: bool, message: string): untyped =
   if not condition:
@@ -95,6 +98,9 @@ proc validate*(frame: MixTransportFrame): Result[void, string] =
   require frame.sessionId.len > 0, "sessionId must not be empty"
   require frame.codec.isNone or frame.codec.get().len <= MaxCodecBytes,
     "application codec is too long"
+  require frame.rejectionReason.isNone or
+    frame.rejectionReason.get().len <= MaxStreamRejectionReasonBytes,
+    "stream rejection reason is too long"
   require frame.ackRanges.len <= MaxAckRanges, "too many acknowledgement ranges"
 
   for ackRange in frame.ackRanges:
@@ -107,7 +113,7 @@ proc validate*(frame: MixTransportFrame): Result[void, string] =
     isStreamFrame =
       frame.kind in {
         FrameKind.OpenStream, FrameKind.StreamAck, FrameKind.Data, FrameKind.Ack,
-        FrameKind.CloseStream, FrameKind.ResetStream,
+        FrameKind.CloseStream, FrameKind.ResetStream, FrameKind.StreamReject,
       }
     carriesSurbs =
       frame.kind in {FrameKind.Connect, FrameKind.OpenStream, FrameKind.Refill}
@@ -135,6 +141,8 @@ proc validate*(frame: MixTransportFrame): Result[void, string] =
     "partCount does not match the frame kind"
   require frame.surbGroups.len == 0 or carriesSurbs,
     "SURB groups do not match the frame kind"
+  require frame.rejectionReason.isNone or frame.kind == FrameKind.StreamReject,
+    "rejectionReason does not match the frame kind"
 
   case frame.kind
   of FrameKind.Connect:
