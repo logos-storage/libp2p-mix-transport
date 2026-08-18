@@ -168,7 +168,8 @@ proc addOutboundStream*(
     return err("stream codec must not be empty")
 
   let stream = newTransportStream(
-    session.sessionId, session.nextOutboundStreamId, codec, StreamDirection.Outbound
+    session.sessionId, session.peerId, session.nextOutboundStreamId, codec,
+    StreamDirection.Outbound,
   )
   session.streams[stream.streamId] = stream
   session.nextOutboundStreamId += 2
@@ -186,8 +187,9 @@ proc addInboundStream*(
   if session.streams.hasKey(streamId):
     return err("stream identifier is already registered")
 
-  let stream =
-    newTransportStream(session.sessionId, streamId, codec, StreamDirection.Inbound)
+  let stream = newTransportStream(
+    session.sessionId, session.peerId, streamId, codec, StreamDirection.Inbound
+  )
   session.streams[streamId] = stream
   ok(stream)
 

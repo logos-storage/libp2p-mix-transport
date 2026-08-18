@@ -5,6 +5,9 @@
 import chronos, results
 import libp2p/multistream
 import libp2p/peerid
+import libp2p/protocols/protocol
+import libp2p/stream/connection
+import libp2p/utils/future
 import libp2p/utils/opt
 import libp2p_mix
 import ./[reply_credentials, sessions, streams, wire]
@@ -25,11 +28,24 @@ type MixTransport* = ref object
   sessions: SessionStore
   connectTimeout: Duration
   streamOpenTimeout: Duration
+  handlerTasks: seq[Future[void].Raising([CancelledError])]
   started: bool
 
 type PreparedReplyGroups = object
   encoded: seq[SurbGroup]
   credentials: seq[ReplyCredentialGroup]
+
+proc runProtocolHandler(
+    session: TransportSession, stream: TransportStream, protocol: LPProtocol
+) {.async: (raises: [CancelledError]).} =
+  defer:
+    protocol.releaseIncoming(stream.peerId)
+    discard session.removeStream(stream.streamId)
+    await noCancel stream.close()
+
+  # Binding the template accessor preserves LPProtoHandler's raises list.
+  let handler: LPProtoHandler = protocol.handler
+  await handler(stream, stream.codec)
 
 proc handleReplyFrame(
     self: MixTransport, frame: MixTransportFrame
@@ -156,7 +172,7 @@ proc handleOpenStream(
   session.addReceivedSurbGroups(decodedGroups).isOkOr:
     return
 
-  if self.mix.switch.ms.lookupProtocol(frame.codec.get()).isNone:
+  let protocol = self.mix.switch.ms.lookupProtocol(frame.codec.get()).valueOr:
     discard await self.sendStreamResponse(
       session,
       frame.streamId.get(),
@@ -164,6 +180,20 @@ proc handleOpenStream(
       "requested protocol is not supported",
     )
     return
+
+  if not protocol.reserveIncoming(session.peerId):
+    discard await self.sendStreamResponse(
+      session,
+      frame.streamId.get(),
+      FrameKind.StreamReject,
+      "requested protocol cannot accept another incoming stream",
+    )
+    return
+
+  var keepReservation = false
+  defer:
+    if not keepReservation:
+      protocol.releaseIncoming(session.peerId)
 
   let streamResult = session.addInboundStream(frame.streamId.get(), frame.codec.get())
   if streamResult.isErr:
@@ -182,6 +212,8 @@ proc handleOpenStream(
 
   stream.establish()
   keepStream = true
+  keepReservation = true
+  self.handlerTasks.trackFut(runProtocolHandler(session, stream, protocol))
 
 proc handleDelivery(
     self: MixTransport, delivery: MixDelivery
@@ -417,6 +449,8 @@ proc stop*(self: MixTransport): Future[void] {.async: (raises: [CancelledError])
 
   self.mix.unregisterRawSurbReplyHandler()
   self.mix.unregisterMixDeliveryHandler(MixTransportCodec)
+  await self.handlerTasks.cancelAndWait()
+  self.handlerTasks.setLen(0)
   self.replyCredentials.clear()
   self.sessions.clear()
   self.started = false

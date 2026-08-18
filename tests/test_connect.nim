@@ -59,12 +59,22 @@ const
   TestCodec = "/mix-transport/test/1.0.0"
   UnsupportedCodec = "/mix-transport/unsupported/1.0.0"
 
-proc newTestProtocol(codec: string): LPProtocol =
+type ProtocolInvocation = object
+  stream: Stream
+  selectedCodec: string
+
+proc newTestProtocol(
+    codec: string,
+    invocations: AsyncQueue[ProtocolInvocation],
+    keepHandlerRunning: AsyncEvent,
+): LPProtocol =
   let handler: LPProtoHandler = proc(
       stream: Stream, selectedCodec: string
   ): Future[void] {.async: (raises: [CancelledError]).} =
-    discard stream
-    discard selectedCodec
+    await invocations.put(
+      ProtocolInvocation(stream: stream, selectedCodec: selectedCodec)
+    )
+    await keepHandlerRunning.wait()
   LPProtocol.new(@[codec], handler)
 
 type RoundTripOutcome = object
@@ -78,6 +88,9 @@ type RoundTripOutcome = object
   initiatorStreamCount: int
   recipientStreamCount: int
   replyDispositions: seq[RawSurbReplyDisposition]
+  handlerPeerId: PeerId
+  handlerCodec: string
+  handlerReceivedStream: bool
 
 proc establishSessionAndStream(): Future[RoundTripOutcome] {.
     async: (raises: [CancelledError, LPError])
@@ -94,8 +107,14 @@ proc establishSessionAndStream(): Future[RoundTripOutcome] {.
     )
 
   # StreamAck confirms that the recipient has a mounted handler for the
-  # requested application codec.
-  recipientMix.switch.mount(newTestProtocol(TestCodec))
+  # requested application codec. The handler remains active until transport
+  # teardown so the test can inspect the connection passed to it.
+  let
+    protocolInvocations = newAsyncQueue[ProtocolInvocation]()
+    keepHandlerRunning = newAsyncEvent()
+  recipientMix.switch.mount(
+    newTestProtocol(TestCodec, protocolInvocations, keepHandlerRunning)
+  )
 
   for node in nodes:
     await node.switch.start()
@@ -151,6 +170,10 @@ proc establishSessionAndStream(): Future[RoundTripOutcome] {.
   let recipientStream = recipientSession.getStream(initiatorStream.streamId).expect(
       "recipient did not retain the inbound stream"
     )
+  let invocationFuture = protocolInvocations.get()
+  if not await invocationFuture.withTimeout(5.seconds):
+    raise newException(LPError, "recipient protocol handler was not invoked")
+  let invocation = await invocationFuture
 
   # The destination has no handler for this codec. It returns StreamReject,
   # allowing dial to fail without waiting for its timeout. The rejected stream
@@ -179,6 +202,9 @@ proc establishSessionAndStream(): Future[RoundTripOutcome] {.
     initiatorStreamCount: session.streamCount,
     recipientStreamCount: recipientSession.streamCount,
     replyDispositions: replyDispositions,
+    handlerPeerId: invocation.stream.peerId,
+    handlerCodec: invocation.selectedCodec,
+    handlerReceivedStream: invocation.stream == recipientStream,
   )
 
 suite "MixTransport session and stream handshakes":
@@ -194,6 +220,8 @@ suite "MixTransport session and stream handshakes":
       outcome.initiatorStream.streamId == outcome.recipientStream.streamId
       outcome.initiatorStream.codec == TestCodec
       outcome.recipientStream.codec == TestCodec
+      outcome.initiatorStream.peerId == outcome.destination
+      outcome.recipientStream.peerId == outcome.session.sessionId
       outcome.initiatorStream.direction == StreamDirection.Outbound
       outcome.recipientStream.direction == StreamDirection.Inbound
       outcome.initiatorStream.state == StreamState.Established
@@ -202,6 +230,9 @@ suite "MixTransport session and stream handshakes":
       outcome.initiatorStreamCount == 1
       outcome.recipientStreamCount == 1
       outcome.recipientReplyGroups == 3
+      outcome.handlerPeerId == outcome.session.sessionId
+      outcome.handlerCodec == TestCodec
+      outcome.handlerReceivedStream
       outcome.replyDispositions ==
         @[
           RawSurbReplyDisposition.Handled, RawSurbReplyDisposition.Handled,

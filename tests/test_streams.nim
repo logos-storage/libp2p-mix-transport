@@ -5,7 +5,7 @@
 import std/unittest
 
 import chronos, results
-import libp2p/[crypto/crypto, peerid]
+import libp2p/[crypto/crypto, peerid, stream/connection]
 import libp2p_mix
 
 import libp2p_mix_transport
@@ -52,6 +52,9 @@ suite "MixTransport streams":
       firstRecipientStream.streamId == 2
       secondRecipientStream.streamId == 4
       firstInitiatorStream.direction == StreamDirection.Outbound
+      firstInitiatorStream.peerId == initiatorSession.peerId
+      firstInitiatorStream.dir == Direction.Out
+      firstInitiatorStream.protocol == "/test/1"
       firstInitiatorStream.state == StreamState.Pending
       firstInitiatorStream.sessionId == initiatorSession.sessionId
       firstInitiatorStream.codec == "/test/1"
