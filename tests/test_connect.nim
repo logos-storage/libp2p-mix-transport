@@ -5,13 +5,23 @@
 import std/[importutils, unittest]
 
 import chronos, results
-import libp2p/[builders, crypto/crypto, crypto/secp, peerid, switch]
+import
+  libp2p/[
+    builders,
+    crypto/crypto,
+    crypto/secp,
+    peerid,
+    protocols/protocol,
+    stream/connection,
+    switch,
+  ]
 import libp2p_mix
 import libp2p_mix/delay_strategy
 
 import libp2p_mix_transport
 
 privateAccess(MixProtocol)
+privateAccess(MixTransport)
 
 proc createMixNodes(count: int): seq[MixProtocol] =
   # Every node is a normal Mix relay. The first and last nodes will also run
@@ -45,21 +55,47 @@ proc createMixNodes(count: int): seq[MixProtocol] =
     switch.mount(mix)
     result.add(mix)
 
-type ConnectOutcome = object
+const
+  TestCodec = "/mix-transport/test/1.0.0"
+  UnsupportedCodec = "/mix-transport/unsupported/1.0.0"
+
+proc newTestProtocol(codec: string): LPProtocol =
+  let handler: LPProtoHandler = proc(
+      stream: Stream, selectedCodec: string
+  ): Future[void] {.async: (raises: [CancelledError]).} =
+    discard stream
+    discard selectedCodec
+  LPProtocol.new(@[codec], handler)
+
+type RoundTripOutcome = object
   destination: PeerId
   session: TransportSession
   reused: TransportSession
+  initiatorStream: TransportStream
+  recipientStream: TransportStream
+  recipientReplyGroups: int
+  rejectionError: string
+  initiatorStreamCount: int
+  recipientStreamCount: int
   replyDispositions: seq[RawSurbReplyDisposition]
 
-proc connectRoundTrip(): Future[ConnectOutcome] {.
+proc establishSessionAndStream(): Future[RoundTripOutcome] {.
     async: (raises: [CancelledError, LPError])
 .} =
   let
     nodes = createMixNodes(5)
     initiatorMix = nodes[0]
     recipientMix = nodes[^1]
-    initiator = newMixTransport(initiatorMix, connectTimeout = 5.seconds)
-    recipient = newMixTransport(recipientMix, connectTimeout = 5.seconds)
+    initiator = newMixTransport(
+      initiatorMix, connectTimeout = 5.seconds, streamOpenTimeout = 5.seconds
+    )
+    recipient = newMixTransport(
+      recipientMix, connectTimeout = 5.seconds, streamOpenTimeout = 5.seconds
+    )
+
+  # StreamAck confirms that the recipient has a mounted handler for the
+  # requested application codec.
+  recipientMix.switch.mount(newTestProtocol(TestCodec))
 
   for node in nodes:
     await node.switch.start()
@@ -103,28 +139,72 @@ proc connectRoundTrip(): Future[ConnectOutcome] {.
     "could not reuse established MixTransport session"
   )
 
+  # dial reuses the established session, sends OpenStream, and returns only
+  # after the recipient has registered the same stream identifier and sent a
+  # StreamAck through one of the session's reply groups.
+  let initiatorStream = (await initiator.dial(destination, TestCodec)).expect(
+    "could not establish MixTransport stream"
+  )
+  let recipientSession = recipient.sessions.get(session.sessionId).expect(
+      "recipient did not retain the established session"
+    )
+  let recipientStream = recipientSession.getStream(initiatorStream.streamId).expect(
+      "recipient did not retain the inbound stream"
+    )
+
+  # The destination has no handler for this codec. It returns StreamReject,
+  # allowing dial to fail without waiting for its timeout. The rejected stream
+  # is removed on both endpoints while the established session remains usable.
+  let rejected = await initiator.dial(destination, UnsupportedCodec)
+  if rejected.isOk:
+    raise newException(LPError, "unsupported codec unexpectedly opened a stream")
+
   var replyDispositions: seq[RawSurbReplyDisposition]
-  for _ in 0 ..< DefaultConnectSurbRedundancy:
+  let expectedReplies =
+    DefaultConnectSurbRedundancy + 2 * DefaultOpenStreamSurbRedundancy
+  for _ in 0 ..< expectedReplies:
     let observed = observedReplies.get()
     if not await observed.withTimeout(5.seconds):
-      raise newException(LPError, "redundant ConnectAck did not reach the initiator")
+      raise newException(LPError, "redundant reply did not reach the initiator")
     replyDispositions.add(await observed)
 
-  ConnectOutcome(
+  RoundTripOutcome(
     destination: destination,
     session: session,
     reused: reused,
+    initiatorStream: initiatorStream,
+    recipientStream: recipientStream,
+    recipientReplyGroups: recipientSession.receivedSurbGroupCount,
+    rejectionError: rejected.error,
+    initiatorStreamCount: session.streamCount,
+    recipientStreamCount: recipientSession.streamCount,
     replyDispositions: replyDispositions,
   )
 
-suite "MixTransport Connect handshake":
-  test "ConnectAck establishes and reuses an anonymous session":
-    let outcome = waitFor connectRoundTrip()
+suite "MixTransport session and stream handshakes":
+  test "StreamAck establishes a stream and StreamReject rejects an unsupported codec":
+    let outcome = waitFor establishSessionAndStream()
 
     check:
       outcome.session.role == SessionRole.Initiator
       outcome.session.state == SessionState.Established
       outcome.session.peerId == outcome.destination
       outcome.reused == outcome.session
+      outcome.initiatorStream.sessionId == outcome.session.sessionId
+      outcome.initiatorStream.streamId == outcome.recipientStream.streamId
+      outcome.initiatorStream.codec == TestCodec
+      outcome.recipientStream.codec == TestCodec
+      outcome.initiatorStream.direction == StreamDirection.Outbound
+      outcome.recipientStream.direction == StreamDirection.Inbound
+      outcome.initiatorStream.state == StreamState.Established
+      outcome.recipientStream.state == StreamState.Established
+      outcome.rejectionError == "requested protocol is not supported"
+      outcome.initiatorStreamCount == 1
+      outcome.recipientStreamCount == 1
+      outcome.recipientReplyGroups == 3
       outcome.replyDispositions ==
-        @[RawSurbReplyDisposition.Handled, RawSurbReplyDisposition.Handled]
+        @[
+          RawSurbReplyDisposition.Handled, RawSurbReplyDisposition.Handled,
+          RawSurbReplyDisposition.Handled, RawSurbReplyDisposition.Handled,
+          RawSurbReplyDisposition.Handled, RawSurbReplyDisposition.Handled,
+        ]

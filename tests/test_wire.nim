@@ -104,6 +104,33 @@ suite "MixTransport wire format":
 
     check frame.encode().isOk
 
+  test "stream rejection identifies the stream it refuses":
+    let frame = MixTransportFrame(
+      version: MixTransportVersion,
+      sessionId: randomSessionId(),
+      kind: FrameKind.StreamReject,
+      streamId: Opt.some(3'u64),
+      rejectionReason: Opt.some("requested protocol is not supported"),
+    )
+
+    let decoded = MixTransportFrame
+      .decode(frame.encode().expect("encode failed"))
+      .expect("decode failed")
+
+    check:
+      decoded.kind == FrameKind.StreamReject
+      decoded.streamId == frame.streamId
+      decoded.rejectionReason == frame.rejectionReason
+
+    # An older or malformed peer may omit the diagnostic reason. The receiver
+    # still recognizes the rejection and supplies its own fallback message.
+    check MixTransportFrame(
+      version: MixTransportVersion,
+      sessionId: randomSessionId(),
+      kind: FrameKind.StreamReject,
+      streamId: Opt.some(5'u64),
+    ).encode().isOk
+
   test "unsupported versions and oversized frames are rejected":
     let unsupported = MixTransportFrame(
       version: MixTransportVersion + 1,

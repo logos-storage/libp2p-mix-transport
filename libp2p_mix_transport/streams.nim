@@ -13,6 +13,7 @@ type
   StreamState* {.pure.} = enum
     Pending
     Established
+    Rejected
 
   TransportStream* = ref object
     sessionId: PeerId
@@ -20,7 +21,8 @@ type
     codec: string
     direction: StreamDirection
     state: StreamState
-    established: AsyncEvent
+    rejectionReason: string
+    resolved: AsyncEvent
 
 func sessionId*(stream: TransportStream): PeerId =
   stream.sessionId
@@ -37,12 +39,20 @@ func direction*(stream: TransportStream): StreamDirection =
 func state*(stream: TransportStream): StreamState =
   stream.state
 
+func rejectionReason*(stream: TransportStream): string =
+  stream.rejectionReason
+
 proc establish*(stream: TransportStream) =
   stream.state = StreamState.Established
-  stream.established.fire()
+  stream.resolved.fire()
 
-proc waitUntilEstablished*(stream: TransportStream): Future[void] =
-  stream.established.wait()
+proc reject*(stream: TransportStream, reason: string) =
+  stream.state = StreamState.Rejected
+  stream.rejectionReason = reason
+  stream.resolved.fire()
+
+proc waitUntilResolved*(stream: TransportStream): Future[void] =
+  stream.resolved.wait()
 
 proc newTransportStream*(
     sessionId: PeerId, streamId: uint64, codec: string, direction: StreamDirection
@@ -56,7 +66,7 @@ proc newTransportStream*(
     codec: codec,
     direction: direction,
     state: StreamState.Pending,
-    established: newAsyncEvent(),
+    resolved: newAsyncEvent(),
   )
 
 {.pop.}
