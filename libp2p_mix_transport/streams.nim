@@ -4,6 +4,7 @@
 
 import chronos
 import libp2p/peerid
+import libp2p/stream/bufferstream
 
 type
   StreamDirection* {.pure.} = enum
@@ -15,7 +16,7 @@ type
     Established
     Rejected
 
-  TransportStream* = ref object
+  TransportStream* = ref object of BufferStream
     sessionId: PeerId
     streamId: uint64
     codec: string
@@ -55,18 +56,31 @@ proc waitUntilResolved*(stream: TransportStream): Future[void] =
   stream.resolved.wait()
 
 proc newTransportStream*(
-    sessionId: PeerId, streamId: uint64, codec: string, direction: StreamDirection
+    sessionId: PeerId,
+    peerId: PeerId,
+    streamId: uint64,
+    codec: string,
+    direction: StreamDirection,
 ): TransportStream =
   doAssert sessionId.len > 0, "stream sessionId must not be empty"
+  doAssert peerId.len > 0, "stream peerId must not be empty"
   doAssert streamId > 0, "streamId must not be zero"
   doAssert codec.len > 0, "stream codec must not be empty"
-  TransportStream(
+  let libp2pDirection =
+    if direction == StreamDirection.Outbound: Direction.Out else: Direction.In
+  result = TransportStream(
     sessionId: sessionId,
+    peerId: peerId,
     streamId: streamId,
     codec: codec,
     direction: direction,
     state: StreamState.Pending,
     resolved: newAsyncEvent(),
+    dir: libp2pDirection,
+    transportDir: libp2pDirection,
+    protocol: codec,
+    timeout: ZeroDuration,
   )
+  result.initStream()
 
 {.pop.}
