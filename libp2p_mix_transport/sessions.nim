@@ -9,6 +9,7 @@ import results
 import libp2p/peerid
 import libp2p/utils/opt
 import libp2p_mix
+import ./streams
 
 type
   SessionRole* {.pure.} = enum
@@ -26,6 +27,8 @@ type
     state: SessionState
     established: AsyncEvent
     receivedSurbGroups: Deque[seq[SURB]]
+    streams: Table[uint64, TransportStream]
+    nextOutboundStreamId: uint64
 
   SessionStore* = ref object
     bySessionId: Table[PeerId, TransportSession]
@@ -45,6 +48,9 @@ func state*(session: TransportSession): SessionState =
 
 func receivedSurbGroupCount*(session: TransportSession): int =
   session.receivedSurbGroups.len
+
+func streamCount*(session: TransportSession): int =
+  session.streams.len
 
 func peerId*(session: TransportSession): PeerId =
   ## Identity exposed to consumers of this transport. The initiator knows the
@@ -85,6 +91,8 @@ proc addInitiatorSession*(
     state: SessionState.Pending,
     established: newAsyncEvent(),
     receivedSurbGroups: initDeque[seq[SURB]](),
+    streams: initTable[uint64, TransportStream](),
+    nextOutboundStreamId: 1,
   )
   store.bySessionId[sessionId] = session
   store.byDestination[destination] = session
@@ -105,6 +113,8 @@ proc addRecipientSession*(
     state: SessionState.Pending,
     established: newAsyncEvent(),
     receivedSurbGroups: initDeque[seq[SURB]](),
+    streams: initTable[uint64, TransportStream](),
+    nextOutboundStreamId: 2,
   )
   store.bySessionId[sessionId] = session
   ok(session)
@@ -133,6 +143,59 @@ proc takeReceivedSurbGroup*(session: TransportSession): Result[seq[SURB], string
   if session.receivedSurbGroups.len == 0:
     return err("session has no received SURB groups")
   ok(session.receivedSurbGroups.popFirst())
+
+func isValidInboundStreamId(session: TransportSession, streamId: uint64): bool =
+  if streamId == 0:
+    return false
+
+  case session.role
+  of SessionRole.Initiator:
+    streamId mod 2 == 0
+  of SessionRole.Recipient:
+    streamId mod 2 == 1
+
+proc getStream*(session: TransportSession, streamId: uint64): Opt[TransportStream] =
+  session.streams.withValue(streamId, stream):
+    return Opt.some(stream[])
+  Opt.none(TransportStream)
+
+proc addOutboundStream*(
+    session: TransportSession, codec: string
+): Result[TransportStream, string] =
+  if session.state != SessionState.Established:
+    return err("cannot open a stream before the session is established")
+  if codec.len == 0:
+    return err("stream codec must not be empty")
+
+  let stream = newTransportStream(
+    session.sessionId, session.nextOutboundStreamId, codec, StreamDirection.Outbound
+  )
+  session.streams[stream.streamId] = stream
+  session.nextOutboundStreamId += 2
+  ok(stream)
+
+proc addInboundStream*(
+    session: TransportSession, streamId: uint64, codec: string
+): Result[TransportStream, string] =
+  if session.state != SessionState.Established:
+    return err("cannot accept a stream before the session is established")
+  if codec.len == 0:
+    return err("stream codec must not be empty")
+  if not session.isValidInboundStreamId(streamId):
+    return err("stream identifier was not allocated by the remote endpoint")
+  if session.streams.hasKey(streamId):
+    return err("stream identifier is already registered")
+
+  let stream =
+    newTransportStream(session.sessionId, streamId, codec, StreamDirection.Inbound)
+  session.streams[streamId] = stream
+  ok(stream)
+
+proc removeStream*(session: TransportSession, streamId: uint64): Opt[TransportStream] =
+  let stream = session.getStream(streamId).valueOr:
+    return Opt.none(TransportStream)
+  session.streams.del(streamId)
+  Opt.some(stream)
 
 proc remove*(store: SessionStore, sessionId: PeerId): Opt[TransportSession] =
   let session = store.get(sessionId).valueOr:
