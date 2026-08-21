@@ -15,7 +15,14 @@ const
   MixTransportVersion* = 1'u32
   MaxCodecBytes* = 255
   MaxStreamRejectionReasonBytes* = 255
-  MaxAckRanges* = 32
+  ReceiveWindowChunks* = 256
+  AckBitmapBytes* = ReceiveWindowChunks div 8
+  MaxInflightChunks* = 64
+  MaxRefillGroupsPerFrame* = 2
+
+static:
+  doAssert ReceiveWindowChunks mod 8 == 0
+  doAssert MaxInflightChunks <= ReceiveWindowChunks
 
 let MaxTransportFrameBytes* = getMaxMessageSizeForCodec(MixTransportCodec, 0).expect(
     "MixTransportCodec framing leaves no room for a transport frame"
@@ -37,10 +44,6 @@ type
     ResetSession = 12
     StreamReject = 13
 
-  AckRange* {.proto2.} = object
-    first* {.fieldNumber: 1, required, pint.}: uint64
-    count* {.fieldNumber: 2, required, pint.}: uint32
-
   SurbGroup* {.proto2.} = object ## Each entry contains one opaque, serialized SURB.
     surbs* {.fieldNumber: 1.}: seq[seq[byte]]
 
@@ -52,8 +55,8 @@ type
     sequence* {.fieldNumber: 5, pint.}: Opt[uint64]
     payload* {.fieldNumber: 6.}: Opt[seq[byte]]
     codec* {.fieldNumber: 7.}: Opt[string]
-    ackThrough* {.fieldNumber: 8, pint.}: Opt[uint64]
-    ackRanges* {.fieldNumber: 9.}: seq[AckRange]
+    receiveBase* {.fieldNumber: 8, pint.}: Opt[uint64]
+    acknowledgementBitmap* {.fieldNumber: 9.}: Opt[seq[byte]]
     batchId* {.fieldNumber: 10, pint.}: Opt[uint64]
     requestedGroups* {.fieldNumber: 11, pint.}: Opt[uint32]
     partIndex* {.fieldNumber: 12, pint.}: Opt[uint32]
@@ -101,11 +104,6 @@ proc validate*(frame: MixTransportFrame): Result[void, string] =
   require frame.rejectionReason.isNone or
     frame.rejectionReason.get().len <= MaxStreamRejectionReasonBytes,
     "stream rejection reason is too long"
-  require frame.ackRanges.len <= MaxAckRanges, "too many acknowledgement ranges"
-
-  for ackRange in frame.ackRanges:
-    require ackRange.count > 0, "acknowledgement range must not be empty"
-
   frame.surbGroups.validateSurbGroups().isOkOr:
     return err(error)
 
@@ -126,10 +124,13 @@ proc validate*(frame: MixTransportFrame): Result[void, string] =
     "payload does not match the frame kind"
   require frame.codec.isSome == (frame.kind == FrameKind.OpenStream),
     "codec does not match the frame kind"
-  require frame.ackThrough.isSome == (frame.kind == FrameKind.Ack),
-    "ackThrough does not match the frame kind"
-  require frame.ackRanges.len == 0 or frame.kind == FrameKind.Ack,
-    "acknowledgement ranges do not match the frame kind"
+  require frame.receiveBase.isSome == (frame.kind == FrameKind.Ack),
+    "receiveBase does not match the frame kind"
+  require frame.acknowledgementBitmap.isSome == (frame.kind == FrameKind.Ack),
+    "acknowledgement bitmap does not match the frame kind"
+  require frame.acknowledgementBitmap.isNone or
+    frame.acknowledgementBitmap.get().len == AckBitmapBytes,
+    "acknowledgement bitmap has the wrong size"
   require frame.batchId.isSome ==
     (frame.kind in {FrameKind.RefillRequest, FrameKind.Refill}),
     "batchId does not match the frame kind"
@@ -153,6 +154,8 @@ proc validate*(frame: MixTransportFrame): Result[void, string] =
     require frame.payload.get().len > 0, "data payload must not be empty"
   of FrameKind.RefillRequest:
     require frame.requestedGroups.get() > 0, "refill must request at least one group"
+    require frame.requestedGroups.get() <= MaxRefillGroupsPerFrame,
+      "refill requests too many groups"
   of FrameKind.Refill:
     require frame.surbGroups.len > 0, "refill must provide at least one SURB group"
     require frame.partCount.get() > 0, "refill partCount must not be zero"
@@ -170,6 +173,29 @@ proc encode*(frame: MixTransportFrame): Result[seq[byte], string] =
   let encoded = Protobuf.encode(frame)
   require encoded.len <= MaxTransportFrameBytes, "transport frame is too large"
   ok(encoded)
+
+proc dataPayloadCapacity*(sessionId: PeerId, streamId: uint64, sequence: uint64): int =
+  ## Return the largest Data payload that fits after encoding this frame's
+  ## actual identifiers and sequence number.
+  var
+    lower = 1
+    upper = MaxTransportFrameBytes
+  while lower <= upper:
+    let
+      candidate = lower + (upper - lower) div 2
+      frame = MixTransportFrame(
+        version: MixTransportVersion,
+        sessionId: sessionId,
+        kind: FrameKind.Data,
+        streamId: Opt.some(streamId),
+        sequence: Opt.some(sequence),
+        payload: Opt.some(newSeq[byte](candidate)),
+      )
+    if Protobuf.encode(frame).len <= MaxTransportFrameBytes:
+      result = candidate
+      lower = candidate + 1
+    else:
+      upper = candidate - 1
 
 proc decodeFrame(data: seq[byte]): MixTransportFrame {.raises: [SerializationError].} =
   Protobuf.decode(data, MixTransportFrame)

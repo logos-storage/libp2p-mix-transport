@@ -6,6 +6,7 @@ import chronos, results
 import libp2p/multistream
 import libp2p/peerid
 import libp2p/protocols/protocol
+import libp2p/stream/bufferstream
 import libp2p/stream/connection
 import libp2p/utils/future
 import libp2p/utils/opt
@@ -20,6 +21,8 @@ const
   DefaultConnectSurbRedundancy* = 2
   DefaultOpenStreamReplyGroups* = 2
   DefaultOpenStreamSurbRedundancy* = 2
+  DefaultRefillGroups* = MaxRefillGroupsPerFrame.int
+  DefaultRefillSurbRedundancy* = 2
   UnknownStreamRejectionReason = "remote rejected the stream for an unknown reason"
 
 type MixTransport* = ref object
@@ -29,11 +32,21 @@ type MixTransport* = ref object
   connectTimeout: Duration
   streamOpenTimeout: Duration
   handlerTasks: seq[Future[void].Raising([CancelledError])]
+  streamTasks: seq[Future[void].Raising([CancelledError])]
   started: bool
 
 type PreparedReplyGroups = object
   encoded: seq[SurbGroup]
   credentials: seq[ReplyCredentialGroup]
+
+proc handleRefillRequest(
+  self: MixTransport, session: TransportSession, frame: MixTransportFrame
+): Future[void] {.async: (raises: [CancelledError]).}
+
+proc handleData(self: MixTransport, frame: MixTransportFrame) {.gcsafe, raises: [].}
+proc handleAcknowledgement(
+  self: MixTransport, frame: MixTransportFrame
+) {.gcsafe, raises: [].}
 
 proc runProtocolHandler(
     session: TransportSession, stream: TransportStream, protocol: LPProtocol
@@ -73,6 +86,14 @@ proc handleReplyFrame(
       stream.reject(
         if rejectionReason.len == 0: UnknownStreamRejectionReason else: rejectionReason
       )
+  of FrameKind.Data:
+    self.handleData(frame)
+  of FrameKind.Ack:
+    self.handleAcknowledgement(frame)
+  of FrameKind.RefillRequest:
+    if session.role == SessionRole.Initiator and
+        session.state == SessionState.Established:
+      await self.handleRefillRequest(session, frame)
   else:
     discard
 
@@ -89,6 +110,186 @@ proc sendWithSurbGroup(
   if not sent:
     return err("could not send through any SURB in the reply group")
   ok()
+
+proc requestRefill(
+    self: MixTransport, session: TransportSession
+): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
+  let batchId = session.beginRefill().valueOr:
+    return ok()
+
+  var replyGroup = session.takeReceivedSurbGroup().valueOr:
+    session.cancelRefill(batchId)
+    return err("could not reserve a SURB group for refill: " & error)
+  let request = MixTransportFrame(
+    version: MixTransportVersion,
+    sessionId: session.sessionId,
+    kind: FrameKind.RefillRequest,
+    batchId: Opt.some(batchId),
+    requestedGroups: Opt.some(DefaultRefillGroups.uint32),
+  ).encode().valueOr:
+    session.cancelRefill(batchId)
+    return err("could not encode RefillRequest: " & error)
+  (await self.sendWithSurbGroup(replyGroup, request)).isOkOr:
+    session.cancelRefill(batchId)
+    return err("could not send RefillRequest: " & error)
+  ok()
+
+proc sendStreamFrame(
+    self: MixTransport, session: TransportSession, frame: MixTransportFrame
+): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
+  let payload = frame.encode().valueOr:
+    return err("could not encode " & $frame.kind & " frame: " & error)
+
+  case session.role
+  of SessionRole.Initiator:
+    let destination = session.destination.valueOr:
+      return err("initiator session has no destination")
+    (
+      await self.mix.send(
+        MixDestination.exitNode(destination), MixTransportCodec, payload
+      )
+    ).isOkOr:
+      return err("could not send " & $frame.kind & " frame: " & error)
+  of SessionRole.Recipient:
+    await session.acquireReplySend()
+    defer:
+      session.releaseReplySend()
+    (await self.requestRefill(session)).isOkOr:
+      return err(error)
+    await session.waitForOrdinarySurbGroup()
+    var replyGroup = session.takeOrdinarySurbGroup().valueOr:
+      return err(error)
+    (await self.sendWithSurbGroup(replyGroup, payload)).isOkOr:
+      return err("could not send " & $frame.kind & " frame: " & error)
+    (await self.requestRefill(session)).isOkOr:
+      return err(error)
+  ok()
+
+proc writeStream(
+    self: MixTransport,
+    session: TransportSession,
+    stream: TransportStream,
+    data: sink seq[byte],
+): Future[void] {.async: (raises: [CancelledError, LPStreamError]).} =
+  if stream.state != StreamState.Established:
+    raise newException(LPStreamError, "MixTransport stream is not established")
+
+  var offset = 0
+  while offset < data.len:
+    await stream.waitForOutboundCapacity()
+    let
+      sequence = stream.nextOutboundSequence
+      capacity = dataPayloadCapacity(session.sessionId, stream.streamId, sequence)
+    if capacity <= 0:
+      raise newException(LPStreamError, "Data frame has no payload capacity")
+
+    let chunkLength = min(capacity, data.len - offset)
+    var chunk = data[offset ..< offset + chunkLength]
+    let reservedSequence = stream.reserveOutbound(chunk).valueOr:
+      raise newException(LPStreamError, error)
+    let frame = MixTransportFrame(
+      version: MixTransportVersion,
+      sessionId: session.sessionId,
+      kind: FrameKind.Data,
+      streamId: Opt.some(stream.streamId),
+      sequence: Opt.some(reservedSequence),
+      payload: Opt.some(move(chunk)),
+    )
+    (await self.sendStreamFrame(session, frame)).isOkOr:
+      stream.cancelOutbound(reservedSequence)
+      raise newException(LPStreamError, error)
+    offset += chunkLength
+    stream.activity = true
+
+proc runInboundDelivery(stream: TransportStream) {.async: (raises: [CancelledError]).} =
+  while not stream.closed:
+    stream.clearInboundDataAvailable()
+    while true:
+      var inbound = stream.takeNextInbound().valueOr:
+        break
+      try:
+        await stream.pushData(move(inbound.payload))
+      except LPStreamError:
+        return
+      stream.markInboundDelivered(inbound.sequence)
+    await stream.waitForInboundData()
+
+proc runAcknowledgements(
+    self: MixTransport, session: TransportSession, stream: TransportStream
+) {.async: (raises: [CancelledError]).} =
+  var sentRevision = 0'u64
+  while not stream.closed:
+    await stream.waitForAcknowledgementNeeded()
+    if stream.closed:
+      return
+    stream.clearAcknowledgementNeeded()
+    let snapshot = stream.acknowledgementSnapshot()
+    if snapshot.revision == sentRevision:
+      continue
+
+    let frame = MixTransportFrame(
+      version: MixTransportVersion,
+      sessionId: session.sessionId,
+      kind: FrameKind.Ack,
+      streamId: Opt.some(stream.streamId),
+      receiveBase: Opt.some(snapshot.receiveBase),
+      acknowledgementBitmap: Opt.some(snapshot.acknowledgementBitmap),
+    )
+    if (await self.sendStreamFrame(session, frame)).isErr:
+      return
+    sentRevision = snapshot.revision
+
+proc configureStream(
+    self: MixTransport, session: TransportSession, stream: TransportStream
+) =
+  let writeHandler: StreamWriteHandler = proc(
+      data: sink seq[byte]
+  ): Future[void] {.async: (raises: [CancelledError, LPStreamError]).} =
+    await self.writeStream(session, stream, move(data))
+  stream.setWriteHandler(writeHandler)
+  self.streamTasks.trackFut(runInboundDelivery(stream))
+  self.streamTasks.trackFut(runAcknowledgements(self, session, stream))
+
+proc handleData(self: MixTransport, frame: MixTransportFrame) {.gcsafe, raises: [].} =
+  let session = self.sessions.get(frame.sessionId).valueOr:
+    return
+  if session.state != SessionState.Established:
+    return
+  let stream = session.getStream(frame.streamId.get()).valueOr:
+    return
+  if stream.state != StreamState.Established:
+    return
+  discard stream.receiveData(frame.sequence.get(), frame.payload.get())
+
+proc handleAcknowledgement(
+    self: MixTransport, frame: MixTransportFrame
+) {.gcsafe, raises: [].} =
+  let session = self.sessions.get(frame.sessionId).valueOr:
+    return
+  if session.state != SessionState.Established:
+    return
+  let stream = session.getStream(frame.streamId.get()).valueOr:
+    return
+  if stream.state != StreamState.Established:
+    return
+  discard stream.applyAcknowledgement(
+    frame.receiveBase.get(), frame.acknowledgementBitmap.get()
+  )
+
+proc handleRefill(self: MixTransport, frame: MixTransportFrame) {.gcsafe, raises: [].} =
+  let session = self.sessions.get(frame.sessionId).valueOr:
+    return
+  if session.role != SessionRole.Recipient or session.state != SessionState.Established:
+    return
+
+  var decodedGroups = newSeqOfCap[seq[SURB]](frame.surbGroups.len)
+  for encodedGroup in frame.surbGroups:
+    let group = encodedGroup.decodeSurbs().valueOr:
+      return
+    decodedGroups.add(group)
+  if not session.completeRefill(frame.batchId.get()):
+    return
+  discard session.addReceivedSurbGroups(decodedGroups)
 
 proc sendStreamResponse(
     self: MixTransport,
@@ -210,7 +411,9 @@ proc handleOpenStream(
   if not await self.sendStreamResponse(session, stream.streamId, FrameKind.StreamAck):
     return
 
+  self.configureStream(session, stream)
   stream.establish()
+  discard await self.requestRefill(session)
   keepStream = true
   keepReservation = true
   self.handlerTasks.trackFut(runProtocolHandler(session, stream, protocol))
@@ -225,6 +428,12 @@ proc handleDelivery(
     await self.handleConnect(frame)
   of FrameKind.OpenStream:
     await self.handleOpenStream(frame)
+  of FrameKind.Data:
+    self.handleData(frame)
+  of FrameKind.Ack:
+    self.handleAcknowledgement(frame)
+  of FrameKind.Refill:
+    self.handleRefill(frame)
   else:
     discard
 
@@ -304,6 +513,32 @@ proc retireReplyGroups(self: MixTransport, groups: openArray[ReplyCredentialGrou
   for group in groups:
     self.replyCredentials.consume(group)
 
+proc handleRefillRequest(
+    self: MixTransport, session: TransportSession, frame: MixTransportFrame
+): Future[void] {.async: (raises: [CancelledError]).} =
+  let destination = session.destination.valueOr:
+    return
+  let prepared = self.createReplyGroups(
+    destination,
+    session.sessionId,
+    frame.requestedGroups.get().int,
+    DefaultRefillSurbRedundancy,
+  ).valueOr:
+    return
+
+  let refill = MixTransportFrame(
+    version: MixTransportVersion,
+    sessionId: session.sessionId,
+    kind: FrameKind.Refill,
+    batchId: frame.batchId,
+    partIndex: Opt.some(0'u32),
+    partCount: Opt.some(1'u32),
+    surbGroups: prepared.encoded,
+  )
+  (await self.sendStreamFrame(session, refill)).isOkOr:
+    self.retireReplyGroups(prepared.credentials)
+    return
+
 proc createConnectFrame(
     self: MixTransport, destination: PeerId, sessionId: PeerId
 ): Result[MixTransportFrame, string] =
@@ -375,7 +610,6 @@ proc dial*(
     return err(error)
   let stream = session.addOutboundStream(codec).valueOr:
     return err(error)
-
   var keepStream = false
   defer:
     if not keepStream:
@@ -414,6 +648,7 @@ proc dial*(
   if stream.state == StreamState.Rejected:
     return err(stream.rejectionReason)
 
+  self.configureStream(session, stream)
   keepStream = true
   ok(stream)
 
@@ -451,6 +686,8 @@ proc stop*(self: MixTransport): Future[void] {.async: (raises: [CancelledError])
   self.mix.unregisterMixDeliveryHandler(MixTransportCodec)
   await self.handlerTasks.cancelAndWait()
   self.handlerTasks.setLen(0)
+  await self.streamTasks.cancelAndWait()
+  self.streamTasks.setLen(0)
   self.replyCredentials.clear()
   self.sessions.clear()
   self.started = false

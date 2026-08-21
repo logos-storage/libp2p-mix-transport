@@ -49,6 +49,28 @@ suite "MixTransport wire format":
       decoded.sequence == frame.sequence
       decoded.payload == frame.payload
 
+  test "acknowledgement bitmap has the fixed receive-window size":
+    let frame = MixTransportFrame(
+      version: MixTransportVersion,
+      sessionId: randomSessionId(),
+      kind: FrameKind.Ack,
+      streamId: Opt.some(7'u64),
+      receiveBase: Opt.some(12'u64),
+      acknowledgementBitmap: Opt.some(newSeq[byte](AckBitmapBytes)),
+    )
+
+    let decoded = MixTransportFrame
+      .decode(frame.encode().expect("encode failed"))
+      .expect("decode failed")
+
+    check:
+      decoded.receiveBase == frame.receiveBase
+      decoded.acknowledgementBitmap == frame.acknowledgementBitmap
+
+    var wrongSize = frame
+    wrongSize.acknowledgementBitmap = Opt.some(newSeq[byte](AckBitmapBytes - 1))
+    check wrongSize.encode().isErr
+
   test "refill frame preserves grouped SURBs":
     let frame = MixTransportFrame(
       version: MixTransportVersion,
