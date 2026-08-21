@@ -11,6 +11,10 @@ import libp2p/utils/opt
 import libp2p_mix
 import ./streams
 
+const
+  ReplyControlReserveGroups* = 2
+  ReplyRefillLowWatermarkGroups* = ReplyControlReserveGroups
+
 type
   SessionRole* {.pure.} = enum
     Initiator
@@ -27,6 +31,10 @@ type
     state: SessionState
     established: AsyncEvent
     receivedSurbGroups: Deque[seq[SURB]]
+    receivedSurbGroupsAvailable: AsyncEvent
+    replySendLock: AsyncLock
+    pendingRefillBatchId: Opt[uint64]
+    nextRefillBatchId: uint64
     streams: Table[uint64, TransportStream]
     nextOutboundStreamId: uint64
 
@@ -91,6 +99,10 @@ proc addInitiatorSession*(
     state: SessionState.Pending,
     established: newAsyncEvent(),
     receivedSurbGroups: initDeque[seq[SURB]](),
+    receivedSurbGroupsAvailable: newAsyncEvent(),
+    replySendLock: newAsyncLock(),
+    pendingRefillBatchId: Opt.none(uint64),
+    nextRefillBatchId: 1,
     streams: initTable[uint64, TransportStream](),
     nextOutboundStreamId: 1,
   )
@@ -113,6 +125,10 @@ proc addRecipientSession*(
     state: SessionState.Pending,
     established: newAsyncEvent(),
     receivedSurbGroups: initDeque[seq[SURB]](),
+    receivedSurbGroupsAvailable: newAsyncEvent(),
+    replySendLock: newAsyncLock(),
+    pendingRefillBatchId: Opt.none(uint64),
+    nextRefillBatchId: 1,
     streams: initTable[uint64, TransportStream](),
     nextOutboundStreamId: 2,
   )
@@ -137,12 +153,61 @@ proc addReceivedSurbGroups*(
 
   for group in groups.mitems:
     session.receivedSurbGroups.addLast(move(group))
+  if groups.len > 0:
+    session.receivedSurbGroupsAvailable.fire()
   ok()
 
 proc takeReceivedSurbGroup*(session: TransportSession): Result[seq[SURB], string] =
   if session.receivedSurbGroups.len == 0:
     return err("session has no received SURB groups")
   ok(session.receivedSurbGroups.popFirst())
+
+proc takeOrdinarySurbGroup*(session: TransportSession): Result[seq[SURB], string] =
+  if session.receivedSurbGroups.len <= ReplyControlReserveGroups:
+    return err("session reply capacity is reserved for control traffic")
+  ok(session.receivedSurbGroups.popFirst())
+
+proc waitForOrdinarySurbGroup*(
+    session: TransportSession
+): Future[void] {.async: (raises: [CancelledError]).} =
+  while session.receivedSurbGroups.len <= ReplyControlReserveGroups:
+    session.receivedSurbGroupsAvailable.clear()
+    if session.receivedSurbGroups.len <= ReplyControlReserveGroups:
+      await session.receivedSurbGroupsAvailable.wait()
+
+proc acquireReplySend*(
+    session: TransportSession
+): Future[void] {.async: (raises: [CancelledError]).} =
+  await session.replySendLock.acquire()
+
+proc releaseReplySend*(session: TransportSession) =
+  try:
+    session.replySendLock.release()
+  except AsyncLockError as exc:
+    raiseAssert "session reply-send lock was not held: " & exc.msg
+
+func refillNeeded*(session: TransportSession): bool =
+  session.role == SessionRole.Recipient and
+    session.receivedSurbGroups.len <= ReplyRefillLowWatermarkGroups and
+    session.pendingRefillBatchId.isNone
+
+proc beginRefill*(session: TransportSession): Opt[uint64] =
+  if not session.refillNeeded:
+    return Opt.none(uint64)
+  let batchId = session.nextRefillBatchId
+  inc session.nextRefillBatchId
+  session.pendingRefillBatchId = Opt.some(batchId)
+  Opt.some(batchId)
+
+proc cancelRefill*(session: TransportSession, batchId: uint64) =
+  if session.pendingRefillBatchId == Opt.some(batchId):
+    session.pendingRefillBatchId = Opt.none(uint64)
+
+proc completeRefill*(session: TransportSession, batchId: uint64): bool =
+  if session.pendingRefillBatchId != Opt.some(batchId):
+    return false
+  session.pendingRefillBatchId = Opt.none(uint64)
+  true
 
 func isValidInboundStreamId(session: TransportSession, streamId: uint64): bool =
   if streamId == 0:

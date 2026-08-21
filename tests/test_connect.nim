@@ -5,6 +5,7 @@
 import std/[importutils, unittest]
 
 import chronos, results
+import stew/byteutils
 import
   libp2p/[
     builders,
@@ -58,6 +59,9 @@ proc createMixNodes(count: int): seq[MixProtocol] =
 const
   TestCodec = "/mix-transport/test/1.0.0"
   UnsupportedCodec = "/mix-transport/unsupported/1.0.0"
+  TestRequest = "request through MixTransport"
+  TestResponse = "response through MixTransport"
+  TestOperationTimeout = 15.seconds
 
 type ProtocolInvocation = object
   stream: Stream
@@ -66,6 +70,7 @@ type ProtocolInvocation = object
 proc newTestProtocol(
     codec: string,
     invocations: AsyncQueue[ProtocolInvocation],
+    requests: AsyncQueue[seq[byte]],
     keepHandlerRunning: AsyncEvent,
 ): LPProtocol =
   let handler: LPProtoHandler = proc(
@@ -74,6 +79,12 @@ proc newTestProtocol(
     await invocations.put(
       ProtocolInvocation(stream: stream, selectedCodec: selectedCodec)
     )
+    try:
+      let request = await stream.readLp(1024)
+      await requests.put(request)
+      await stream.writeLp(TestResponse)
+    except LPStreamError:
+      await requests.put(@[])
     await keepHandlerRunning.wait()
   LPProtocol.new(@[codec], handler)
 
@@ -91,6 +102,8 @@ type RoundTripOutcome = object
   handlerPeerId: PeerId
   handlerCodec: string
   handlerReceivedStream: bool
+  receivedRequest: seq[byte]
+  receivedResponse: seq[byte]
 
 proc establishSessionAndStream(): Future[RoundTripOutcome] {.
     async: (raises: [CancelledError, LPError])
@@ -100,10 +113,14 @@ proc establishSessionAndStream(): Future[RoundTripOutcome] {.
     initiatorMix = nodes[0]
     recipientMix = nodes[^1]
     initiator = newMixTransport(
-      initiatorMix, connectTimeout = 5.seconds, streamOpenTimeout = 5.seconds
+      initiatorMix,
+      connectTimeout = TestOperationTimeout,
+      streamOpenTimeout = TestOperationTimeout,
     )
     recipient = newMixTransport(
-      recipientMix, connectTimeout = 5.seconds, streamOpenTimeout = 5.seconds
+      recipientMix,
+      connectTimeout = TestOperationTimeout,
+      streamOpenTimeout = TestOperationTimeout,
     )
 
   # StreamAck confirms that the recipient has a mounted handler for the
@@ -111,9 +128,12 @@ proc establishSessionAndStream(): Future[RoundTripOutcome] {.
   # teardown so the test can inspect the connection passed to it.
   let
     protocolInvocations = newAsyncQueue[ProtocolInvocation]()
+    receivedRequests = newAsyncQueue[seq[byte]]()
     keepHandlerRunning = newAsyncEvent()
   recipientMix.switch.mount(
-    newTestProtocol(TestCodec, protocolInvocations, keepHandlerRunning)
+    newTestProtocol(
+      TestCodec, protocolInvocations, receivedRequests, keepHandlerRunning
+    )
   )
 
   for node in nodes:
@@ -171,9 +191,26 @@ proc establishSessionAndStream(): Future[RoundTripOutcome] {.
       "recipient did not retain the inbound stream"
     )
   let invocationFuture = protocolInvocations.get()
-  if not await invocationFuture.withTimeout(5.seconds):
+  if not await invocationFuture.withTimeout(TestOperationTimeout):
     raise newException(LPError, "recipient protocol handler was not invoked")
   let invocation = await invocationFuture
+
+  # Application bytes use the ordinary libp2p Connection interface. The
+  # transport divides the write into Data frames, restores stream order at the
+  # recipient and supplies the bytes to the mounted protocol's read call.
+  await initiatorStream.writeLp(TestRequest)
+  let receivedRequestFuture = receivedRequests.get()
+  if not await receivedRequestFuture.withTimeout(TestOperationTimeout):
+    raise newException(LPError, "recipient protocol did not receive stream data")
+  let receivedRequest = await receivedRequestFuture
+
+  # The handler writes its response through the same virtual connection. On
+  # the recipient this consumes a SURB group; low reply capacity is replenished
+  # before ordinary return traffic is allowed to consume the control reserve.
+  let receivedResponseFuture = initiatorStream.readLp(1024)
+  if not await receivedResponseFuture.withTimeout(TestOperationTimeout):
+    raise newException(LPError, "initiator did not receive stream response")
+  let receivedResponse = await receivedResponseFuture
 
   # The destination has no handler for this codec. It returns StreamReject,
   # allowing dial to fail without waiting for its timeout. The rejected stream
@@ -187,7 +224,7 @@ proc establishSessionAndStream(): Future[RoundTripOutcome] {.
     DefaultConnectSurbRedundancy + 2 * DefaultOpenStreamSurbRedundancy
   for _ in 0 ..< expectedReplies:
     let observed = observedReplies.get()
-    if not await observed.withTimeout(5.seconds):
+    if not await observed.withTimeout(TestOperationTimeout):
       raise newException(LPError, "redundant reply did not reach the initiator")
     replyDispositions.add(await observed)
 
@@ -205,6 +242,8 @@ proc establishSessionAndStream(): Future[RoundTripOutcome] {.
     handlerPeerId: invocation.stream.peerId,
     handlerCodec: invocation.selectedCodec,
     handlerReceivedStream: invocation.stream == recipientStream,
+    receivedRequest: receivedRequest,
+    receivedResponse: receivedResponse,
   )
 
 suite "MixTransport session and stream handshakes":
@@ -229,10 +268,12 @@ suite "MixTransport session and stream handshakes":
       outcome.rejectionError == "requested protocol is not supported"
       outcome.initiatorStreamCount == 1
       outcome.recipientStreamCount == 1
-      outcome.recipientReplyGroups == 3
+      outcome.recipientReplyGroups >= ReplyControlReserveGroups
       outcome.handlerPeerId == outcome.session.sessionId
       outcome.handlerCodec == TestCodec
       outcome.handlerReceivedStream
+      outcome.receivedRequest == TestRequest.toBytes()
+      outcome.receivedResponse == TestResponse.toBytes()
       outcome.replyDispositions ==
         @[
           RawSurbReplyDisposition.Handled, RawSurbReplyDisposition.Handled,

@@ -129,3 +129,36 @@ suite "MixTransport streams":
     check:
       stream.state == StreamState.Rejected
       stream.rejectionReason == "test rejection"
+
+  test "the acknowledgement bitmap retains and orders received chunks":
+    let
+      rng = newRng()
+      store = newSessionStore()
+      session = store.addRecipientSession(randomPeerId(rng)).expect(
+          "could not add recipient session"
+        )
+    session.establish()
+    let stream =
+      session.addInboundStream(1, "/test/1").expect("could not add inbound stream")
+
+    check:
+      stream.receiveData(2, @[2'u8]) == InboundDataDisposition.Accepted
+      stream.takeNextInbound().isNone
+      stream.receiveData(1, @[1'u8]) == InboundDataDisposition.Accepted
+      stream.receiveData(2, @[2'u8]) == InboundDataDisposition.Duplicate
+
+    var first = stream.takeNextInbound().expect("sequence 1 was not ready")
+    check:
+      first.sequence == 1
+      first.payload == @[1'u8]
+    stream.markInboundDelivered(first.sequence)
+
+    var second = stream.takeNextInbound().expect("sequence 2 was not ready")
+    check:
+      second.sequence == 2
+      second.payload == @[2'u8]
+    stream.markInboundDelivered(second.sequence)
+
+    check:
+      stream.receiveBase == 3
+      stream.pendingInboundCount == 0
