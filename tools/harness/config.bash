@@ -5,10 +5,11 @@ LIB_SRC=${LIB_SRC:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
 # shellcheck source=./utils.bash
 source "$LIB_SRC/utils.bash"
 
-export TR_RUNTIME_FOLDER=$(realpath "${LIB_SRC}/../runtime")
-export TR_LOGS_FOLDER="${TR_RUNTIME_FOLDER}/logs"
+TR_RUNTIME_FOLDER=$(realpath "${LIB_SRC}/../runtime")
+export TR_RUNTIME_FOLDER
 TR_NODE_BINARY="$(realpath "${LIB_SRC}/../node")"
 export TR_NODE_BINARY
+export TR_LOGS_FOLDER="${TR_RUNTIME_FOLDER}/logs"
 
 echoerr "Configured variables:"
 env | grep "^TR_"

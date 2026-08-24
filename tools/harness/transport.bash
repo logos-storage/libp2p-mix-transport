@@ -19,14 +19,14 @@ _tr_urls() {
   local -n urls_ref=$1
   local idx
   for idx in "${!_node_pids[@]}"; do
-    urls_ref+=("http://127.0.0.1:$(( _base_api_port + idx ))")
+    urls_ref+=("http://127.0.0.1:$((_base_api_port + idx))")
   done
 }
 
 tr_start_node() {
   local node_index=$1
-  local api_port=$(( _base_api_port + node_index ))
-  local listen_port=$(( _base_listen_port + node_index ))
+  local api_port=$((_base_api_port + node_index))
+  local listen_port=$((_base_listen_port + node_index))
   local args=("--api-port=$api_port" "--listen-port=$listen_port")
 
   local tr_cmd=(
@@ -42,7 +42,7 @@ tr_start_node() {
 
   echoerr "Command: ${tr_cmd[*]}"
 
-  "${tr_cmd[@]}" &> "${TR_LOGS_FOLDER}/node-${node_index}.log" &
+  "${tr_cmd[@]}" &>"${TR_LOGS_FOLDER}/node-${node_index}.log" &
   _node_pids[$node_index]=$!
 }
 
@@ -80,4 +80,3 @@ tr_destroy() {
   tr_kill_nodes
   clean_folders
 }
-
