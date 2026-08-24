@@ -162,3 +162,29 @@ suite "MixTransport streams":
     check:
       stream.receiveBase == 3
       stream.pendingInboundCount == 0
+
+  test "closing wakes a writer blocked by the outbound capacity limit":
+    let
+      rng = newRng()
+      store = newSessionStore()
+      session = store.addRecipientSession(randomPeerId(rng)).expect(
+          "could not add recipient session"
+        )
+    session.establish()
+    let stream =
+      session.addInboundStream(1, "/test/1").expect("could not add inbound stream")
+
+    for index in 0 ..< MaxInflightChunks:
+      discard stream.reserveOutbound(@[byte(index)]).expect(
+          "could not fill outbound capacity"
+        )
+
+    let waitingForCapacity = stream.waitForOutboundCapacity()
+    check not waitingForCapacity.finished
+
+    # TransportStream.closeImpl fires sendStateChanged so a writer blocked on
+    # outbound capacity can wake and observe that the stream has closed.
+    waitFor stream.close()
+
+    expect LPStreamClosedError:
+      waitFor waitingForCapacity
