@@ -182,12 +182,13 @@ func canReserveOutbound*(stream: TransportStream): bool =
 proc waitForOutboundCapacity*(
     stream: TransportStream
 ): Future[void] {.async: (raises: [CancelledError, LPStreamError]).} =
-  while not stream.canReserveOutbound:
+  while true:
     if stream.closed:
       raise newLPStreamClosedError()
+    if stream.canReserveOutbound:
+      return
     stream.sendStateChanged.clear()
-    if not stream.canReserveOutbound:
-      await stream.sendStateChanged.wait()
+    await stream.sendStateChanged.wait()
 
 proc reserveOutbound*(
     stream: TransportStream, payload: seq[byte]
