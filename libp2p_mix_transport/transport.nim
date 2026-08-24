@@ -217,15 +217,12 @@ proc runInboundDelivery(stream: TransportStream) {.async: (raises: [CancelledErr
 proc runAcknowledgements(
     self: MixTransport, session: TransportSession, stream: TransportStream
 ) {.async: (raises: [CancelledError]).} =
-  var sentRevision = 0'u64
   while not stream.closed:
-    await stream.waitForAcknowledgementNeeded()
+    await stream.waitForShouldSendAck()
     if stream.closed:
       return
-    stream.clearAcknowledgementNeeded()
+    stream.clearShouldSendAck()
     let snapshot = stream.acknowledgementSnapshot()
-    if snapshot.revision == sentRevision:
-      continue
 
     let frame = MixTransportFrame(
       version: MixTransportVersion,
@@ -237,7 +234,6 @@ proc runAcknowledgements(
     )
     if (await self.sendStreamFrame(session, frame)).isErr:
       return
-    sentRevision = snapshot.revision
 
 proc configureStream(
     self: MixTransport, session: TransportSession, stream: TransportStream
