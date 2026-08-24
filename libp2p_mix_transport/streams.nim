@@ -24,7 +24,6 @@ type
   AckSnapshot* = object
     receiveBase*: uint64
     acknowledgementBitmap*: seq[byte]
-    revision*: uint64
 
   StreamDirection* {.pure.} = enum
     Outbound
@@ -53,8 +52,7 @@ type
     acknowledgementBitmap: seq[byte]
     pendingInbound: Table[uint64, seq[byte]]
     dataAvailable: AsyncEvent
-    acknowledgementNeeded: AsyncEvent
-    acknowledgementRevision: uint64
+    shouldSendAck: AsyncEvent
 
 func sessionId*(stream: TransportStream): PeerId =
   stream.sessionId
@@ -111,27 +109,22 @@ proc shiftBitmap(stream: TransportStream) =
     stream.acknowledgementBitmap[index] =
       (stream.acknowledgementBitmap[index] shr 1) or carry
 
-proc requestAcknowledgement(stream: TransportStream) =
-  inc stream.acknowledgementRevision
-  stream.acknowledgementNeeded.fire()
+proc fireShouldSendAckEvent(stream: TransportStream) =
+  stream.shouldSendAck.fire()
 
 proc acknowledgementSnapshot*(stream: TransportStream): AckSnapshot =
   var bitmap = newSeq[byte](AckBitmapBytes)
   for index, value in stream.acknowledgementBitmap:
     bitmap[index] = value
-  AckSnapshot(
-    receiveBase: stream.receiveBase,
-    acknowledgementBitmap: move(bitmap),
-    revision: stream.acknowledgementRevision,
-  )
+  AckSnapshot(receiveBase: stream.receiveBase, acknowledgementBitmap: move(bitmap))
 
-proc waitForAcknowledgementNeeded*(
+proc waitForShouldSendAck*(
     stream: TransportStream
 ): Future[void].Raising([CancelledError]) =
-  stream.acknowledgementNeeded.wait().join()
+  stream.shouldSendAck.wait().join()
 
-proc clearAcknowledgementNeeded*(stream: TransportStream) =
-  stream.acknowledgementNeeded.clear()
+proc clearShouldSendAck*(stream: TransportStream) =
+  stream.shouldSendAck.clear()
 
 proc waitForInboundData*(
     stream: TransportStream
@@ -145,21 +138,21 @@ proc receiveData*(
     stream: TransportStream, sequence: uint64, payload: sink seq[byte]
 ): InboundDataDisposition =
   if sequence < stream.receiveBase:
-    stream.requestAcknowledgement()
+    stream.fireShouldSendAckEvent()
     return InboundDataDisposition.Duplicate
 
   let offset = sequence - stream.receiveBase
   if offset >= ReceiveWindowChunks.uint64:
-    stream.requestAcknowledgement()
+    stream.fireShouldSendAckEvent()
     return InboundDataDisposition.OutsideWindow
   if stream.acknowledgementBitmap.bitmapContains(offset):
-    stream.requestAcknowledgement()
+    stream.fireShouldSendAckEvent()
     return InboundDataDisposition.Duplicate
 
   stream.pendingInbound[sequence] = move(payload)
   stream.acknowledgementBitmap.setBitmapBit(offset)
   stream.dataAvailable.fire()
-  stream.requestAcknowledgement()
+  stream.fireShouldSendAckEvent()
   InboundDataDisposition.Accepted
 
 proc takeNextInbound*(
@@ -179,7 +172,7 @@ proc markInboundDelivered*(stream: TransportStream, sequence: uint64) =
   doAssert stream.acknowledgementBitmap.bitmapContains(0)
   stream.shiftBitmap()
   inc stream.receiveBase
-  stream.requestAcknowledgement()
+  stream.fireShouldSendAckEvent()
   if stream.acknowledgementBitmap.bitmapContains(0):
     stream.dataAvailable.fire()
 
@@ -275,7 +268,7 @@ method closeImpl*(
     stream: TransportStream
 ): Future[void] {.async: (raises: [], raw: true).} =
   stream.dataAvailable.fire()
-  stream.acknowledgementNeeded.fire()
+  stream.shouldSendAck.fire()
   stream.sendStateChanged.fire()
   procCall BufferStream(stream).closeImpl()
 
@@ -309,7 +302,7 @@ proc newTransportStream*(
     acknowledgementBitmap: newSeq[byte](AckBitmapBytes),
     pendingInbound: initTable[uint64, seq[byte]](),
     dataAvailable: newAsyncEvent(),
-    acknowledgementNeeded: newAsyncEvent(),
+    shouldSendAck: newAsyncEvent(),
     dir: libp2pDirection,
     transportDir: libp2pDirection,
     protocol: codec,
