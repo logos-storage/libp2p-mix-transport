@@ -143,7 +143,6 @@ proc receiveData*(
 
   let offset = sequence - stream.receiveBase
   if offset >= ReceiveWindowChunks.uint64:
-    stream.fireShouldSendAckEvent()
     return InboundDataDisposition.OutsideWindow
   if stream.acknowledgementBitmap.bitmapContains(offset):
     stream.fireShouldSendAckEvent()
