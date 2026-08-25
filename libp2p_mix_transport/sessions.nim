@@ -10,6 +10,7 @@ import libp2p/peerid
 import libp2p/utils/opt
 import libp2p_mix
 import ./streams
+from ./wire import MaxSessionIdBytes, StreamId
 
 const
   ReplyControlReserveGroups* = 2
@@ -35,8 +36,8 @@ type
     replySendLock: AsyncLock
     pendingRefillBatchId: Opt[uint64]
     nextRefillBatchId: uint64
-    streams: Table[uint64, TransportStream]
-    nextOutboundStreamId: uint64
+    streams: Table[StreamId, TransportStream]
+    nextOutboundStreamId: Opt[StreamId]
 
   SessionStore* = ref object
     bySessionId: Table[PeerId, TransportSession]
@@ -87,6 +88,8 @@ proc addInitiatorSession*(
     return err("destination must not be empty")
   if sessionId.len == 0:
     return err("sessionId must not be empty")
+  if sessionId.len > MaxSessionIdBytes:
+    return err("sessionId is too long")
   if store.byDestination.hasKey(destination):
     return err("destination already has a session")
   if store.bySessionId.hasKey(sessionId):
@@ -103,8 +106,8 @@ proc addInitiatorSession*(
     replySendLock: newAsyncLock(),
     pendingRefillBatchId: Opt.none(uint64),
     nextRefillBatchId: 1,
-    streams: initTable[uint64, TransportStream](),
-    nextOutboundStreamId: 1,
+    streams: initTable[StreamId, TransportStream](),
+    nextOutboundStreamId: Opt.some(StreamId(1)),
   )
   store.bySessionId[sessionId] = session
   store.byDestination[destination] = session
@@ -115,6 +118,8 @@ proc addRecipientSession*(
 ): Result[TransportSession, string] =
   if sessionId.len == 0:
     return err("sessionId must not be empty")
+  if sessionId.len > MaxSessionIdBytes:
+    return err("sessionId is too long")
   if store.bySessionId.hasKey(sessionId):
     return err("sessionId is already registered")
 
@@ -129,8 +134,8 @@ proc addRecipientSession*(
     replySendLock: newAsyncLock(),
     pendingRefillBatchId: Opt.none(uint64),
     nextRefillBatchId: 1,
-    streams: initTable[uint64, TransportStream](),
-    nextOutboundStreamId: 2,
+    streams: initTable[StreamId, TransportStream](),
+    nextOutboundStreamId: Opt.some(StreamId(2)),
   )
   store.bySessionId[sessionId] = session
   ok(session)
@@ -209,7 +214,7 @@ proc completeRefill*(session: TransportSession, batchId: uint64): bool =
   session.pendingRefillBatchId = Opt.none(uint64)
   true
 
-func isValidInboundStreamId(session: TransportSession, streamId: uint64): bool =
+func isValidInboundStreamId(session: TransportSession, streamId: StreamId): bool =
   if streamId == 0:
     return false
 
@@ -219,10 +224,21 @@ func isValidInboundStreamId(session: TransportSession, streamId: uint64): bool =
   of SessionRole.Recipient:
     streamId mod 2 == 1
 
-proc getStream*(session: TransportSession, streamId: uint64): Opt[TransportStream] =
+proc getStream*(session: TransportSession, streamId: StreamId): Opt[TransportStream] =
   session.streams.withValue(streamId, stream):
     return Opt.some(stream[])
   Opt.none(TransportStream)
+
+proc takeNextOutboundStreamId(session: TransportSession): Result[StreamId, string] =
+  let streamId = session.nextOutboundStreamId.valueOr:
+    return err("stream identifier space is exhausted")
+
+  session.nextOutboundStreamId =
+    if streamId > StreamId.high - 2:
+      Opt.none(StreamId)
+    else:
+      Opt.some(streamId + 2)
+  ok(streamId)
 
 proc addOutboundStream*(
     session: TransportSession, codec: string
@@ -232,16 +248,16 @@ proc addOutboundStream*(
   if codec.len == 0:
     return err("stream codec must not be empty")
 
+  let streamId = session.takeNextOutboundStreamId().valueOr:
+    return err(error)
   let stream = newTransportStream(
-    session.sessionId, session.peerId, session.nextOutboundStreamId, codec,
-    StreamDirection.Outbound,
+    session.sessionId, session.peerId, streamId, codec, StreamDirection.Outbound
   )
   session.streams[stream.streamId] = stream
-  session.nextOutboundStreamId += 2
   ok(stream)
 
 proc addInboundStream*(
-    session: TransportSession, streamId: uint64, codec: string
+    session: TransportSession, streamId: StreamId, codec: string
 ): Result[TransportStream, string] =
   if session.state != SessionState.Established:
     return err("cannot accept a stream before the session is established")
@@ -258,7 +274,9 @@ proc addInboundStream*(
   session.streams[streamId] = stream
   ok(stream)
 
-proc removeStream*(session: TransportSession, streamId: uint64): Opt[TransportStream] =
+proc removeStream*(
+    session: TransportSession, streamId: StreamId
+): Opt[TransportStream] =
   let stream = session.getStream(streamId).valueOr:
     return Opt.none(TransportStream)
   session.streams.del(streamId)

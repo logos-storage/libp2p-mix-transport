@@ -10,6 +10,10 @@ import protobuf_serialization
 import protobuf_serialization/pkg/results
 import protobuf_serialization/std/enums
 
+type
+  StreamId* = uint32
+  SequenceNumber* = uint32
+
 const
   MixTransportCodec* = "/libp2p/mix-transport/1.0.0"
   MixTransportVersion* = 1'u32
@@ -19,6 +23,25 @@ const
   AckBitmapBytes* = ReceiveWindowChunks div 8
   MaxInflightChunks* = 64
   MaxRefillGroupsPerFrame* = 2
+  MaxSessionIdBytes* = 39
+  MaxDataSequenceNumber* = SequenceNumber.high - 1
+
+  # Every Data-frame field number fits in a one-byte Protobuf field tag.
+  ProtobufFieldTagBytes = 1
+  SingleByteVarintBytes = 1
+  MaxDataPayloadLengthPrefixBytes = 2
+
+  VersionFieldBytes = ProtobufFieldTagBytes + SingleByteVarintBytes
+  SessionIdFieldBytes =
+    ProtobufFieldTagBytes + SingleByteVarintBytes + MaxSessionIdBytes
+  FrameKindFieldBytes = ProtobufFieldTagBytes + SingleByteVarintBytes
+  StreamIdFieldBytes = ProtobufFieldTagBytes + sizeof(StreamId)
+  SequenceFieldBytes = ProtobufFieldTagBytes + sizeof(SequenceNumber)
+  DataPayloadHeaderBytes = ProtobufFieldTagBytes + MaxDataPayloadLengthPrefixBytes
+
+  MaxDataFrameOverheadBytes =
+    VersionFieldBytes + SessionIdFieldBytes + FrameKindFieldBytes + StreamIdFieldBytes +
+    SequenceFieldBytes + DataPayloadHeaderBytes
 
 static:
   doAssert ReceiveWindowChunks mod 8 == 0
@@ -27,6 +50,10 @@ static:
 let MaxTransportFrameBytes* = getMaxMessageSizeForCodec(MixTransportCodec, 0).expect(
     "MixTransportCodec framing leaves no room for a transport frame"
   )
+
+let MaxDataPayloadBytes* = MaxTransportFrameBytes - MaxDataFrameOverheadBytes
+
+doAssert MaxDataPayloadBytes > 0, "MixTransport Data frame has no payload capacity"
 
 type
   FrameKind* {.pure.} = enum
@@ -51,11 +78,11 @@ type
     version* {.fieldNumber: 1, required, pint.}: uint32
     sessionId* {.fieldNumber: 2, required, ext.}: PeerId
     kind* {.fieldNumber: 3, required, ext.}: FrameKind
-    streamId* {.fieldNumber: 4, pint.}: Opt[uint64]
-    sequence* {.fieldNumber: 5, pint.}: Opt[uint64]
+    streamId* {.fieldNumber: 4, fixed.}: Opt[StreamId]
+    sequence* {.fieldNumber: 5, fixed.}: Opt[SequenceNumber]
     payload* {.fieldNumber: 6.}: Opt[seq[byte]]
     codec* {.fieldNumber: 7.}: Opt[string]
-    receiveBase* {.fieldNumber: 8, pint.}: Opt[uint64]
+    receiveBase* {.fieldNumber: 8, fixed.}: Opt[SequenceNumber]
     acknowledgementBitmap* {.fieldNumber: 9.}: Opt[seq[byte]]
     batchId* {.fieldNumber: 10, pint.}: Opt[uint64]
     requestedGroups* {.fieldNumber: 11, pint.}: Opt[uint32]
@@ -99,6 +126,7 @@ proc validateSurbGroups(groups: openArray[SurbGroup]): Result[void, string] =
 proc validate*(frame: MixTransportFrame): Result[void, string] =
   require frame.version == MixTransportVersion, "unsupported transport frame version"
   require frame.sessionId.len > 0, "sessionId must not be empty"
+  require frame.sessionId.len <= MaxSessionIdBytes, "sessionId is too long"
   require frame.codec.isNone or frame.codec.get().len <= MaxCodecBytes,
     "application codec is too long"
   require frame.rejectionReason.isNone or
@@ -118,6 +146,7 @@ proc validate*(frame: MixTransportFrame): Result[void, string] =
 
   require frame.streamId.isSome == isStreamFrame,
     "streamId does not match the frame kind"
+  require frame.streamId.isNone or frame.streamId.get() > 0, "streamId must not be zero"
   require frame.sequence.isSome == (frame.kind == FrameKind.Data),
     "sequence does not match the frame kind"
   require frame.payload.isSome == (frame.kind == FrameKind.Data),
@@ -151,7 +180,11 @@ proc validate*(frame: MixTransportFrame): Result[void, string] =
   of FrameKind.OpenStream:
     require frame.codec.get().len > 0, "application codec must not be empty"
   of FrameKind.Data:
+    require frame.sequence.get() > 0, "data sequence must not be zero"
+    require frame.sequence.get() <= MaxDataSequenceNumber,
+      "data sequence space is exhausted"
     require frame.payload.get().len > 0, "data payload must not be empty"
+    require frame.payload.get().len <= MaxDataPayloadBytes, "data payload is too large"
   of FrameKind.RefillRequest:
     require frame.requestedGroups.get() > 0, "refill must request at least one group"
     require frame.requestedGroups.get() <= MaxRefillGroupsPerFrame,
@@ -173,29 +206,6 @@ proc encode*(frame: MixTransportFrame): Result[seq[byte], string] =
   let encoded = Protobuf.encode(frame)
   require encoded.len <= MaxTransportFrameBytes, "transport frame is too large"
   ok(encoded)
-
-proc dataPayloadCapacity*(sessionId: PeerId, streamId: uint64, sequence: uint64): int =
-  ## Return the largest Data payload that fits after encoding this frame's
-  ## actual identifiers and sequence number.
-  var
-    lower = 1
-    upper = MaxTransportFrameBytes
-  while lower <= upper:
-    let
-      candidate = lower + (upper - lower) div 2
-      frame = MixTransportFrame(
-        version: MixTransportVersion,
-        sessionId: sessionId,
-        kind: FrameKind.Data,
-        streamId: Opt.some(streamId),
-        sequence: Opt.some(sequence),
-        payload: Opt.some(newSeq[byte](candidate)),
-      )
-    if Protobuf.encode(frame).len <= MaxTransportFrameBytes:
-      result = candidate
-      lower = candidate + 1
-    else:
-      upper = candidate - 1
 
 proc decodeFrame(data: seq[byte]): MixTransportFrame {.raises: [SerializationError].} =
   Protobuf.decode(data, MixTransportFrame)
