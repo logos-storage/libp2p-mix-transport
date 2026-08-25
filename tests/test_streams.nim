@@ -2,13 +2,16 @@
 
 {.used.}
 
-import std/unittest
+import std/[importutils, unittest]
 
 import chronos, results
 import libp2p/[crypto/crypto, peerid, stream/connection]
 import libp2p_mix
 
 import libp2p_mix_transport
+
+privateAccess(TransportSession)
+privateAccess(TransportStream)
 
 # Callers using the package facade must register streams through their session.
 static:
@@ -58,6 +61,24 @@ suite "MixTransport streams":
       firstInitiatorStream.state == StreamState.Pending
       firstInitiatorStream.sessionId == initiatorSession.sessionId
       firstInitiatorStream.codec == "/test/1"
+
+  test "the final stream identifier is allocated once before exhaustion":
+    let
+      rng = newRng()
+      store = newSessionStore()
+      session = store.addInitiatorSession(randomPeerId(rng), randomPeerId(rng)).expect(
+          "could not add initiator session"
+        )
+    session.establish()
+    session.nextOutboundStreamId = Opt.some(StreamId.high)
+
+    let finalStream = session.addOutboundStream("/test/final").expect(
+        "could not allocate final stream identifier"
+      )
+
+    check:
+      finalStream.streamId == StreamId.high
+      session.addOutboundStream("/test/exhausted").isErr
 
   test "an inbound stream keeps the identifier selected by its remote opener":
     let
@@ -188,3 +209,19 @@ suite "MixTransport streams":
 
     expect LPStreamClosedError:
       waitFor waitingForCapacity
+
+  test "a writer observes sequence exhaustion instead of waiting forever":
+    let
+      rng = newRng()
+      store = newSessionStore()
+      session = store.addRecipientSession(randomPeerId(rng)).expect(
+          "could not add recipient session"
+        )
+    session.establish()
+    let stream =
+      session.addInboundStream(1, "/test/1").expect("could not add inbound stream")
+    stream.nextOutboundSequence = SequenceNumber.high
+
+    check stream.reserveOutbound(@[1'u8]).isErr
+    expect LPStreamError:
+      waitFor stream.waitForOutboundCapacity()

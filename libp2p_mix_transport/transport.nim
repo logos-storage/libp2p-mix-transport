@@ -177,13 +177,7 @@ proc writeStream(
   var offset = 0
   while offset < data.len:
     await stream.waitForOutboundCapacity()
-    let
-      sequence = stream.nextOutboundSequence
-      capacity = dataPayloadCapacity(session.sessionId, stream.streamId, sequence)
-    if capacity <= 0:
-      raise newException(LPStreamError, "Data frame has no payload capacity")
-
-    let chunkLength = min(capacity, data.len - offset)
+    let chunkLength = min(MaxDataPayloadBytes, data.len - offset)
     var chunk = data[offset ..< offset + chunkLength]
     let reservedSequence = stream.reserveOutbound(chunk).valueOr:
       raise newException(LPStreamError, error)
@@ -290,7 +284,7 @@ proc handleRefill(self: MixTransport, frame: MixTransportFrame) {.gcsafe, raises
 proc sendStreamResponse(
     self: MixTransport,
     session: TransportSession,
-    streamId: uint64,
+    streamId: StreamId,
     kind: FrameKind,
     rejectionReason = "",
 ): Future[bool] {.async: (raises: [CancelledError]).} =

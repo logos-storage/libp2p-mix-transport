@@ -9,7 +9,9 @@ import libp2p/peerid
 import libp2p/stream/bufferstream
 import libp2p/utils/opt
 
-from ./wire import AckBitmapBytes, MaxInflightChunks, ReceiveWindowChunks
+from ./wire import
+  AckBitmapBytes, MaxDataSequenceNumber, MaxInflightChunks, ReceiveWindowChunks,
+  SequenceNumber, StreamId
 
 type
   StreamWriteHandler* = proc(data: sink seq[byte]): Future[void] {.
@@ -22,7 +24,7 @@ type
     OutsideWindow
 
   AckSnapshot* = object
-    receiveBase*: uint64
+    receiveBase*: SequenceNumber
     acknowledgementBitmap*: seq[byte]
 
   StreamDirection* {.pure.} = enum
@@ -36,7 +38,7 @@ type
 
   TransportStream* = ref object of BufferStream
     sessionId: PeerId
-    streamId: uint64
+    streamId: StreamId
     codec: string
     direction: StreamDirection
     state: StreamState
@@ -44,20 +46,20 @@ type
     resolved: AsyncEvent
     writeHandler: StreamWriteHandler
     writeLock: AsyncLock
-    nextOutboundSequence: uint64
-    remoteReceiveBase: uint64
-    pendingOutbound: Table[uint64, seq[byte]]
+    nextOutboundSequence: SequenceNumber
+    remoteReceiveBase: SequenceNumber
+    pendingOutbound: Table[SequenceNumber, seq[byte]]
     sendStateChanged: AsyncEvent
-    receiveBase: uint64
+    receiveBase: SequenceNumber
     acknowledgementBitmap: seq[byte]
-    pendingInbound: Table[uint64, seq[byte]]
+    pendingInbound: Table[SequenceNumber, seq[byte]]
     dataAvailable: AsyncEvent
     shouldSendAck: AsyncEvent
 
 func sessionId*(stream: TransportStream): PeerId =
   stream.sessionId
 
-func streamId*(stream: TransportStream): uint64 =
+func streamId*(stream: TransportStream): StreamId =
   stream.streamId
 
 func codec*(stream: TransportStream): string =
@@ -72,7 +74,7 @@ func state*(stream: TransportStream): StreamState =
 func rejectionReason*(stream: TransportStream): string =
   stream.rejectionReason
 
-func receiveBase*(stream: TransportStream): uint64 =
+func receiveBase*(stream: TransportStream): SequenceNumber =
   stream.receiveBase
 
 func pendingInboundCount*(stream: TransportStream): int =
@@ -81,19 +83,23 @@ func pendingInboundCount*(stream: TransportStream): int =
 func pendingOutboundCount*(stream: TransportStream): int =
   stream.pendingOutbound.len
 
-func nextOutboundSequence*(stream: TransportStream): uint64 =
+func nextOutboundSequence*(stream: TransportStream): SequenceNumber =
   stream.nextOutboundSequence
 
-func remoteReceiveLimit*(stream: TransportStream): uint64 =
-  stream.remoteReceiveBase + ReceiveWindowChunks.uint64
+func remoteReceiveLimit*(stream: TransportStream): SequenceNumber =
+  let window = SequenceNumber(ReceiveWindowChunks)
+  if stream.remoteReceiveBase > SequenceNumber.high - window:
+    SequenceNumber.high
+  else:
+    stream.remoteReceiveBase + window
 
-func bitmapContains(bitmap: openArray[byte], offset: uint64): bool =
+func bitmapContains(bitmap: openArray[byte], offset: SequenceNumber): bool =
   let
     byteIndex = int(offset div 8)
     bitIndex = int(offset mod 8)
   (bitmap[byteIndex] and (1'u8 shl bitIndex)) != 0
 
-proc setBitmapBit(bitmap: var seq[byte], offset: uint64) =
+proc setBitmapBit(bitmap: var seq[byte], offset: SequenceNumber) =
   let
     byteIndex = int(offset div 8)
     bitIndex = int(offset mod 8)
@@ -135,14 +141,16 @@ proc clearInboundDataAvailable*(stream: TransportStream) =
   stream.dataAvailable.clear()
 
 proc receiveData*(
-    stream: TransportStream, sequence: uint64, payload: sink seq[byte]
+    stream: TransportStream, sequence: SequenceNumber, payload: sink seq[byte]
 ): InboundDataDisposition =
+  if sequence > MaxDataSequenceNumber:
+    return InboundDataDisposition.OutsideWindow
   if sequence < stream.receiveBase:
     stream.fireShouldSendAckEvent()
     return InboundDataDisposition.Duplicate
 
   let offset = sequence - stream.receiveBase
-  if offset >= ReceiveWindowChunks.uint64:
+  if offset >= SequenceNumber(ReceiveWindowChunks):
     return InboundDataDisposition.OutsideWindow
   if stream.acknowledgementBitmap.bitmapContains(offset):
     stream.fireShouldSendAckEvent()
@@ -156,17 +164,17 @@ proc receiveData*(
 
 proc takeNextInbound*(
     stream: TransportStream
-): Opt[tuple[sequence: uint64, payload: seq[byte]]] =
+): Opt[tuple[sequence: SequenceNumber, payload: seq[byte]]] =
   if not stream.acknowledgementBitmap.bitmapContains(0):
-    return Opt.none(tuple[sequence: uint64, payload: seq[byte]])
+    return Opt.none(tuple[sequence: SequenceNumber, payload: seq[byte]])
 
   stream.pendingInbound.withValue(stream.receiveBase, payload):
     let value = (sequence: stream.receiveBase, payload: move(payload[]))
     stream.pendingInbound.del(stream.receiveBase)
     return Opt.some(value)
-  Opt.none(tuple[sequence: uint64, payload: seq[byte]])
+  Opt.none(tuple[sequence: SequenceNumber, payload: seq[byte]])
 
-proc markInboundDelivered*(stream: TransportStream, sequence: uint64) =
+proc markInboundDelivered*(stream: TransportStream, sequence: SequenceNumber) =
   doAssert sequence == stream.receiveBase
   doAssert stream.acknowledgementBitmap.bitmapContains(0)
   stream.shiftBitmap()
@@ -177,6 +185,7 @@ proc markInboundDelivered*(stream: TransportStream, sequence: uint64) =
 
 func canReserveOutbound*(stream: TransportStream): bool =
   stream.pendingOutbound.len < MaxInflightChunks and
+    stream.nextOutboundSequence <= MaxDataSequenceNumber and
     stream.nextOutboundSequence < stream.remoteReceiveLimit
 
 proc waitForOutboundCapacity*(
@@ -185,6 +194,8 @@ proc waitForOutboundCapacity*(
   while true:
     if stream.closed:
       raise newLPStreamClosedError()
+    if stream.nextOutboundSequence > MaxDataSequenceNumber:
+      raise newException(LPStreamError, "stream sequence space is exhausted")
     if stream.canReserveOutbound:
       return
     stream.sendStateChanged.clear()
@@ -192,7 +203,9 @@ proc waitForOutboundCapacity*(
 
 proc reserveOutbound*(
     stream: TransportStream, payload: seq[byte]
-): Result[uint64, string] =
+): Result[SequenceNumber, string] =
+  if stream.nextOutboundSequence > MaxDataSequenceNumber:
+    return err("stream sequence space is exhausted")
   if not stream.canReserveOutbound:
     return err("stream has no outbound capacity")
   let sequence = stream.nextOutboundSequence
@@ -200,25 +213,25 @@ proc reserveOutbound*(
   stream.pendingOutbound[sequence] = payload
   ok(sequence)
 
-proc cancelOutbound*(stream: TransportStream, sequence: uint64) =
+proc cancelOutbound*(stream: TransportStream, sequence: SequenceNumber) =
   if stream.pendingOutbound.hasKey(sequence):
     stream.pendingOutbound.del(sequence)
     stream.sendStateChanged.fire()
 
 proc applyAcknowledgement*(
-    stream: TransportStream, receiveBase: uint64, bitmap: openArray[byte]
+    stream: TransportStream, receiveBase: SequenceNumber, bitmap: openArray[byte]
 ): bool =
   if bitmap.len != AckBitmapBytes or receiveBase < stream.remoteReceiveBase or
       receiveBase > stream.nextOutboundSequence:
     return false
 
-  var acknowledged: seq[uint64]
+  var acknowledged: seq[SequenceNumber]
   for sequence in stream.pendingOutbound.keys:
     if sequence < receiveBase:
       acknowledged.add(sequence)
     else:
       let offset = sequence - receiveBase
-      if offset < ReceiveWindowChunks.uint64 and bitmap.bitmapContains(offset):
+      if offset < SequenceNumber(ReceiveWindowChunks) and bitmap.bitmapContains(offset):
         acknowledged.add(sequence)
 
   for sequence in acknowledged:
@@ -275,7 +288,7 @@ method closeImpl*(
 proc newTransportStream*(
     sessionId: PeerId,
     peerId: PeerId,
-    streamId: uint64,
+    streamId: StreamId,
     codec: string,
     direction: StreamDirection,
 ): TransportStream =
@@ -296,11 +309,11 @@ proc newTransportStream*(
     writeLock: newAsyncLock(),
     nextOutboundSequence: 1,
     remoteReceiveBase: 1,
-    pendingOutbound: initTable[uint64, seq[byte]](),
+    pendingOutbound: initTable[SequenceNumber, seq[byte]](),
     sendStateChanged: newAsyncEvent(),
     receiveBase: 1,
     acknowledgementBitmap: newSeq[byte](AckBitmapBytes),
-    pendingInbound: initTable[uint64, seq[byte]](),
+    pendingInbound: initTable[SequenceNumber, seq[byte]](),
     dataAvailable: newAsyncEvent(),
     shouldSendAck: newAsyncEvent(),
     dir: libp2pDirection,
