@@ -205,7 +205,7 @@ proc runInboundDelivery(stream: TransportStream) {.async: (raises: [CancelledErr
         await stream.pushData(move(inbound.payload))
       except LPStreamError:
         return
-      stream.markInboundDelivered(inbound.sequence)
+      stream.advanceReceiveWindow(inbound.sequence)
     await stream.waitForInboundData()
 
 proc runAcknowledgements(

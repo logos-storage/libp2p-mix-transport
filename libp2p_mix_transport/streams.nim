@@ -171,7 +171,7 @@ proc takeNextInbound*(
     return Opt.some(value)
   Opt.none(tuple[sequence: SequenceNumber, payload: seq[byte]])
 
-proc markInboundDelivered*(stream: TransportStream, sequence: SequenceNumber) =
+proc advanceReceiveWindow*(stream: TransportStream, sequence: SequenceNumber) =
   doAssert sequence == stream.receiveBase
   doAssert stream.acknowledgementBitmap.bitmapContains(0)
   stream.shiftBitmap()
