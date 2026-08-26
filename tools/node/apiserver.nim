@@ -2,6 +2,7 @@ import std/base64
 import std/json
 import std/strformat
 
+import pkg/chronicles
 import pkg/chronos/apps/http/httpserver
 import pkg/libp2p
 import pkg/libp2p/crypto/secp
@@ -9,6 +10,9 @@ import pkg/libp2p_mix
 import pkg/libp2p_mix/curve25519
 
 import ./node
+
+logScope:
+  topics = "node mix_transport api_server"
 
 proc toJson*(obj: MixPubInfo): JsonNode =
   %*{
@@ -29,7 +33,7 @@ proc toJson*(obj: MixNodeInfo): JsonNode =
   ).toJson()
 
 proc toJson*(obj: Node): JsonNode =
-  %*{"mixInfo": obj.info.toJson()}
+  %*{"mixInfo": obj.info.toJson(), "running": obj.running}
 
 proc fromJson*(obj: var PeerId, json: JsonNode) =
   let peerIdStr = base64.decode(json.str)
@@ -56,6 +60,42 @@ proc fromJson*(obj: var MixPubInfo, json: JsonNode) =
   ).valueOr:
     raise newException(ValueError, "Invalid libp2p public key")
 
+proc handleRequest(
+    req: HttpRequestRef, node: Node
+): Future[HttpResponseRef] {.async: (raises: [CancelledError, CatchableError]).} =
+  let
+    body = await req.getBody()
+    data =
+      try:
+        parseJson(bytesToString(body))
+      except ValueError as exc:
+        return await req.respond(Http400, "Failed to parse: " & exc.msg)
+    size = data{"size"}.getInt().int32
+
+  if size <= 0:
+    return await req.respond(Http400, "Size must be present and greater than 0")
+
+  var
+    peerId: PeerId
+    address: MultiAddress
+  # If we have a PeerId, use mix transport.
+  if data.hasKey("peerId"):
+    fromJson(peerId, data["peerId"])
+    info "Handle data request over mix", peerId = peerId
+    let res = await node.request(peerId, size)
+    if res.isErr:
+      return await req.respond(Http500, "Failed to request: " & res.error)
+  # Otherwise, contact peer directly.
+  elif data.hasKey("address"):
+    fromJson(address, data["address"])
+    info "Handle direct data request", address = address
+    await node.request(address, size) # will throw on error
+  else:
+    return await req.respond(Http400, "Either peerId or address must be present")
+
+  # all good
+  await req.respond(Http200, "ok")
+
 proc newServer*(
     node: Node, listenAddress: string, apiPort: uint
 ): Result[HttpServerRef, string] =
@@ -68,39 +108,24 @@ proc newServer*(
     try:
       case req.uri.path
       of "/status":
-        let headers = HttpTable.init([("Content-Type", "application/json")])
-        return await req.respond(Http200, $node.toJson(), headers)
+        if req.meth != MethodGet:
+          return await req.respond(Http405, "Method Not Allowed")
+        await req.respond(
+          Http200,
+          $node.toJson(),
+          HttpTable.init([("Content-Type", "application/json")]),
+        )
       of "/request":
-        let
-          body = await req.getBody()
-          data =
-            try:
-              parseJson(bytesToString(body))
-            except ValueError as exc:
-              return await req.respond(Http400, "Failed to parse: " & exc.msg)
-          size = data{"size"}.getInt().int32
-
-        if size <= 0:
-          return await req.respond(Http400, "Size must be present and greater than 0")
-
-        # If we have a PeerId, use mix transport.
-        if data.hasKey("peerId"):
-          var peerIdObj: PeerId
-          fromJson(peerIdObj, data["peerId"])
-          let res = await node.request(peerIdObj, size)
-          if res.isErr:
-            return await req.respond(Http500, "Failed to request: " & res.error)
-
-        # Otherwise, contact peer directly.
-        elif data.hasKey("address"):
-          var addrObj: MultiAddress
-          fromJson(addrObj, data["address"])
-          await node.request(addrObj, size)
-        else:
-          return await req.respond(Http400, "Either peerId or address must be present")
+        if req.meth != MethodPost:
+          return await req.respond(Http405, "Method Not Allowed")
+        try:
+          await handleRequest(req, node)
+        except ValueError as exc:
+          await req.respond(Http400, exc.msg)
       else:
-        return await req.respond(Http404, "Not found.")
+        await req.respond(Http404, "Not found.")
     except CatchableError as exc:
+      error "API handler error", exc = exc
       return defaultResponse(exc)
 
   HttpServerRef.new(initTAddress(fmt"{listenAddress}:{apiPort}"), apiHandler)

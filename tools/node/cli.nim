@@ -1,17 +1,20 @@
 import std/httpclient
 import std/json
-import std/jsonutils
 import std/os
 import std/parseopt
 import std/strformat
 import std/strutils
 
+import pkg/chronicles
 import pkg/chronos
 import pkg/chronos/apps/http/httpserver
 import pkg/libp2p_mix
 import pkg/results
 
 import ./[node, apiserver]
+
+logScope:
+  topics = "node mix_transport"
 
 const
   DefaultApiPort = 8080.uint
@@ -25,18 +28,24 @@ proc collectMixConfigs(urls: seq[string]): seq[MixPubInfo] =
   # Use blocking client cause we're not running inside of chronos
   let client = newHttpClient()
   result = newSeq[MixPubInfo](urls.len)
-  echoerr "Contacting " & $urls.len & " mix nodes..."
+  if urls.len == 0:
+    warn "No mix nodes to contact"
+    return
+
+  info "Contacting mix nodes", len = urls.len
   for i, url in urls:
+    debug "Contacting mix node", url = url
     let content = parseJson(client.getContent(fmt"{url}/status"))
     fromJson(result[i], content["mixInfo"])
+    debug "Added mix config for node", url = url
 
 proc printUsage() =
-  echo "Usage: node [options] <listen-ip>"
-  echo "Options:"
-  echo "  -h, --help            Show this help message"
-  echo "  -a, --api-port <port> API port (default: 8080)"
-  echo "  -l, --listen-port <port> Listen port (default: 0)"
-  echo "  -i  --listen-ip <ipv4> Listen IP (default: 127.0.0.1)"
+  echoerr "Usage: node [options] <listen-ip>"
+  echoerr "Options:"
+  echoerr "  -h, --help            Show this help message"
+  echoerr "  -a, --api-port <port> API port (default: 8080)"
+  echoerr "  -l, --listen-port <port> Listen port (default: 0)"
+  echoerr "  -i  --listen-ip <ipv4> Listen IP (default: 127.0.0.1)"
 
 proc main() =
   var
@@ -68,21 +77,18 @@ proc main() =
     of cmdEnd:
       assert(false) # should not happen
 
-  echoerr "Positional args: " & $positionalArgs
-  let mixNodes = collectMixConfigs(positionalArgs)
-
-  echoerr "Mix nodes: " & $mixNodes
-
   let
+    mixNodes = collectMixConfigs(positionalArgs)
     node = Node.init(mixNodes, listenIp, listenPort).valueOr:
-      echoerr("Failed to initialize node: " & $error)
+      error "Failed to initialize node", msg = error
       quit(1)
     server = newServer(node, listenIp, apiPort).valueOr:
-      echoerr("Failed to create server: " & $error)
+      error "Failed to create server", msg = error
       quit(1)
 
   waitFor node.start()
   server.start()
+  node.running = true
 
   while true:
     chronos.poll()
