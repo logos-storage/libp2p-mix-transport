@@ -156,8 +156,8 @@ proc sendStreamFrame(
       session.releaseReplySend()
     (await self.requestRefill(session)).isOkOr:
       return err(error)
-    await session.waitForOrdinarySurbGroup()
-    var replyGroup = session.takeOrdinarySurbGroup().valueOr:
+    await session.waitForUnreservedSurbGroup()
+    var replyGroup = session.takeUnreservedSurbGroup().valueOr:
       return err(error)
     (await self.sendWithSurbGroup(replyGroup, payload)).isOkOr:
       return err("could not send " & $frame.kind & " frame: " & error)
