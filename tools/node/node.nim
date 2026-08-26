@@ -1,9 +1,9 @@
 import std/random
 import std/times
 import std/strformat
-import std/sugar
 
 import pkg/chronos
+import pkg/chronicles
 import pkg/libp2p
 import pkg/libp2p/protocols/protocol
 import pkg/libp2p/crypto/secp
@@ -15,17 +15,21 @@ import pkg/stew/endians2
 
 import ../../libp2p_mix_transport
 
+logScope:
+  topics = "node mix_transport"
+
 const TransferCodec = "/test/simple-transfer/1.0.0"
 const ChunkSize = 1024 * 1024 * 1024
 
 type
   MixPool* = seq[MixPubInfo]
 
-  Node* = object
+  Node* = ref object
     info*: MixNodeInfo
     switch*: Switch
     proto*: MixProtocol
     transport*: MixTransport
+    running*: bool
 
   MsgType {.pure.} = enum
     transferRequest = 1.byte
@@ -47,7 +51,7 @@ proc encodeMsg[T](msg: T, msgType: MsgType): seq[byte] =
   let data = Protobuf.encode(msg)
   # 1 byte for type + 2 for message length
   var buffer = newSeqUninit[byte](data.len + 1 + 2)
-  let len = buffer.len.uint16.toLE
+  let len = data.len.uint16.toLE
 
   buffer[0] = msgType.byte
   copyMem(addr buffer[1], addr len, 2)
@@ -81,6 +85,8 @@ proc request(
     else:
       seed.get()
 
+  info "Sending libp2p transfer request", size = size, seed = seedValue
+
   let payload =
     encodeMsg(TransferRequest(size: size, seed: seedValue), MsgType.transferRequest)
   await stream.write(payload) # sink
@@ -90,13 +96,14 @@ proc request*(
 ): Future[Result[void, string]] {.async: (raises: [CancelledError, LPStreamError]).} =
   let stream = (await self.transport.dial(target, TransferCodec)).valueOr:
     return err(error)
+
   await request(stream, size, seed)
 
 proc request*(
     self: Node, target: MultiAddress, size: int32, seed: Option[int64] = int64.none
 ): Future[void] {.async: (raises: [CancelledError, LPStreamError, DialFailedError]).} =
   let
-    peerId = await self.switch.connect(target)
+    peerId = await self.switch.connect(target, true)
     stream = await self.switch.dial(peerId, TransferCodec)
 
   await request(stream, size, seed)
@@ -104,6 +111,7 @@ proc request*(
 proc handleTransferRequest(
     stream: Stream, request: TransferRequest
 ) {.async: (raises: [CancelledError, LPStreamError]).} =
+  info "handling libp2p transfer request", size = request.size, seed = request.seed
   # Send preamble.
   await send(
     stream,
@@ -114,6 +122,8 @@ proc handleTransferRequest(
   var
     remaining = request.size.int
     rand = initRand(request.seed)
+
+  info "sending random stream", remaining = remaining
   while remaining > 0:
     # write eats our buffer with sink, so we might as well
     # just allocate a new one on every pass (hoping the compiler
@@ -124,9 +134,13 @@ proc handleTransferRequest(
     await stream.write(batch)
     remaining -= batch.len
 
+  info "Bytes sent", size = request.size, seed = request.seed
+
 proc handleTransferResponse(
     stream: Stream, response: TransferResponse
 ) {.async: (raises: [CancelledError, LPError]).} =
+  info "receiving libp2p transfer response",
+    status = response.status, size = response.request.size, seed = response.request.seed
   if response.status != ResponseStatus.Accepted:
     raise newException(LPError, "Transfer rejected")
 
@@ -143,24 +157,41 @@ proc handleTransferResponse(
       if buffer[i] != rand.rand(byte):
         raise newException(LPError, "Bytestream mismatch")
 
+  info "Bytestream validated successfully",
+    size = response.request.size, seed = response.request.seed
+
 proc newTransferProtocol*(): LPProtocol =
   let handler: LPProtoHandler = proc(
       stream: Stream, selectedCodec: string
   ): Future[void] {.async: (raises: [CancelledError]).} =
+    defer:
+      await stream.close()
     try:
-      var msgType: MsgType
-      await stream.readExactly(addr msgType, 1)
+      debug "entering read loop"
+      while not stream.atEof:
+        var msgType: MsgType
+        await stream.readExactly(addr msgType, 1)
 
-      case msgType
-      of MsgType.transferRequest:
-        await handleTransferRequest(stream, await decodeMsg[TransferRequest](stream))
-      of MsgType.transferResponse:
-        await handleTransferResponse(stream, await decodeMsg[TransferResponse](stream))
+        trace "read type header", msgType = msgType
+        {.warning[UnreachableElse]: off.}:
+          case msgType
+          of MsgType.transferRequest:
+            await handleTransferRequest(
+              stream, await decodeMsg[TransferRequest](stream)
+            )
+          of MsgType.transferResponse:
+            await handleTransferResponse(
+              stream, await decodeMsg[TransferResponse](stream)
+            )
+          else:
+            error "Unknown message type", msgType = msgType
+            break
     except SerializationError as e:
-      # TODO proper logging
-      echo "Malformed message" & $e.msg
+      error "Malformed message", msg = e.msg
     except LPError as e:
-      echo "Error handling message" & $e.msg
+      error "Error handling message", msg = e.msg
+
+    debug "exiting read loop"
 
   LPProtocol.new(@[TransferCodec], handler)
 
@@ -216,7 +247,8 @@ proc init*(
     transport: newMixTransport(mixProto),
   ).ok
 
-proc start*(node: Node): Future[void] {.async: (raises: [CancelledError, LPError]).} =
-  await node.switch.start()
-  await node.proto.start()
-  (await node.transport.start()).expect("Failed to start Mix transport")
+proc start*(self: Node): Future[void] {.async: (raises: [CancelledError, LPError]).} =
+  await self.switch.start()
+  await self.proto.start()
+  (await self.transport.start()).expect("Failed to start Mix transport")
+  self.running = true

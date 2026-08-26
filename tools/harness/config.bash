@@ -7,7 +7,7 @@ source "$LIB_SRC/utils.bash"
 
 TR_RUNTIME_FOLDER=$(realpath "${LIB_SRC}/../runtime")
 export TR_RUNTIME_FOLDER
-TR_NODE_BINARY="$(realpath "${LIB_SRC}/../node")"
+TR_NODE_BINARY="$(realpath "${LIB_SRC}/../node/node")"
 export TR_NODE_BINARY
 export TR_LOGS_FOLDER="${TR_RUNTIME_FOLDER}/logs"
 

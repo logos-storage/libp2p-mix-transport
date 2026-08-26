@@ -23,6 +23,17 @@ _tr_urls() {
   done
 }
 
+_node_ready() {
+  local node_index=$1
+  tr_status "$node_index" | jq -e '.running == true' > /dev/null
+}
+
+tr_status() {
+  local node_index=$1
+  local api_port=$((_base_api_port + node_index))
+  curl -fsS "http://127.0.0.1:$api_port/status" | jq .
+}
+
 tr_start_node() {
   local node_index=$1
   local api_port=$((_base_api_port + node_index))
@@ -46,6 +57,34 @@ tr_start_node() {
   _node_pids[$node_index]=$!
 }
 
+tr_start_network() {
+  local node_count=$1
+  echoerr "Starting network with $node_count nodes"
+  for ((i = 0; i < node_count; i++)); do
+    echoerr "Starting node $i"
+    tr_start_node "$i"
+    await 10 _node_ready "$i"
+    echoerr "Node $i is ready"
+  done
+}
+
+tr_transfer_regular() {
+  local source_node=$1 dest_node=$2 size=$3
+  local source_api_port=$((_base_api_port + source_node))
+  local dest_listen_port=$((_base_listen_port + dest_node))
+
+  echoerr "Starting transfer."
+  curl -fsS -X POST "http://127.0.0.1:$source_api_port/request" \
+    -H "Content-Type: application/json" \
+    -d '{"address": "/ip4/127.0.0.1/tcp/'"$dest_listen_port/"'", "size": '"$size"'}'
+}
+
+tr_info() {
+  local node_index=$1
+  local api_port=$((_base_api_port + node_index))
+  curl -fsS "http://127.0.0.1:$api_port/status" | jq .
+}
+
 tr_kill_node() {
   local node_index=$1
   local pid=${_node_pids[$node_index]}
@@ -59,14 +98,15 @@ tr_kill_nodes() {
 }
 
 tr_list_nodes() {
-  for pid in "${_node_pids[@]}"; do
+  for idx in "${!_node_pids[@]}"; do
+    local pid=${_node_pids[$idx]}
     local status
     if kill -0 "$pid" 2>/dev/null; then
       status="RUNNING"
     else
       status="DEAD"
     fi
-    echo " - PID: $pid, Status: $status"
+    echo " - index: $idx, PID: $pid, Status: $status"
   done
 }
 
