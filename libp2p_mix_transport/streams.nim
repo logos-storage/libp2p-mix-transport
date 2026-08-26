@@ -165,9 +165,6 @@ proc receiveData*(
 proc takeNextInbound*(
     stream: TransportStream
 ): Opt[tuple[sequence: SequenceNumber, payload: seq[byte]]] =
-  if not stream.acknowledgementBitmap.bitmapContains(0):
-    return Opt.none(tuple[sequence: SequenceNumber, payload: seq[byte]])
-
   stream.pendingInbound.withValue(stream.receiveBase, payload):
     let value = (sequence: stream.receiveBase, payload: move(payload[]))
     stream.pendingInbound.del(stream.receiveBase)
