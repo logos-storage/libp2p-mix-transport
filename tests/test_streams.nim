@@ -172,13 +172,13 @@ suite "MixTransport streams":
     check:
       first.sequence == 1
       first.payload == @[1'u8]
-    stream.markInboundDelivered(first.sequence)
+    stream.advanceReceiveWindow(first.sequence)
 
     var second = stream.takeNextInbound().expect("sequence 2 was not ready")
     check:
       second.sequence == 2
       second.payload == @[2'u8]
-    stream.markInboundDelivered(second.sequence)
+    stream.advanceReceiveWindow(second.sequence)
 
     check:
       stream.receiveBase == 3
