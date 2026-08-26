@@ -167,12 +167,12 @@ proc takeReceivedSurbGroup*(session: TransportSession): Result[seq[SURB], string
     return err("session has no received SURB groups")
   ok(session.receivedSurbGroups.popFirst())
 
-proc takeOrdinarySurbGroup*(session: TransportSession): Result[seq[SURB], string] =
+proc takeUnreservedSurbGroup*(session: TransportSession): Result[seq[SURB], string] =
   if session.receivedSurbGroups.len <= ReplyControlReserveGroups:
     return err("session reply capacity is reserved for control traffic")
   ok(session.receivedSurbGroups.popFirst())
 
-proc waitForOrdinarySurbGroup*(
+proc waitForUnreservedSurbGroup*(
     session: TransportSession
 ): Future[void] {.async: (raises: [CancelledError]).} =
   while session.receivedSurbGroups.len <= ReplyControlReserveGroups:

@@ -206,7 +206,7 @@ proc establishSessionAndStream(): Future[RoundTripOutcome] {.
 
   # The handler writes its response through the same virtual connection. On
   # the recipient this consumes a SURB group; low reply capacity is replenished
-  # before ordinary return traffic is allowed to consume the control reserve.
+  # before return traffic is allowed to consume a group above the control reserve.
   let receivedResponseFuture = initiatorStream.readLp(1024)
   if not await receivedResponseFuture.withTimeout(TestOperationTimeout):
     raise newException(LPError, "initiator did not receive stream response")
