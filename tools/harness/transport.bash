@@ -12,6 +12,7 @@ source "$LIB_SRC/utils.bash"
 
 require_binary "$TR_NODE_BINARY"
 
+MIX_PATH_LENGTH=3
 _base_api_port=8000
 _base_listen_port=9000
 
@@ -79,10 +80,25 @@ tr_transfer_regular() {
     -d '{"address": "/ip4/127.0.0.1/tcp/'"$dest_listen_port/"'", "size": '"$size"'}'
 }
 
-tr_info() {
-  local node_index=$1
-  local api_port=$((_base_api_port + node_index))
-  curl -fsS "http://127.0.0.1:$api_port/status" | jq .
+tr_transfer_mix() {
+  local source_node=$1 dest_node=$2 size=$3
+  local source_api_port=$((_base_api_port + source_node))
+  local dest_peer_id
+  dest_peer_id=$(tr_peer_id "$dest_node")
+
+  # This ensures that the node knows enough mix nodes to build a path, assuming that
+  # they're not launching non-contiguous node IDs. To get a more accurate predicate
+  # we'd need to know how many mix nodes the node knows, which for now I don't see
+  # as needed.
+  if [[ $source_node -le $MIX_PATH_LENGTH ]]; then
+    echoerr "Source index must be larger or equal to $MIX_PATH_LENGTH (was $source_node)"
+    return 1
+  fi
+
+  echoerr "Starting mix transfer."
+  curl -fsS -X POST "http://127.0.0.1:$source_api_port/request" \
+    -H "Content-Type: application/json" \
+    -d '{"peerId": "'"$dest_peer_id"'", "size": '"$size"'}'
 }
 
 tr_kill_node() {
@@ -97,6 +113,10 @@ tr_kill_nodes() {
   done
 }
 
+tr_peer_id() {
+  tr_status "$1" | jq -r '.mixInfo.peerId'
+}
+
 tr_list_nodes() {
   for idx in "${!_node_pids[@]}"; do
     local pid=${_node_pids[$idx]}
@@ -106,7 +126,7 @@ tr_list_nodes() {
     else
       status="DEAD"
     fi
-    echo " - index: $idx, PID: $pid, Status: $status"
+    echo " - index: $idx, PID: $pid, Status: $status, PeerId: $(tr_peer_id "$idx")"
   done
 }
 
