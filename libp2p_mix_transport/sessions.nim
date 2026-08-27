@@ -144,7 +144,9 @@ proc establish*(session: TransportSession) =
   session.state = SessionState.Established
   session.established.fire()
 
-proc waitUntilEstablished*(session: TransportSession): Future[void] =
+proc waitUntilEstablished*(
+    session: TransportSession
+): Future[void] {.async: (raw: true, raises: [CancelledError]).} =
   session.established.wait()
 
 proc addReceivedSurbGroups*(
