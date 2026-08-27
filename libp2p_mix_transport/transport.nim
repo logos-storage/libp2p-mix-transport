@@ -134,6 +134,17 @@ proc requestRefill(
     return err("could not send RefillRequest: " & error)
   ok()
 
+proc ensureUnreservedSurbGroup(
+    self: MixTransport, session: TransportSession
+): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
+  while session.receivedSurbGroupCount <= ReplyControlReserveGroups:
+    session.clearReplyCapacityStateChanged()
+    (await self.requestRefill(session)).isOkOr:
+      return err(error)
+    if session.receivedSurbGroupCount <= ReplyControlReserveGroups:
+      await session.waitForReplyCapacityStateChange()
+  ok()
+
 proc sendStreamFrame(
     self: MixTransport, session: TransportSession, frame: MixTransportFrame
 ): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
@@ -154,9 +165,8 @@ proc sendStreamFrame(
     await session.acquireReplySend()
     defer:
       session.releaseReplySend()
-    (await self.requestRefill(session)).isOkOr:
+    (await self.ensureUnreservedSurbGroup(session)).isOkOr:
       return err(error)
-    await session.waitForUnreservedSurbGroup()
     var replyGroup = session.takeUnreservedSurbGroup().valueOr:
       return err(error)
     (await self.sendWithSurbGroup(replyGroup, payload)).isOkOr:
@@ -272,13 +282,15 @@ proc handleRefill(self: MixTransport, frame: MixTransportFrame) {.gcsafe, raises
   if session.role != SessionRole.Recipient or session.state != SessionState.Established:
     return
 
+  let batchId = frame.batchId.get()
+  if not session.completeRefill(batchId):
+    return
+
   var decodedGroups = newSeqOfCap[seq[SURB]](frame.surbGroups.len)
   for encodedGroup in frame.surbGroups:
     let group = encodedGroup.decodeSurbs().valueOr:
-      return
+      continue
     decodedGroups.add(group)
-  if not session.completeRefill(frame.batchId.get()):
-    return
   discard session.addReceivedSurbGroups(decodedGroups)
 
 proc sendStreamResponse(

@@ -113,17 +113,23 @@ proc decodeSurbs*(group: SurbGroup): Result[seq[SURB], string] =
     decoded.add(surb)
   ok(decoded)
 
-proc validateSurbGroups(groups: openArray[SurbGroup]): Result[void, string] =
+proc validateSurbGroups(
+    groups: openArray[SurbGroup], requireValidEncoding: bool
+): Result[void, string] =
   var surbCount = 0
   for group in groups:
-    require group.surbs.len > 0, "SURB groups must not be empty"
+    if requireValidEncoding:
+      require group.surbs.len > 0, "SURB groups must not be empty"
     surbCount += group.surbs.len
     require surbCount <= MaxTransportFrameBytes div SurbSize, "too many SURBs"
-    for surb in group.surbs:
-      require surb.len == SurbSize, "invalid serialized SURB size"
+    if requireValidEncoding:
+      for surb in group.surbs:
+        require surb.len == SurbSize, "invalid serialized SURB size"
   ok()
 
-proc validate*(frame: MixTransportFrame): Result[void, string] =
+proc validateFrame(
+    frame: MixTransportFrame, requireValidSurbEncoding: bool
+): Result[void, string] =
   require frame.version == MixTransportVersion, "unsupported transport frame version"
   require frame.sessionId.len > 0, "sessionId must not be empty"
   require frame.sessionId.len <= MaxSessionIdBytes, "sessionId is too long"
@@ -132,7 +138,7 @@ proc validate*(frame: MixTransportFrame): Result[void, string] =
   require frame.rejectionReason.isNone or
     frame.rejectionReason.get().len <= MaxStreamRejectionReasonBytes,
     "stream rejection reason is too long"
-  frame.surbGroups.validateSurbGroups().isOkOr:
+  frame.surbGroups.validateSurbGroups(requireValidSurbEncoding).isOkOr:
     return err(error)
 
   let
@@ -199,6 +205,9 @@ proc validate*(frame: MixTransportFrame): Result[void, string] =
 
   ok()
 
+proc validate*(frame: MixTransportFrame): Result[void, string] =
+  frame.validateFrame(requireValidSurbEncoding = true)
+
 proc encode*(frame: MixTransportFrame): Result[seq[byte], string] =
   frame.validate().isOkOr:
     return err(error)
@@ -220,7 +229,7 @@ proc decode*(
       decodeFrame(data)
     except SerializationError as exc:
       return err("could not decode transport frame: " & exc.msg)
-  frame.validate().isOkOr:
+  frame.validateFrame(requireValidSurbEncoding = false).isOkOr:
     return err(error)
   ok(frame)
 
