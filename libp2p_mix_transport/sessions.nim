@@ -32,7 +32,7 @@ type
     state: SessionState
     established: AsyncEvent
     receivedSurbGroups: Deque[seq[SURB]]
-    receivedSurbGroupsAvailable: AsyncEvent
+    replyCapacityStateChanged: AsyncEvent
     replySendLock: AsyncLock
     pendingRefillBatchId: Opt[uint64]
     nextRefillBatchId: uint64
@@ -102,7 +102,7 @@ proc addInitiatorSession*(
     state: SessionState.Pending,
     established: newAsyncEvent(),
     receivedSurbGroups: initDeque[seq[SURB]](),
-    receivedSurbGroupsAvailable: newAsyncEvent(),
+    replyCapacityStateChanged: newAsyncEvent(),
     replySendLock: newAsyncLock(),
     pendingRefillBatchId: Opt.none(uint64),
     nextRefillBatchId: 1,
@@ -130,7 +130,7 @@ proc addRecipientSession*(
     state: SessionState.Pending,
     established: newAsyncEvent(),
     receivedSurbGroups: initDeque[seq[SURB]](),
-    receivedSurbGroupsAvailable: newAsyncEvent(),
+    replyCapacityStateChanged: newAsyncEvent(),
     replySendLock: newAsyncLock(),
     pendingRefillBatchId: Opt.none(uint64),
     nextRefillBatchId: 1,
@@ -159,7 +159,7 @@ proc addReceivedSurbGroups*(
   for group in groups.mitems:
     session.receivedSurbGroups.addLast(move(group))
   if groups.len > 0:
-    session.receivedSurbGroupsAvailable.fire()
+    session.replyCapacityStateChanged.fire()
   ok()
 
 proc takeReceivedSurbGroup*(session: TransportSession): Result[seq[SURB], string] =
@@ -172,13 +172,13 @@ proc takeUnreservedSurbGroup*(session: TransportSession): Result[seq[SURB], stri
     return err("session reply capacity is reserved for control traffic")
   ok(session.receivedSurbGroups.popFirst())
 
-proc waitForUnreservedSurbGroup*(
+proc clearReplyCapacityStateChanged*(session: TransportSession) =
+  session.replyCapacityStateChanged.clear()
+
+proc waitForReplyCapacityStateChange*(
     session: TransportSession
 ): Future[void] {.async: (raises: [CancelledError]).} =
-  while session.receivedSurbGroups.len <= ReplyControlReserveGroups:
-    session.receivedSurbGroupsAvailable.clear()
-    if session.receivedSurbGroups.len <= ReplyControlReserveGroups:
-      await session.receivedSurbGroupsAvailable.wait()
+  await session.replyCapacityStateChanged.wait()
 
 proc acquireReplySend*(
     session: TransportSession
@@ -208,10 +208,14 @@ proc cancelRefill*(session: TransportSession, batchId: uint64) =
   if session.pendingRefillBatchId == Opt.some(batchId):
     session.pendingRefillBatchId = Opt.none(uint64)
 
+func isPendingRefill*(session: TransportSession, batchId: uint64): bool =
+  session.pendingRefillBatchId == Opt.some(batchId)
+
 proc completeRefill*(session: TransportSession, batchId: uint64): bool =
-  if session.pendingRefillBatchId != Opt.some(batchId):
+  if not session.isPendingRefill(batchId):
     return false
   session.pendingRefillBatchId = Opt.none(uint64)
+  session.replyCapacityStateChanged.fire()
   true
 
 func isValidInboundStreamId(session: TransportSession, streamId: StreamId): bool =

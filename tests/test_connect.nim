@@ -2,7 +2,7 @@
 
 {.used.}
 
-import std/[importutils, unittest]
+import std/[importutils, tables, unittest]
 
 import chronos, results
 import stew/byteutils
@@ -18,6 +18,8 @@ import
   ]
 import libp2p_mix
 import libp2p_mix/delay_strategy
+import libp2p_mix/serialization
+import protobuf_serialization
 
 import libp2p_mix_transport
 
@@ -55,6 +57,19 @@ proc createMixNodes(count: int): seq[MixProtocol] =
     mix.nodePool.add(nodeInfos.includeAllExcept(nodeInfo))
     switch.mount(mix)
     result.add(mix)
+
+proc testSurb(marker: byte): SURB =
+  var key = newSeq[byte](k)
+  for value in key.mitems:
+    value = marker
+
+  SURB(
+    hop: Hop.init(newSeq[byte](AddrSize)),
+    header: Header.init(
+      newSeq[byte](AlphaSize), newSeq[byte](BetaSize), newSeq[byte](GammaSize)
+    ),
+    key: move(key),
+  )
 
 const
   TestCodec = "/mix-transport/test/1.0.0"
@@ -280,3 +295,57 @@ suite "MixTransport session and stream handshakes":
           RawSurbReplyDisposition.Handled, RawSurbReplyDisposition.Handled,
           RawSurbReplyDisposition.Handled, RawSurbReplyDisposition.Handled,
         ]
+
+  test "a refill retains valid groups and permits another short-supply request":
+    let
+      mix = createMixNodes(1)[0]
+      transport = newMixTransport(mix)
+      session = transport.sessions
+        .addRecipientSession(
+          PeerId.random(mix.rng).expect("could not generate session identifier")
+        )
+        .expect("could not add recipient session")
+
+    session.establish()
+    session.addReceivedSurbGroups(@[@[SURB()], @[SURB()]]).expect(
+      "could not add initial reply groups"
+    )
+    let batchId = session.beginRefill().expect("could not begin refill")
+    discard session.takeReceivedSurbGroup().expect(
+        "could not consume the refill request group"
+      )
+
+    (waitFor transport.start()).expect("could not start transport")
+    defer:
+      waitFor transport.stop()
+
+    let frame = MixTransportFrame(
+      version: MixTransportVersion,
+      sessionId: session.sessionId,
+      kind: FrameKind.Refill,
+      batchId: Opt.some(batchId),
+      partIndex: Opt.some(0'u32),
+      partCount: Opt.some(1'u32),
+      surbGroups: @[
+        SurbGroup.init(@[testSurb(1)]).expect("could not encode valid SURB group"),
+        SurbGroup(surbs: @[@[0'u8]]),
+      ],
+    )
+
+    # Invoke the same delivery callback that Mix uses for a forward Refill.
+    # The valid group is retained, the malformed group is ignored, and the
+    # completed batch allows the recipient to request more capacity.
+    check frame.encode().isErr
+    waitFor mix.deliveryHandlers[MixTransportCodec](
+      MixDelivery(
+        service: MixTransportCodec,
+        # Bypass the strict local encoder to model malformed bytes received
+        # from a remote endpoint. The inbound decoder performs structural
+        # validation and leaves each SURB group for independent decoding.
+        payload: Protobuf.encode(frame),
+      )
+    )
+
+    check:
+      session.receivedSurbGroupCount == ReplyControlReserveGroups
+      session.beginRefill().isSome

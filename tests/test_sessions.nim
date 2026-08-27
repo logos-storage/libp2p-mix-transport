@@ -2,8 +2,9 @@
 
 {.used.}
 
-import std/unittest
+import std/[sequtils, unittest]
 
+import chronos
 import results
 import libp2p/[crypto/crypto, peerid]
 import libp2p_mix
@@ -70,6 +71,37 @@ suite "MixTransport sessions":
     check session.receivedSurbGroupCount == 1
     check session.takeReceivedSurbGroup().expect("could not take second group").len == 1
     check session.takeReceivedSurbGroup().isErr
+
+  test "a short refill completes its batch and permits another request":
+    let
+      rng = newRng()
+      store = newSessionStore()
+      session = store.addRecipientSession(randomPeerId(rng)).expect(
+          "could not add recipient session"
+        )
+
+    session
+      .addReceivedSurbGroups(toSeq(0 ..< ReplyControlReserveGroups).mapIt(@[SURB()]))
+      .expect("could not add initial SURB groups")
+
+    let firstBatchId = session.beginRefill().expect("could not begin first refill")
+    discard session.takeReceivedSurbGroup().expect(
+        "could not consume the refill request group"
+      )
+    session.clearReplyCapacityStateChanged()
+
+    # A refill may retain fewer valid groups than requested. Completing the
+    # batch wakes the waiting send so that it can recheck the queue and request
+    # another refill instead of waiting for an unreserved group indefinitely.
+    check session.completeRefill(firstBatchId)
+    session.addReceivedSurbGroups(@[@[SURB()]]).expect(
+      "could not add the valid part of the refill"
+    )
+    waitFor session.waitForReplyCapacityStateChange()
+
+    check:
+      session.receivedSurbGroupCount == ReplyControlReserveGroups
+      session.beginRefill().isSome
 
   test "duplicate indexes are rejected without replacing existing sessions":
     let
