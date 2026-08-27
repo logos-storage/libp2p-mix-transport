@@ -89,7 +89,9 @@ proc handleRequest(
   elif data.hasKey("address"):
     fromJson(address, data["address"])
     info "Handle direct data request", address = address
-    await node.request(address, size) # will throw on error
+    let res = await node.request(address, size)
+    if res.isErr:
+      return await req.respond(Http500, "Failed to request: " & res.error)
   else:
     return await req.respond(Http400, "Either peerId or address must be present")
 

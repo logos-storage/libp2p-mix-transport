@@ -86,7 +86,10 @@ proc main() =
       error "Failed to create server", msg = error
       quit(1)
 
-  waitFor node.start()
+  (waitFor node.start()).isOkOr:
+    error "Failed to start node", msg = error
+    quit(1)
+
   server.start()
   node.running = true
 

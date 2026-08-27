@@ -27,8 +27,9 @@ type
   Node* = ref object
     info*: MixNodeInfo
     switch*: Switch
-    proto*: MixProtocol
-    transport*: MixTransport
+    mixProto*: MixProtocol
+    mixTransport*: MixTransport
+    # When set to true, means the node is ready to take requests.
     running*: bool
 
   MsgType {.pure.} = enum
@@ -47,21 +48,17 @@ type
     status {.fieldNumber: 1, ext.}: ResponseStatus
     request {.fieldNumber: 2.}: TransferRequest
 
-proc encodeMsg[T](msg: T, msgType: MsgType): seq[byte] =
-  let data = Protobuf.encode(msg)
-  # 1 byte for type + 2 for message length
-  var buffer = newSeqUninit[byte](data.len + 1 + 2)
-  let len = data.len.uint16.toLE
+proc receive[T](
+    stream: Stream, msgType: MsgType
+): Future[T] {.async: (raises: [CancelledError, SerializationError, LPError]).} =
+  var
+    len: uint16
+    msgTypeByte: byte
 
-  buffer[0] = msgType.byte
-  copyMem(addr buffer[1], addr len, 2)
-  copyMem(addr buffer[3], addr data[0], data.len)
-  buffer
+  await stream.readExactly(addr msgTypeByte, 1)
+  if msgTypeByte != msgType.byte:
+    raise newException(LPError, "Invalid message type")
 
-proc decodeMsg[T](
-    stream: Stream
-): Future[T] {.async: (raises: [CancelledError, SerializationError, LPStreamError]).} =
-  var len: uint16
   await stream.readExactly(addr len, 2)
   len = len.fromLE
 
@@ -72,49 +69,23 @@ proc decodeMsg[T](
 proc send[T](
     stream: Stream, msg: sink T, msgType: MsgType
 ) {.async: (raises: [CancelledError, LPStreamError]).} =
-  let payload = encodeMsg(msg, msgType)
-  await stream.write(payload)
+  let data = Protobuf.encode(msg)
+  # Header: [msgType (1 byte), payload length (2 bytes)]
+  var buffer = newSeqUninit[byte](data.len + 1 + 2)
+  let len = data.len.uint16.toLE
 
-proc request(
-    stream: Stream, size: int32, seed: Option[int64] = int64.none
-) {.async: (raises: [CancelledError, LPStreamError]).} =
-  let now = getTime()
-  var seedValue =
-    if seed.isNone:
-      now.toUnix * 1_000_000_000 + now.nanosecond
-    else:
-      seed.get()
+  buffer[0] = msgType.byte
+  copyMem(addr buffer[1], addr len, 2)
+  copyMem(addr buffer[3], addr data[0], data.len)
 
-  info "Sending libp2p transfer request", size = size, seed = seedValue
-
-  let payload =
-    encodeMsg(TransferRequest(size: size, seed: seedValue), MsgType.transferRequest)
-  await stream.write(payload) # sink
-
-proc request*(
-    self: Node, target: PeerId, size: int32, seed: Option[int64] = int64.none
-): Future[Result[void, string]] {.async: (raises: [CancelledError, LPStreamError]).} =
-  let stream = (await self.transport.dial(target, TransferCodec)).valueOr:
-    return err(error)
-
-  await request(stream, size, seed)
-
-proc request*(
-    self: Node, target: MultiAddress, size: int32, seed: Option[int64] = int64.none
-): Future[void] {.async: (raises: [CancelledError, LPStreamError, DialFailedError]).} =
-  let
-    peerId = await self.switch.connect(target, true)
-    stream = await self.switch.dial(peerId, TransferCodec)
-
-  await request(stream, size, seed)
+  await stream.write(buffer)
 
 proc handleTransferRequest(
     stream: Stream, request: TransferRequest
 ) {.async: (raises: [CancelledError, LPStreamError]).} =
   info "handling libp2p transfer request", size = request.size, seed = request.seed
   # Send preamble.
-  await send(
-    stream,
+  await stream.send(
     TransferResponse(status: ResponseStatus.Accepted, request: request),
     MsgType.transferResponse,
   )
@@ -146,7 +117,7 @@ proc handleTransferResponse(
 
   var
     received = 0
-    buffer = newSeq[byte](ChunkSize)
+    buffer = newSeq[byte](min(ChunkSize, response.request.size.int))
     rand = initRand(response.request.seed)
 
   while received < response.request.size:
@@ -160,38 +131,85 @@ proc handleTransferResponse(
   info "Bytestream validated successfully",
     size = response.request.size, seed = response.request.seed
 
+proc request(
+    stream: Stream, size: int32, seed: Option[int64] = int64.none
+): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
+  defer:
+    await stream.close()
+
+  let now = getTime()
+  let seedValue =
+    if seed.isNone:
+      now.toUnix * 1_000_000_000 + now.nanosecond
+    else:
+      seed.get()
+
+  info "Sending libp2p transfer request", size = size, seed = seedValue
+
+  try:
+    await stream.send(
+      TransferRequest(size: size, seed: seedValue), MsgType.transferRequest
+    )
+    await handleTransferResponse(stream, await receive[TransferResponse](stream, MsgType.transferResponse))
+  except CancelledError as e:
+    raise e
+  except CatchableError as e:
+    return err(e.msg)
+
+  ok()
+
+## Asks the remote peer for a random byte stream of size `size` using
+## an optionally provided seed, and then waits for the result and
+## verifies it. This version uses a Mix transport connection.
+proc request*(
+    self: Node, target: PeerId, size: int32, seed: Option[int64] = int64.none
+): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
+  let stream = (await self.mixTransport.dial(target, TransferCodec)).valueOr:
+    return err(error)
+
+  await request(stream, size, seed)
+
+## Asks the remote peer for a random byte stream of size `size` using
+## an optionally provided seed, and then waits for the result and
+## verifies it. This version uses a direct libp2p connection.
+proc request*(
+    self: Node, target: MultiAddress, size: int32, seed: Option[int64] = int64.none
+): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
+  let stream =
+    try:
+      let peerId = await self.switch.connect(target, true)
+      await self.switch.dial(peerId, TransferCodec)
+    except CancelledError as e:
+      raise e
+    except CatchableError as e:
+      return err(e.msg)
+
+  ? await request(stream, size, seed)
+
+  # Because we're calling `connect` without a peer id, the ConnManager will internally
+  # open a connection per dial. If we don't drop the peer, we'll exhaust the maximum
+  # of connections simply by running repeated transfers.
+  await self.switch.connManager.dropPeer(stream.peerId)
+  ok()
+
 proc newTransferProtocol*(): LPProtocol =
   let handler: LPProtoHandler = proc(
       stream: Stream, selectedCodec: string
   ): Future[void] {.async: (raises: [CancelledError]).} =
     defer:
+      debug "exiting read loop"
       await stream.close()
+
     try:
-      debug "entering read loop"
+      debug "entering read loop", peer = stream.peerId
       while not stream.atEof:
-        var msgType: MsgType
-        await stream.readExactly(addr msgType, 1)
-
-        trace "read type header", msgType = msgType
-        {.warning[UnreachableElse]: off.}:
-          case msgType
-          of MsgType.transferRequest:
-            await handleTransferRequest(
-              stream, await decodeMsg[TransferRequest](stream)
-            )
-          of MsgType.transferResponse:
-            await handleTransferResponse(
-              stream, await decodeMsg[TransferResponse](stream)
-            )
-          else:
-            error "Unknown message type", msgType = msgType
-            break
-    except SerializationError as e:
-      error "Malformed message", msg = e.msg
-    except LPError as e:
+        await handleTransferRequest(stream, await receive[TransferRequest](stream, MsgType.transferRequest))
+    except CancelledError as e:
+      raise e
+    except LPStreamEOFError:
+      debug "transfer stream closed by peer"
+    except CatchableError as e:
       error "Error handling message", msg = e.msg
-
-    debug "exiting read loop"
 
   LPProtocol.new(@[TransferCodec], handler)
 
@@ -243,12 +261,17 @@ proc init*(
   Node(
     info: mixNodeInfo,
     switch: switch,
-    proto: mixProto,
-    transport: newMixTransport(mixProto),
+    mixProto: mixProto,
+    mixTransport: newMixTransport(mixProto),
   ).ok
 
-proc start*(self: Node): Future[void] {.async: (raises: [CancelledError, LPError]).} =
-  await self.switch.start()
-  await self.proto.start()
-  (await self.transport.start()).expect("Failed to start Mix transport")
+proc start*(self: Node): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
+  try:
+    await self.switch.start()
+    await self.mixProto.start()
+  except CatchableError as e:
+    error "Error starting node", msg = e.msg
+    return err(e.msg)
+  ? await self.mixTransport.start()
   self.running = true
+  ok()
