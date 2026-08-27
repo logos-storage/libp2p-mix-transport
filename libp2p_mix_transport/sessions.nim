@@ -177,13 +177,13 @@ proc clearReplyCapacityStateChanged*(session: TransportSession) =
 
 proc waitForReplyCapacityStateChange*(
     session: TransportSession
-): Future[void] {.async: (raises: [CancelledError]).} =
-  await session.replyCapacityStateChanged.wait()
+): Future[void] {.async: (raw: true, raises: [CancelledError]).} =
+  session.replyCapacityStateChanged.wait()
 
 proc acquireReplySend*(
     session: TransportSession
-): Future[void] {.async: (raises: [CancelledError]).} =
-  await session.replySendLock.acquire()
+): Future[void] {.async: (raw: true, raises: [CancelledError]).} =
+  session.replySendLock.acquire()
 
 proc releaseReplySend*(session: TransportSession) =
   try:

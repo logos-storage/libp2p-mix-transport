@@ -141,8 +141,7 @@ proc ensureUnreservedSurbGroup(
     session.clearReplyCapacityStateChanged()
     (await self.requestRefill(session)).isOkOr:
       return err(error)
-    if session.receivedSurbGroupCount <= ReplyControlReserveGroups:
-      await session.waitForReplyCapacityStateChange()
+    await session.waitForReplyCapacityStateChange()
   ok()
 
 proc sendStreamFrame(

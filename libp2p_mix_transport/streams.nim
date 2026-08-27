@@ -126,16 +126,16 @@ proc acknowledgementSnapshot*(stream: TransportStream): AckSnapshot =
 
 proc waitForShouldSendAck*(
     stream: TransportStream
-): Future[void].Raising([CancelledError]) =
-  stream.shouldSendAck.wait().join()
+): Future[void] {.async: (raw: true, raises: [CancelledError]).} =
+  stream.shouldSendAck.wait()
 
 proc clearShouldSendAck*(stream: TransportStream) =
   stream.shouldSendAck.clear()
 
 proc waitForInboundData*(
     stream: TransportStream
-): Future[void].Raising([CancelledError]) =
-  stream.dataAvailable.wait().join()
+): Future[void] {.async: (raw: true, raises: [CancelledError]).} =
+  stream.dataAvailable.wait()
 
 proc clearInboundDataAvailable*(stream: TransportStream) =
   stream.dataAvailable.clear()
