@@ -27,6 +27,18 @@ await() {
     if (( SECONDS - start >= timeout )); then
       return 1
     fi
-    sleep 1
+    sleep 0.5
   done
+}
+
+array_remove() {
+  local -n arr=$1
+  local value=$2
+  local new_arr=()
+  for item in "${arr[@]}"; do
+    if [[ "$item" != "$value" ]]; then
+      new_arr+=("$item")
+    fi
+  done
+  arr=("${new_arr[@]}")
 }

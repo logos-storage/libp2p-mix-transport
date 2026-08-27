@@ -32,14 +32,18 @@ _node_ready() {
 tr_status() {
   local node_index=$1
   local api_port=$((_base_api_port + node_index))
-  curl -fsS "http://127.0.0.1:$api_port/status" | jq .
+  curl -fsS "http://127.0.0.1:$api_port/status" 2> /dev/null | jq .
 }
 
 tr_start_node() {
   local node_index=$1
   local api_port=$((_base_api_port + node_index))
   local listen_port=$((_base_listen_port + node_index))
-  local args=("--api-port=$api_port" "--listen-port=$listen_port")
+  local args=(
+    "--api-port=$api_port"
+    "--listen-port=$listen_port"
+    --log-level="$TR_LOG_LEVEL"
+  )
 
   local tr_cmd=(
     "$TR_NODE_BINARY"
@@ -51,8 +55,6 @@ tr_start_node() {
   if [[ ${#urls[@]} -gt 0 ]]; then
     tr_cmd+=("${urls[@]}")
   fi
-
-  echoerr "Command: ${tr_cmd[*]}"
 
   "${tr_cmd[@]}" &>"${TR_LOGS_FOLDER}/node-${node_index}.log" &
   _node_pids[$node_index]=$!

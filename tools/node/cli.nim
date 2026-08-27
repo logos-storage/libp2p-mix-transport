@@ -6,6 +6,8 @@ import std/strformat
 import std/strutils
 
 import pkg/chronicles
+import pkg/chronicles/helpers
+import pkg/chronicles/topics_registry
 import pkg/chronos
 import pkg/chronos/apps/http/httpserver
 import pkg/libp2p_mix
@@ -20,9 +22,25 @@ const
   DefaultApiPort = 8080.uint
   DefaultListenPort = 0.uint
   DefaultListenIp = "127.0.0.1"
+  DefaultLogLevel = "INFO"
 
 template echoerr(msg: string) =
   stderr.writeLine(msg)
+
+proc updateLogLevel*(logLevel: string) {.raises: [ValueError].} =
+  let directives = logLevel.split(";")
+  try:
+    setLogLevel(parseEnum[LogLevel](directives[0].toUpperAscii))
+  except ValueError:
+    raise (ref ValueError)(
+      msg:
+        "Please specify one of: trace, debug, " & "info, notice, warn, error or fatal"
+    )
+
+  if directives.len > 1:
+    for topicName, settings in parseTopicDirectives(directives[1 ..^ 1]):
+      if not setTopicState(topicName, settings.state, settings.logLevel):
+        warn "Unrecognized logging topic", topic = topicName
 
 proc collectMixConfigs(urls: seq[string]): seq[MixPubInfo] =
   # Use blocking client cause we're not running inside of chronos
@@ -72,6 +90,8 @@ proc main() =
         listenPort = val.parseUint()
       of "listen-ip", "i":
         listenIp = val
+      of "log-level", "e":
+        updateLogLevel(val)
       else:
         echoerr("Unknown option: " & key)
         printUsage()
