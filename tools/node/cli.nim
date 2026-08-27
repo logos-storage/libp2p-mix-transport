@@ -37,7 +37,9 @@ proc collectMixConfigs(urls: seq[string]): seq[MixPubInfo] =
     debug "Contacting mix node", url = url
     let content = parseJson(client.getContent(fmt"{url}/status"))
     fromJson(result[i], content["mixInfo"])
-    debug "Added mix config for node", url = url
+    info "Added mix config for node", url = url
+
+  info "Node mix pool has nodes", n = result.len
 
 proc printUsage() =
   echoerr "Usage: node [options] <listen-ip>"
