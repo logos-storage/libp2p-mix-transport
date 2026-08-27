@@ -243,8 +243,8 @@ proc configureStream(
 ) =
   let writeHandler: StreamWriteHandler = proc(
       data: sink seq[byte]
-  ): Future[void] {.async: (raises: [CancelledError, LPStreamError]).} =
-    await self.writeStream(session, stream, move(data))
+  ): Future[void] {.async: (raw: true, raises: [CancelledError, LPStreamError]).} =
+    self.writeStream(session, stream, move(data))
   stream.setWriteHandler(writeHandler)
   self.streamTasks.trackFut(runInboundDelivery(stream))
   self.streamTasks.trackFut(runAcknowledgements(self, session, stream))
@@ -661,16 +661,16 @@ proc start*(
 
   let deliveryHandler: MixDeliveryHandler = proc(
       delivery: MixDelivery
-  ): Future[void] {.async: (raises: [CancelledError]).} =
-    await self.handleDelivery(delivery)
+  ): Future[void] {.async: (raw: true, raises: [CancelledError]).} =
+    self.handleDelivery(delivery)
 
   self.mix.registerMixDeliveryHandler(MixTransportCodec, deliveryHandler).isOkOr:
     return err(error)
 
   let rawSurbReplyHandler: RawSurbReplyHandler = proc(
       reply: RawSurbReply
-  ): Future[RawSurbReplyDisposition] {.async: (raises: [CancelledError]).} =
-    return await self.handleRawSurbReply(reply)
+  ): Future[RawSurbReplyDisposition] {.async: (raw: true, raises: [CancelledError]).} =
+    self.handleRawSurbReply(reply)
 
   self.mix.registerRawSurbReplyHandler(rawSurbReplyHandler).isOkOr:
     self.mix.unregisterMixDeliveryHandler(MixTransportCodec)

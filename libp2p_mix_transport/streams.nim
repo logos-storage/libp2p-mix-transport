@@ -254,7 +254,9 @@ proc reject*(stream: TransportStream, reason: string) =
   stream.rejectionReason = reason
   stream.resolved.fire()
 
-proc waitUntilResolved*(stream: TransportStream): Future[void] =
+proc waitUntilResolved*(
+    stream: TransportStream
+): Future[void] {.async: (raw: true, raises: [CancelledError]).} =
   stream.resolved.wait()
 
 method write*(
