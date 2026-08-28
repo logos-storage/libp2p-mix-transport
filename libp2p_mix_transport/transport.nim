@@ -2,7 +2,7 @@
 
 {.push raises: [].}
 
-import chronos, results
+import chronos, chronos/asyncsync, results, tables
 import libp2p/multistream
 import libp2p/peerid
 import libp2p/protocols/protocol
@@ -33,6 +33,9 @@ type MixTransport* = ref object
   streamOpenTimeout: Duration
   handlerTasks: seq[Future[void].Raising([CancelledError])]
   streamTasks: seq[Future[void].Raising([CancelledError])]
+  connLock: AsyncLock
+  connectAttempts: Table[PeerId,
+    Future[Result[TransportSession, string]].Raising([CancelledError])]
   started: bool
 
 type PreparedReplyGroups = object
@@ -465,6 +468,7 @@ proc newMixTransport*(
     sessions: newSessionStore(),
     connectTimeout: connectTimeout,
     streamOpenTimeout: streamOpenTimeout,
+    connLock: newAsyncLock(),
   )
 
 proc createReplyGroups(
@@ -552,17 +556,9 @@ proc createConnectFrame(
     )
   )
 
-proc connect*(
+proc connectInternal(
     self: MixTransport, destination: PeerId
 ): Future[Result[TransportSession, string]] {.async: (raises: [CancelledError]).} =
-  if not self.started:
-    return err("MixTransport is not started")
-
-  self.sessions.getByDestination(destination).withValue(existing):
-    if existing.state == SessionState.Established:
-      return ok(existing)
-    return err("session establishment is already in progress")
-
   let sessionId = PeerId.random(self.mix.switch.rng).valueOr:
     return err("could not generate session identifier: " & $error)
   let session = self.sessions.addInitiatorSession(destination, sessionId).valueOr:
@@ -591,6 +587,90 @@ proc connect*(
 
   keepSession = true
   ok(session)
+
+## Connect operation synchronizer, implemented like this so we can test it in
+## isolation.
+proc connect[S, K, T](
+  self: S,
+  destination: K,
+  connInternal: (
+    proc(self: S, destination: K): Future[Result[T, string]].Raising([CancelledError]) {.gcsafe, raises:[]}),
+  getExisting: (proc(self: S, destination: K): Opt[T] {.gcsafe, raises: [].}),
+): Future[Result[T, string]] {.async: (raises: [CancelledError]).} =
+  template releaseLock() =
+    try:
+      self.connLock.release()
+    except AsyncLockError:
+      doAssert false, "lock release twice"
+
+  await self.connLock.acquire()
+  # If a connection already exists and it is established, we return it.
+  self.getExisting(destination).withValue(existing):
+    releaseLock()
+    # It might happen that the connection is no longer valid here, but
+    # that's fine.
+    return ok(existing)
+
+  # If a valid connection doesn't exist, then this is officially a connection
+  # attempt. Our goal here then becomes to merge all connection attempts
+  # into a single operation, with only one of the requesters "owning" the
+  # actual attempt while everyone else awaits.
+
+  # Are we the first ones to attempt this connection?
+  if destination in self.connectAttempts:
+    # No, someone else owns the attempt, so we just wait.
+    # Copies before releasing the lock as otherwise the attempt
+    # could complete before we can get a hold of the future.
+    var attempt: Future[Result[T, string]].Raising([CancelledError])
+    try:
+      attempt = self.connectAttempts[destination]
+    except exceptions.KeyError:
+      doAssert false, "assertion failed"
+    releaseLock()
+    return await attempt
+
+  # If we're here, we're sure that we're the ones handling this
+  # attempt at connecting to this destination.
+  let attempt =
+    Future[Result[T, string]].Raising([CancelledError]).init("transport.connect")
+  # Note that this should never replace an existing attempt.
+  doAssert destination notin self.connectAttempts
+  self.connectAttempts[destination] = attempt
+  # We can release the lock here as we've secured the attempt.
+  releaseLock()
+
+  let res = try:
+    await self.connInternal(destination)
+  except CancelledError as e:
+    raise e
+  except CatchableError as e:
+    err(e.msg)
+  finally:
+    # This is what will officially end an attempt. Once the
+    # future is out of the table, another requester can re-attempt
+    # the connection. Until then, everyone will see the result of
+    # the previous attempt.
+    await self.connLock.acquire()
+    self.connectAttempts.del(destination)
+    releaseLock()
+
+  attempt.complete(res)
+  res
+
+proc connect*(
+  self: MixTransport,
+  destination: PeerId
+): Future[Result[TransportSession, string]] {.async: (raises: [CancelledError]).} =
+  if not self.started:
+    return err("MixTransport is not started")
+
+  proc getExisting(self: MixTransport, destination: PeerId): Opt[TransportSession] {.nimcall, gcsafe.} =
+    self.sessions.getByDestination(destination).withValue(existing):
+      if existing.state == SessionState.Established:
+        return Opt.some(existing)
+    return Opt.none(TransportSession)
+
+  await connect[MixTransport, PeerId, TransportSession](self, destination, connectInternal, getExisting)
 
 proc dial*(
     self: MixTransport, destination: PeerId, codec: string

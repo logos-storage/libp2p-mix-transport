@@ -4,7 +4,7 @@
 
 import std/[importutils, unittest]
 
-import chronos, results
+import chronos, results, tables
 import stew/byteutils
 import
   libp2p/[
@@ -15,11 +15,13 @@ import
     protocols/protocol,
     stream/connection,
     switch,
+    utils/opt,
   ]
 import libp2p_mix
 import libp2p_mix/delay_strategy
 
 import libp2p_mix_transport
+import libp2p_mix_transport/transport {.all.}
 
 privateAccess(MixProtocol)
 privateAccess(MixTransport)
@@ -280,3 +282,139 @@ suite "MixTransport session and stream handshakes":
           RawSurbReplyDisposition.Handled, RawSurbReplyDisposition.Handled,
           RawSurbReplyDisposition.Handled, RawSurbReplyDisposition.Handled,
         ]
+
+type
+  Synchronizer = ref object
+    connectAttempts: Table[string, Future[Result[Session, string]].Raising([CancelledError])]
+    sessions: Table[string, Session]
+    connLock: AsyncLock
+    gate: AsyncEvent
+
+  Caller = int
+  ConnAttempt = int
+  Destination = string
+  Session = tuple[attempt: ConnAttempt, caller: Caller]
+
+  ConnInternal = proc(self: Synchronizer, dest: Destination):
+    Future[Result[Session, string]].Raising([CancelledError]) {.gcsafe, raises: [].}
+
+proc newSynchronizer*(T: type Synchronizer): T =
+  T(connLock: newAsyncLock(), gate: newAsyncEvent())
+
+proc getExisting*(self: Synchronizer, dest: Destination): Opt[Session] {.raises: [].} =
+  if self.sessions.hasKey(dest):
+    try:
+      return Opt.some(self.sessions[dest])
+    except KeyError:
+      doAssert false
+  else:
+    return Opt.none(Session)
+
+proc connInternal(caller: Caller, error: Opt[string] = Opt.none(string)): ConnInternal =
+  proc wrapped(self: Synchronizer, dest: Destination): Future[Result[Session, string]] {.
+      async: (raises: [CancelledError])
+  .} =
+    # makes sure the connection attempt doesn't end before we can
+    # fire the next caller - this is how we ensure that calls get
+    # placed into the same attempt.
+    await self.gate.wait()
+
+    if error.isSome:
+      return err(error.get())
+
+    let attempt = try:
+      self.sessions[dest].attempt
+    except KeyError:
+      0
+
+    let session = (attempt + 1, caller)
+    self.sessions[dest] = session
+    return ok(session)
+
+  wrapped
+
+suite "connect behavior under multiple callers":
+
+  test "should create connection when there is only one caller":
+    proc asyncTest(): Future[void] {.async: (handleException: true).} =
+      let transport = Synchronizer.newSynchronizer()
+      transport.gate.fire()
+
+      let session = await connect[Synchronizer, Destination, Session](
+        transport, "destination1", connInternal(5), getExisting)
+
+      check:
+        session.get() == (attempt: 1, caller: 5)
+        transport.connectAttempts.len == 0
+
+    waitFor asyncTest()
+
+  test "should return existing connection if there is one":
+    proc asyncTest(): Future[void] {.async: (handleException: true).} =
+      let transport = Synchronizer.newSynchronizer()
+      transport.sessions["destination1"] = (10, 1)
+      transport.gate.fire()
+
+      let session = await connect[Synchronizer, Destination, Session](
+        transport, "destination1", connInternal(5), getExisting)
+
+      check:
+        session.get() == (attempt: 10, caller: 1)
+
+    waitFor asyncTest()
+
+  test "should await the owner's attempt when there is more than one caller":
+    proc asyncTest(): Future[void] {.async: (handleException: true).} =
+      let transport = Synchronizer.newSynchronizer()
+
+      let
+        first = connect[Synchronizer, Destination, Session](
+          transport, "destination1", connInternal(1), getExisting)
+        second = connect[Synchronizer, Destination, Session](
+          transport, "destination1", connInternal(2), getExisting)
+
+      transport.gate.fire()
+
+      let
+        firstSession = await first
+        secondSession = await second
+
+      check:
+        firstSession.get() == (attempt: 1, caller: 1)
+        secondSession.get() == (attempt: 1, caller: 1)
+        transport.connectAttempts.len == 0
+
+    waitFor asyncTest()
+
+  test "should allow another attempt if the previous one failed":
+    proc asyncTest(): Future[void] {.async: (handleException: true).} =
+      let transport = Synchronizer.newSynchronizer()
+
+      let
+        first = connect[Synchronizer, Destination, Session](
+          transport, "destination1", connInternal(1, Opt.some("ooops, this is an error")),
+          getExisting)
+        second = connect[Synchronizer, Destination, Session](
+          transport, "destination1", connInternal(2, Opt.some("this is also an error")),
+          getExisting)
+
+      transport.gate.fire()
+      # Despite the error, the first two calls should end in the same
+      # outcome as they are logically the same attempt.
+      check:
+        (await first).error() == "ooops, this is an error"
+        (await second).error() == "ooops, this is an error"
+        transport.connectAttempts.len == 0
+
+      # A third call that happens after the first two complete,
+      # however, should be able to go through as it represents
+      # a separate attempt.
+      transport.gate.clear()
+      let third = connect[Synchronizer, Destination, Session](
+        transport, "destination1", connInternal(3), getExisting)
+      transport.gate.fire()
+      check:
+        (await third).get() == (attempt: 1, caller: 3)
+        transport.connectAttempts.len == 0
+
+    waitFor asyncTest()
