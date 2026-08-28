@@ -70,7 +70,7 @@ while [ "${_remaining}" -gt 0 ]; do
     _to_launch=$(( _to_launch < _max_launch ? _to_launch : _max_launch ))
     if [ $_to_launch -gt 0 ]; then
         for _ in $(seq 1 $_to_launch); do
-            mapfile -t _pair < <(shuf -i "${MIX_PATH_LENGTH}"-$((N_NODES - 1)) -n 2)
+            mapfile -t _pair < <(shuf -i "${MIX_PATH_LENGTH}"-$((N_NODES - 1)) -n 2 | sort -nr)
             echoerr "Transfer ${_pair[0]} -> ${_pair[1]} (${N_BYTES} bytes)"
             $_tr_transfer "${_pair[0]}" "${_pair[1]}" "${N_BYTES}" &
             _running+=($!)
