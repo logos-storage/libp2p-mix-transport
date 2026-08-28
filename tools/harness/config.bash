@@ -14,6 +14,7 @@ TR_LOG_LEVEL="INFO;trace:mix_transport"
 export TR_RUNTIME_FOLDER
 export TR_NODE_BINARY
 export TR_LOGS_FOLDER
+export TR_LOG_LEVEL
 
 echoerr "Configured variables:"
 env | grep "^TR_"

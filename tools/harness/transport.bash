@@ -92,7 +92,7 @@ tr_transfer_mix() {
   # they're not launching non-contiguous node IDs. To get a more accurate predicate
   # we'd need to know how many mix nodes the node knows, which for now I don't see
   # as needed.
-  if [[ $source_node -le $MIX_PATH_LENGTH ]]; then
+  if [[ $source_node -lt $MIX_PATH_LENGTH ]]; then
     echoerr "Source index must be larger or equal to $MIX_PATH_LENGTH (was $source_node)"
     return 1
   fi
