@@ -111,9 +111,7 @@ suite "MixTransport wire format":
       version: MixTransportVersion,
       sessionId: randomSessionId(),
       kind: FrameKind.Refill,
-      batchId: Opt.some(42'u64),
-      partIndex: Opt.some(0'u32),
-      partCount: Opt.some(1'u32),
+      refillRequestId: Opt.some(RefillRequestId(42)),
       surbGroups: @[SurbGroup(surbs: @[newSeq[byte](SurbSize)])],
     )
 
@@ -122,9 +120,7 @@ suite "MixTransport wire format":
       .expect("decode failed")
 
     check:
-      decoded.batchId == frame.batchId
-      decoded.partIndex == frame.partIndex
-      decoded.partCount == frame.partCount
+      decoded.refillRequestId == frame.refillRequestId
       decoded.surbGroups == frame.surbGroups
 
   test "SURB groups use the canonical Mix serialization boundary":

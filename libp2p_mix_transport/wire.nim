@@ -13,6 +13,7 @@ import protobuf_serialization/std/enums
 type
   StreamId* = uint32
   SequenceNumber* = uint32
+  RefillRequestId* = uint64
 
 const
   MixTransportCodec* = "/libp2p/mix-transport/1.0.0"
@@ -84,10 +85,8 @@ type
     codec* {.fieldNumber: 7.}: Opt[string]
     receiveBase* {.fieldNumber: 8, fixed.}: Opt[SequenceNumber]
     acknowledgementBitmap* {.fieldNumber: 9.}: Opt[seq[byte]]
-    batchId* {.fieldNumber: 10, pint.}: Opt[uint64]
+    refillRequestId* {.fieldNumber: 10, pint.}: Opt[RefillRequestId]
     requestedGroups* {.fieldNumber: 11, pint.}: Opt[uint32]
-    partIndex* {.fieldNumber: 12, pint.}: Opt[uint32]
-    partCount* {.fieldNumber: 13, pint.}: Opt[uint32]
     surbGroups* {.fieldNumber: 14.}: seq[SurbGroup]
     rejectionReason* {.fieldNumber: 15.}: Opt[string]
 
@@ -166,15 +165,11 @@ proc validateFrame(
   require frame.acknowledgementBitmap.isNone or
     frame.acknowledgementBitmap.get().len == AckBitmapBytes,
     "acknowledgement bitmap has the wrong size"
-  require frame.batchId.isSome ==
+  require frame.refillRequestId.isSome ==
     (frame.kind in {FrameKind.RefillRequest, FrameKind.Refill}),
-    "batchId does not match the frame kind"
+    "refillRequestId does not match the frame kind"
   require frame.requestedGroups.isSome == (frame.kind == FrameKind.RefillRequest),
     "requestedGroups does not match the frame kind"
-  require frame.partIndex.isSome == (frame.kind == FrameKind.Refill),
-    "partIndex does not match the frame kind"
-  require frame.partCount.isSome == (frame.kind == FrameKind.Refill),
-    "partCount does not match the frame kind"
   require frame.surbGroups.len == 0 or carriesSurbs,
     "SURB groups do not match the frame kind"
   require frame.rejectionReason.isNone or frame.kind == FrameKind.StreamReject,
@@ -197,9 +192,6 @@ proc validateFrame(
       "refill requests too many groups"
   of FrameKind.Refill:
     require frame.surbGroups.len > 0, "refill must provide at least one SURB group"
-    require frame.partCount.get() > 0, "refill partCount must not be zero"
-    require frame.partIndex.get() < frame.partCount.get(),
-      "refill partIndex is outside partCount"
   else:
     discard
 
