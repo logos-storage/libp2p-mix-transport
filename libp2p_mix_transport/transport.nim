@@ -114,23 +114,23 @@ proc sendWithSurbGroup(
 proc requestRefill(
     self: MixTransport, session: TransportSession
 ): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
-  let batchId = session.beginRefill().valueOr:
+  let refillRequestId = session.beginRefillRequest().valueOr:
     return ok()
 
   var replyGroup = session.takeReceivedSurbGroup().valueOr:
-    session.cancelRefill(batchId)
+    session.cancelRefillRequest(refillRequestId)
     return err("could not reserve a SURB group for refill: " & error)
   let request = MixTransportFrame(
     version: MixTransportVersion,
     sessionId: session.sessionId,
     kind: FrameKind.RefillRequest,
-    batchId: Opt.some(batchId),
+    refillRequestId: Opt.some(refillRequestId),
     requestedGroups: Opt.some(DefaultRefillGroups.uint32),
   ).encode().valueOr:
-    session.cancelRefill(batchId)
+    session.cancelRefillRequest(refillRequestId)
     return err("could not encode RefillRequest: " & error)
   (await self.sendWithSurbGroup(replyGroup, request)).isOkOr:
-    session.cancelRefill(batchId)
+    session.cancelRefillRequest(refillRequestId)
     return err("could not send RefillRequest: " & error)
   ok()
 
@@ -281,8 +281,8 @@ proc handleRefill(self: MixTransport, frame: MixTransportFrame) {.gcsafe, raises
   if session.role != SessionRole.Recipient or session.state != SessionState.Established:
     return
 
-  let batchId = frame.batchId.get()
-  if not session.completeRefill(batchId):
+  let refillRequestId = frame.refillRequestId.get()
+  if not session.completeRefillRequest(refillRequestId):
     return
 
   var decodedGroups = newSeqOfCap[seq[SURB]](frame.surbGroups.len)
@@ -531,9 +531,7 @@ proc handleRefillRequest(
     version: MixTransportVersion,
     sessionId: session.sessionId,
     kind: FrameKind.Refill,
-    batchId: frame.batchId,
-    partIndex: Opt.some(0'u32),
-    partCount: Opt.some(1'u32),
+    refillRequestId: frame.refillRequestId,
     surbGroups: prepared.encoded,
   )
   (await self.sendStreamFrame(session, refill)).isOkOr:

@@ -310,7 +310,8 @@ suite "MixTransport session and stream handshakes":
     session.addReceivedSurbGroups(@[@[SURB()], @[SURB()]]).expect(
       "could not add initial reply groups"
     )
-    let batchId = session.beginRefill().expect("could not begin refill")
+    let refillRequestId =
+      session.beginRefillRequest().expect("could not begin refill request")
     discard session.takeReceivedSurbGroup().expect(
         "could not consume the refill request group"
       )
@@ -323,9 +324,7 @@ suite "MixTransport session and stream handshakes":
       version: MixTransportVersion,
       sessionId: session.sessionId,
       kind: FrameKind.Refill,
-      batchId: Opt.some(batchId),
-      partIndex: Opt.some(0'u32),
-      partCount: Opt.some(1'u32),
+      refillRequestId: Opt.some(refillRequestId),
       surbGroups: @[
         SurbGroup.init(@[testSurb(1)]).expect("could not encode valid SURB group"),
         SurbGroup(surbs: @[@[0'u8]]),
@@ -334,7 +333,7 @@ suite "MixTransport session and stream handshakes":
 
     # Invoke the same delivery callback that Mix uses for a forward Refill.
     # The valid group is retained, the malformed group is ignored, and the
-    # completed batch allows the recipient to request more capacity.
+    # completed request allows the recipient to request more capacity.
     check frame.encode().isErr
     waitFor mix.deliveryHandlers[MixTransportCodec](
       MixDelivery(
@@ -348,4 +347,4 @@ suite "MixTransport session and stream handshakes":
 
     check:
       session.receivedSurbGroupCount == ReplyControlReserveGroups
-      session.beginRefill().isSome
+      session.beginRefillRequest().isSome

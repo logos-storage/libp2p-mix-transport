@@ -10,7 +10,7 @@ import libp2p/peerid
 import libp2p/utils/opt
 import libp2p_mix
 import ./streams
-from ./wire import MaxSessionIdBytes, StreamId
+from ./wire import MaxSessionIdBytes, RefillRequestId, StreamId
 
 const
   ReplyControlReserveGroups* = 2
@@ -34,8 +34,8 @@ type
     receivedSurbGroups: Deque[seq[SURB]]
     replyCapacityStateChanged: AsyncEvent
     replySendLock: AsyncLock
-    pendingRefillBatchId: Opt[uint64]
-    nextRefillBatchId: uint64
+    pendingRefillRequestId: Opt[RefillRequestId]
+    nextRefillRequestId: RefillRequestId
     streams: Table[StreamId, TransportStream]
     nextOutboundStreamId: Opt[StreamId]
 
@@ -104,8 +104,8 @@ proc addInitiatorSession*(
     receivedSurbGroups: initDeque[seq[SURB]](),
     replyCapacityStateChanged: newAsyncEvent(),
     replySendLock: newAsyncLock(),
-    pendingRefillBatchId: Opt.none(uint64),
-    nextRefillBatchId: 1,
+    pendingRefillRequestId: Opt.none(RefillRequestId),
+    nextRefillRequestId: 1,
     streams: initTable[StreamId, TransportStream](),
     nextOutboundStreamId: Opt.some(StreamId(1)),
   )
@@ -132,8 +132,8 @@ proc addRecipientSession*(
     receivedSurbGroups: initDeque[seq[SURB]](),
     replyCapacityStateChanged: newAsyncEvent(),
     replySendLock: newAsyncLock(),
-    pendingRefillBatchId: Opt.none(uint64),
-    nextRefillBatchId: 1,
+    pendingRefillRequestId: Opt.none(RefillRequestId),
+    nextRefillRequestId: 1,
     streams: initTable[StreamId, TransportStream](),
     nextOutboundStreamId: Opt.some(StreamId(2)),
   )
@@ -193,30 +193,34 @@ proc releaseReplySend*(session: TransportSession) =
   except AsyncLockError as exc:
     raiseAssert "session reply-send lock was not held: " & exc.msg
 
-func refillNeeded*(session: TransportSession): bool =
+func refillRequestNeeded*(session: TransportSession): bool =
   session.role == SessionRole.Recipient and
     session.receivedSurbGroups.len <= ReplyRefillLowWatermarkGroups and
-    session.pendingRefillBatchId.isNone
+    session.pendingRefillRequestId.isNone
 
-proc beginRefill*(session: TransportSession): Opt[uint64] =
-  if not session.refillNeeded:
-    return Opt.none(uint64)
-  let batchId = session.nextRefillBatchId
-  inc session.nextRefillBatchId
-  session.pendingRefillBatchId = Opt.some(batchId)
-  Opt.some(batchId)
+proc beginRefillRequest*(session: TransportSession): Opt[RefillRequestId] =
+  if not session.refillRequestNeeded:
+    return Opt.none(RefillRequestId)
+  let refillRequestId = session.nextRefillRequestId
+  inc session.nextRefillRequestId
+  session.pendingRefillRequestId = Opt.some(refillRequestId)
+  Opt.some(refillRequestId)
 
-proc cancelRefill*(session: TransportSession, batchId: uint64) =
-  if session.pendingRefillBatchId == Opt.some(batchId):
-    session.pendingRefillBatchId = Opt.none(uint64)
+proc cancelRefillRequest*(session: TransportSession, refillRequestId: RefillRequestId) =
+  if session.pendingRefillRequestId == Opt.some(refillRequestId):
+    session.pendingRefillRequestId = Opt.none(RefillRequestId)
 
-func isPendingRefill*(session: TransportSession, batchId: uint64): bool =
-  session.pendingRefillBatchId == Opt.some(batchId)
+func isPendingRefillRequest*(
+    session: TransportSession, refillRequestId: RefillRequestId
+): bool =
+  session.pendingRefillRequestId == Opt.some(refillRequestId)
 
-proc completeRefill*(session: TransportSession, batchId: uint64): bool =
-  if not session.isPendingRefill(batchId):
+proc completeRefillRequest*(
+    session: TransportSession, refillRequestId: RefillRequestId
+): bool =
+  if not session.isPendingRefillRequest(refillRequestId):
     return false
-  session.pendingRefillBatchId = Opt.none(uint64)
+  session.pendingRefillRequestId = Opt.none(RefillRequestId)
   session.replyCapacityStateChanged.fire()
   true
 

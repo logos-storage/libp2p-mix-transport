@@ -72,7 +72,7 @@ suite "MixTransport sessions":
     check session.takeReceivedSurbGroup().expect("could not take second group").len == 1
     check session.takeReceivedSurbGroup().isErr
 
-  test "a short refill completes its batch and permits another request":
+  test "a short refill completes its request and permits another request":
     let
       rng = newRng()
       store = newSessionStore()
@@ -84,16 +84,17 @@ suite "MixTransport sessions":
       .addReceivedSurbGroups(toSeq(0 ..< ReplyControlReserveGroups).mapIt(@[SURB()]))
       .expect("could not add initial SURB groups")
 
-    let firstBatchId = session.beginRefill().expect("could not begin first refill")
+    let firstRefillRequestId =
+      session.beginRefillRequest().expect("could not begin first refill request")
     discard session.takeReceivedSurbGroup().expect(
         "could not consume the refill request group"
       )
     session.clearReplyCapacityStateChanged()
 
     # A refill may retain fewer valid groups than requested. Completing the
-    # batch wakes the waiting send so that it can recheck the queue and request
+    # request wakes the waiting send so that it can recheck the queue and request
     # another refill instead of waiting for an unreserved group indefinitely.
-    check session.completeRefill(firstBatchId)
+    check session.completeRefillRequest(firstRefillRequestId)
     session.addReceivedSurbGroups(@[@[SURB()]]).expect(
       "could not add the valid part of the refill"
     )
@@ -101,7 +102,7 @@ suite "MixTransport sessions":
 
     check:
       session.receivedSurbGroupCount == ReplyControlReserveGroups
-      session.beginRefill().isSome
+      session.beginRefillRequest().isSome
 
   test "duplicate indexes are rejected without replacing existing sessions":
     let
