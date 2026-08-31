@@ -16,6 +16,7 @@ import ./[reply_credentials, sessions, streams, wire]
 const
   DefaultConnectTimeout* = 30.seconds
   DefaultStreamOpenTimeout* = 30.seconds
+  DefaultRefillRequestTimeout* = 30.seconds
   MinimumConnectReplyGroups* = 2
   DefaultConnectReplyGroups* = MinimumConnectReplyGroups
   DefaultConnectSurbRedundancy* = 2
@@ -31,6 +32,7 @@ type MixTransport* = ref object
   sessions: SessionStore
   connectTimeout: Duration
   streamOpenTimeout: Duration
+  refillRequestTimeout: Duration
   handlerTasks: seq[Future[void].Raising([CancelledError])]
   streamTasks: seq[Future[void].Raising([CancelledError])]
   started: bool
@@ -114,8 +116,11 @@ proc sendWithSurbGroup(
 proc requestRefill(
     self: MixTransport, session: TransportSession
 ): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
-  let refillRequestId = session.beginRefillRequest().valueOr:
+  if not session.refillRequestDue:
     return ok()
+
+  let refillRequestId = session.registerRefillRequest().valueOr:
+    return err(error)
 
   var replyGroup = session.takeReceivedSurbGroup().valueOr:
     session.cancelRefillRequest(refillRequestId)
@@ -129,6 +134,7 @@ proc requestRefill(
   ).encode().valueOr:
     session.cancelRefillRequest(refillRequestId)
     return err("could not encode RefillRequest: " & error)
+  session.scheduleNextRefillRequest(self.refillRequestTimeout)
   (await self.sendWithSurbGroup(replyGroup, request)).isOkOr:
     session.cancelRefillRequest(refillRequestId)
     return err("could not send RefillRequest: " & error)
@@ -141,7 +147,10 @@ proc ensureUnreservedSurbGroup(
     session.clearReplyCapacityStateChanged()
     (await self.requestRefill(session)).isOkOr:
       return err(error)
-    await session.waitForReplyCapacityStateChange()
+    if session.receivedSurbGroupCount <= ReplyControlReserveGroups:
+      let waitTime = session.timeUntilNextRefillRequest()
+      if waitTime > ZeroDuration:
+        discard await session.waitForReplyCapacityStateChange().withTimeout(waitTime)
   ok()
 
 proc sendStreamFrame(
@@ -282,7 +291,7 @@ proc handleRefill(self: MixTransport, frame: MixTransportFrame) {.gcsafe, raises
     return
 
   let refillRequestId = frame.refillRequestId.get()
-  if not session.completeRefillRequest(refillRequestId):
+  if not session.acceptRefillResponse(refillRequestId):
     return
 
   var decodedGroups = newSeqOfCap[seq[SURB]](frame.surbGroups.len)
@@ -460,16 +469,22 @@ proc newMixTransport*(
     mix: MixProtocol,
     connectTimeout = DefaultConnectTimeout,
     streamOpenTimeout = DefaultStreamOpenTimeout,
+    refillRequestTimeout = DefaultRefillRequestTimeout,
+    refillResponseLifetime = DefaultRefillResponseLifetime,
+    maxOutstandingRefillRequests = DefaultMaxOutstandingRefillRequests,
 ): MixTransport =
   doAssert not mix.isNil, "MixProtocol must not be nil"
   doAssert connectTimeout > ZeroDuration, "connect timeout must be positive"
   doAssert streamOpenTimeout > ZeroDuration, "stream open timeout must be positive"
+  doAssert refillRequestTimeout > ZeroDuration,
+    "refill request timeout must be positive"
   MixTransport(
     mix: mix,
     replyCredentials: ReplyCredentialStore.new(),
-    sessions: newSessionStore(),
+    sessions: newSessionStore(refillResponseLifetime, maxOutstandingRefillRequests),
     connectTimeout: connectTimeout,
     streamOpenTimeout: streamOpenTimeout,
+    refillRequestTimeout: refillRequestTimeout,
   )
 
 proc createReplyGroups(

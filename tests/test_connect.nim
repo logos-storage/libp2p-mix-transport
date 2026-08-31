@@ -311,7 +311,7 @@ suite "MixTransport session and stream handshakes":
       "could not add initial reply groups"
     )
     let refillRequestId =
-      session.beginRefillRequest().expect("could not begin refill request")
+      session.registerRefillRequest().expect("could not register refill request")
     discard session.takeReceivedSurbGroup().expect(
         "could not consume the refill request group"
       )
@@ -347,4 +347,4 @@ suite "MixTransport session and stream handshakes":
 
     check:
       session.receivedSurbGroupCount == ReplyControlReserveGroups
-      session.beginRefillRequest().isSome
+      session.refillRequestDue
