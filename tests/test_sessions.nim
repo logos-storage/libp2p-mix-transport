@@ -72,7 +72,7 @@ suite "MixTransport sessions":
     check session.takeReceivedSurbGroup().expect("could not take second group").len == 1
     check session.takeReceivedSurbGroup().isErr
 
-  test "a short refill completes its request and permits another request":
+  test "a short refill permits another request immediately":
     let
       rng = newRng()
       store = newSessionStore()
@@ -84,17 +84,23 @@ suite "MixTransport sessions":
       .addReceivedSurbGroups(toSeq(0 ..< ReplyControlReserveGroups).mapIt(@[SURB()]))
       .expect("could not add initial SURB groups")
 
-    let firstRefillRequestId =
-      session.beginRefillRequest().expect("could not begin first refill request")
+    let
+      now = Moment.now()
+      firstRefillRequestId = session.registerRefillRequest(now).expect(
+          "could not register first refill request"
+        )
     discard session.takeReceivedSurbGroup().expect(
         "could not consume the refill request group"
       )
+    session.scheduleNextRefillRequest(30.seconds, now)
     session.clearReplyCapacityStateChanged()
 
-    # A refill may retain fewer valid groups than requested. Completing the
-    # request wakes the waiting send so that it can recheck the queue and request
-    # another refill instead of waiting for an unreserved group indefinitely.
-    check session.completeRefillRequest(firstRefillRequestId)
+    check not session.refillRequestDue(now + 1.seconds)
+
+    # A response may retain fewer valid groups than requested. Accepting the
+    # response wakes the waiting send so that it can recheck the queue and retry
+    # instead of waiting for an unreserved group indefinitely.
+    check session.acceptRefillResponse(firstRefillRequestId, now + 1.seconds)
     session.addReceivedSurbGroups(@[@[SURB()]]).expect(
       "could not add the valid part of the refill"
     )
@@ -102,7 +108,70 @@ suite "MixTransport sessions":
 
     check:
       session.receivedSurbGroupCount == ReplyControlReserveGroups
-      session.beginRefillRequest().isSome
+      session.refillRequestDue(now + 1.seconds)
+
+  test "late refill responses contribute their SURB groups exactly once":
+    let
+      rng = newRng()
+      store = newSessionStore()
+      session = store.addRecipientSession(randomPeerId(rng)).expect(
+          "could not add recipient session"
+        )
+
+    session
+      .addReceivedSurbGroups(toSeq(0 ..< ReplyControlReserveGroups).mapIt(@[SURB()]))
+      .expect("could not add initial SURB groups")
+
+    let firstRequestId =
+      session.registerRefillRequest().expect("could not register first request")
+    discard session.takeReceivedSurbGroup().expect("could not send first request")
+    let retryRequestId =
+      session.registerRefillRequest().expect("could not register retry request")
+    discard session.takeReceivedSurbGroup().expect("could not send retry request")
+
+    check session.acceptRefillResponse(retryRequestId)
+    session.addReceivedSurbGroups(@[@[SURB()], @[SURB()]]).expect(
+      "could not add retry response groups"
+    )
+    check:
+      session.refillRequestDue
+      session.receivedSurbGroupCount == ReplyControlReserveGroups
+
+    check session.acceptRefillResponse(firstRequestId)
+    session.addReceivedSurbGroups(@[@[SURB()], @[SURB()]]).expect(
+      "could not add late response groups"
+    )
+    check:
+      not session.refillRequestDue
+      session.receivedSurbGroupCount == 2 * ReplyControlReserveGroups
+      not session.acceptRefillResponse(firstRequestId)
+
+  test "the oldest refill request is evicted when correlation state is full":
+    let
+      rng = newRng()
+      store = newSessionStore(
+        refillResponseLifetime = 30.minutes, maxOutstandingRefillRequests = 2
+      )
+      session = store.addRecipientSession(randomPeerId(rng)).expect(
+          "could not add recipient session"
+        )
+      now = Moment.now()
+
+    session
+      .addReceivedSurbGroups(toSeq(0 ..< ReplyControlReserveGroups).mapIt(@[SURB()]))
+      .expect("could not add initial SURB groups")
+    let
+      firstRequestId = session.registerRefillRequest(now).expect("first request")
+      secondRequestId =
+        session.registerRefillRequest(now + 1.seconds).expect("second request")
+      thirdRequestId =
+        session.registerRefillRequest(now + 2.seconds).expect("third request")
+
+    check:
+      session.outstandingRefillRequestCount == 2
+      not session.acceptRefillResponse(firstRequestId, now + 3.seconds)
+      session.acceptRefillResponse(secondRequestId, now + 3.seconds)
+      session.acceptRefillResponse(thirdRequestId, now + 3.seconds)
 
   test "duplicate indexes are rejected without replacing existing sessions":
     let
