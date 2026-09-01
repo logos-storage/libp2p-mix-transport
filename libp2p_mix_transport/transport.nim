@@ -2,7 +2,7 @@
 
 {.push raises: [].}
 
-import chronos, results
+import chronicles, chronos, results
 import libp2p/multistream
 import libp2p/peerid
 import libp2p/protocols/protocol
@@ -12,6 +12,9 @@ import libp2p/utils/future
 import libp2p/utils/opt
 import libp2p_mix
 import ./[reply_credentials, sessions, streams, wire]
+
+logScope:
+  topics = "libp2p mix-transport"
 
 const
   DefaultConnectTimeout* = 30.seconds
@@ -260,12 +263,21 @@ proc configureStream(
 
 proc handleData(self: MixTransport, frame: MixTransportFrame) {.gcsafe, raises: [].} =
   let session = self.sessions.get(frame.sessionId).valueOr:
+    debug "Dropping Data frame for unknown session", sessionId = frame.sessionId
     return
   if session.state != SessionState.Established:
+    debug "Dropping Data frame because session is not established",
+      sessionId = frame.sessionId, sessionState = session.state
     return
   let stream = session.getStream(frame.streamId.get()).valueOr:
+    debug "Dropping Data frame for unknown stream",
+      sessionId = frame.sessionId, streamId = frame.streamId.get()
     return
   if stream.state != StreamState.Established:
+    debug "Dropping Data frame because stream is not established",
+      sessionId = frame.sessionId,
+      streamId = stream.streamId,
+      streamState = stream.state
     return
   discard stream.receiveData(frame.sequence.get(), frame.payload.get())
 
@@ -273,12 +285,21 @@ proc handleAcknowledgement(
     self: MixTransport, frame: MixTransportFrame
 ) {.gcsafe, raises: [].} =
   let session = self.sessions.get(frame.sessionId).valueOr:
+    debug "Dropping Ack frame for unknown session", sessionId = frame.sessionId
     return
   if session.state != SessionState.Established:
+    debug "Dropping Ack frame because session is not established",
+      sessionId = frame.sessionId, sessionState = session.state
     return
   let stream = session.getStream(frame.streamId.get()).valueOr:
+    debug "Dropping Ack frame for unknown stream",
+      sessionId = frame.sessionId, streamId = frame.streamId.get()
     return
   if stream.state != StreamState.Established:
+    debug "Dropping Ack frame because stream is not established",
+      sessionId = frame.sessionId,
+      streamId = stream.streamId,
+      streamState = stream.state
     return
   discard stream.applyAcknowledgement(
     frame.receiveBase.get(), frame.acknowledgementBitmap.get()
@@ -286,8 +307,15 @@ proc handleAcknowledgement(
 
 proc handleRefill(self: MixTransport, frame: MixTransportFrame) {.gcsafe, raises: [].} =
   let session = self.sessions.get(frame.sessionId).valueOr:
+    debug "Dropping Refill frame for unknown session", sessionId = frame.sessionId
     return
-  if session.role != SessionRole.Recipient or session.state != SessionState.Established:
+  if session.role != SessionRole.Recipient:
+    debug "Dropping Refill frame for session with unexpected role",
+      sessionId = frame.sessionId, sessionRole = session.role
+    return
+  if session.state != SessionState.Established:
+    debug "Dropping Refill frame because session is not established",
+      sessionId = frame.sessionId, sessionState = session.state
     return
 
   let refillRequestId = frame.refillRequestId.get()
@@ -375,8 +403,15 @@ proc handleOpenStream(
     self: MixTransport, frame: MixTransportFrame
 ): Future[void] {.async: (raises: [CancelledError]).} =
   let session = self.sessions.get(frame.sessionId).valueOr:
+    debug "Dropping OpenStream frame for unknown session", sessionId = frame.sessionId
     return
-  if session.role != SessionRole.Recipient or session.state != SessionState.Established:
+  if session.role != SessionRole.Recipient:
+    debug "Dropping OpenStream frame for session with unexpected role",
+      sessionId = frame.sessionId, sessionRole = session.role
+    return
+  if session.state != SessionState.Established:
+    debug "Dropping OpenStream frame because session is not established",
+      sessionId = frame.sessionId, sessionState = session.state
     return
 
   var decodedGroups = newSeqOfCap[seq[SURB]](frame.surbGroups.len)
