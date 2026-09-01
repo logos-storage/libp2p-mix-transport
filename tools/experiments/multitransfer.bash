@@ -19,6 +19,8 @@ N_CONCURRENT=${3:-5}
 N_BYTES=${4:-1048576}
 # Use mix?
 USE_MIX=${5:-true}
+# What delay strategy?
+MIX_STRATEGY=${6:-default}
 
 echoerr "Running multitransfer experiment with:"
 echoerr "  Nodes: ${N_NODES}"
@@ -26,13 +28,14 @@ echoerr "  Transfers: ${N_TRANSFERS}"
 echoerr "  Concurrent: ${N_CONCURRENT}"
 echoerr "  File size: ${N_BYTES}"
 echoerr "  Use mix: ${USE_MIX}"
+echoerr "  Mix delay strategy: ${MIX_STRATEGY}"
 
 _running=()
 _remaining="${N_TRANSFERS}"
 
 tr_destroy
 tr_init
-tr_start_network "${N_NODES}"
+tr_start_network "${N_NODES}" "--mix-config=${MIX_STRATEGY}"
 
 poll_transfers() {
   echoerr "Running transfer PIDs: ${_running[*]}"

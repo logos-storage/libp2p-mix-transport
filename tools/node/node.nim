@@ -24,6 +24,10 @@ const ChunkSize = 1024 * 1024 * 1024
 type
   MixPool* = seq[MixPubInfo]
 
+  MixConfigPresets* = enum
+    Default = "default",
+    Exponential = "exponential",
+
   Node* = ref object
     info*: MixNodeInfo
     switch*: Switch
@@ -254,17 +258,28 @@ proc createMixNodeInfo(info: PeerInfo, listenAddress: MultiAddress): MixNodeInfo
 proc init*(
     T: type Node,
     mixPool: MixPool,
+    mixConfig: MixConfigPresets,
     listenIp: string,
     listenPort: uint,
     maxConnections: int,
 ): Result[Node, string] =
   let listenAddress = ?MultiAddress.init(fmt"/ip4/{listenIp}/tcp/{listenPort}")
-
   let
     rng = newRng()
+    delayStrategy = case mixConfig
+      of MixConfigPresets.Exponential:
+        info "Mix will use exponential delays"
+        ExponentialDelayStrategy.new(rng = rng)
+      of MixConfigPresets.Default:
+        info "Mix will use uniform small delays (default)"
+        NoSamplingDelayStrategy.new(rng = rng)
     switch = createSwitch(listenAddress, rng, maxConnections)
     mixNodeInfo = createMixNodeInfo(switch.peerInfo, listenAddress)
-    mixProto = MixProtocol.new(mixNodeInfo, switch)
+    mixProto = MixProtocol.new(
+      mixNodeInfo,
+      switch,
+      delayStrategy = Opt.some(delayStrategy),
+    )
     transferProto = newTransferProtocol()
 
   mixProto.nodePool.add(mixPool)
@@ -285,7 +300,7 @@ proc start*(
     await self.switch.start()
     await self.mixProto.start()
   except CatchableError as e:
-    error "Error starting node", msg = e.msg
+    error "error starting node", msg = e.msg
     return err(e.msg)
   ?await self.mixTransport.start()
   self.running = true

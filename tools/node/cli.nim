@@ -67,6 +67,11 @@ proc printUsage() =
   echoerr "  -a, --api-port <port> API port (default: 8080)"
   echoerr "  -l, --listen-port <port> Listen port (default: 0)"
   echoerr "  -i  --listen-ip <ipv4> Listen IP (default: 127.0.0.1)"
+  echoerr "  -x, --mix-config <preset> Mix config preset (default: default)"
+  echoerr "                            Presets: default, exponential"
+  echoerr "  -e, --log-level <level> Log level (default: info)"
+  echoerr "                          Levels: trace, debug, info, warn, error"
+  echoerr "  -m, --max-connections <n> Maximum connections (default: 50)"
 
 proc main() =
   var
@@ -74,6 +79,7 @@ proc main() =
     listenPort: uint = DefaultListenPort
     listenIp: string = DefaultListenIp
     maxConnections: int = DefaultMaxConnections
+    mixConfig: MixConfigPresets = MixConfigPresets.Default
     positionalArgs: seq[string]
 
   var optparser = initOptParser(quoteShellCommand(commandLineParams()))
@@ -96,6 +102,13 @@ proc main() =
         maxConnections = val.parseInt()
       of "log-level", "e":
         updateLogLevel(val)
+      of "mix-config", "x":
+        try:
+          mixConfig = parseEnum[MixConfigPresets](val)
+        except CatchableError:
+          echoerr("Invalid mix config preset: " & val)
+          printUsage()
+          quit(1)
       else:
         echoerr("Unknown option: " & key)
         printUsage()
@@ -105,7 +118,8 @@ proc main() =
 
   let
     mixNodes = collectMixConfigs(positionalArgs)
-    node = Node.init(mixNodes, listenIp, listenPort, maxConnections).valueOr:
+    node = Node.init(mixNodes,
+      mixConfig, listenIp, listenPort, maxConnections).valueOr:
       error "Failed to initialize node", msg = error
       quit(1)
     server = newServer(node, listenIp, apiPort).valueOr:
