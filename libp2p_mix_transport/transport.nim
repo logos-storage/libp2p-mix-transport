@@ -105,7 +105,7 @@ proc handleReplyFrame(
 
 method sendWithSurbGroup(
     self: MixTransport, surbs: sink seq[SURB], payload: sink seq[byte]
-): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
+): Future[Result[void, string]] {.async: (raises: [CancelledError]), base.} =
   var sent = false
   for surb in surbs.mitems:
     # Each SURB is consumed once, but every redundant packet needs the same
