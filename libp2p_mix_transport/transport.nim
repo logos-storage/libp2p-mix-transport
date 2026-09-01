@@ -349,23 +349,27 @@ proc handleConnect(
 
   let session = self.sessions.addRecipientSession(frame.sessionId).valueOr:
     return
+  var keepSession = false
+  defer:
+    if not keepSession:
+      discard self.sessions.remove(frame.sessionId)
+
   session.addReceivedSurbGroups(decodedGroups).isOkOr:
-    discard self.sessions.remove(frame.sessionId)
     return
 
   var replyGroup = session.takeReceivedSurbGroup().valueOr:
-    discard self.sessions.remove(frame.sessionId)
     return
   let acknowledgement = MixTransportFrame(
     version: MixTransportVersion, sessionId: frame.sessionId, kind: FrameKind.ConnectAck
   ).encode().valueOr:
-    discard self.sessions.remove(frame.sessionId)
     return
 
-  (await self.sendWithSurbGroup(replyGroup, acknowledgement)).isOkOr:
-    discard self.sessions.remove(frame.sessionId)
-    return
+  # ConnectAck allows the initiator to send session traffic immediately. Make
+  # the recipient ready before the first redundant ACK copy can arrive.
   session.establish()
+  (await self.sendWithSurbGroup(replyGroup, acknowledgement)).isOkOr:
+    return
+  keepSession = true
 
 proc handleOpenStream(
     self: MixTransport, frame: MixTransportFrame
@@ -417,16 +421,19 @@ proc handleOpenStream(
   defer:
     if not keepStream:
       discard session.removeStream(stream.streamId)
+      await noCancel stream.close()
 
+  # StreamAck allows the initiator to send Data immediately. Install the
+  # bounded receive path before the first redundant ACK copy can arrive.
+  self.configureStream(session, stream)
+  stream.establish()
   if not await self.sendStreamResponse(session, stream.streamId, FrameKind.StreamAck):
     return
 
-  self.configureStream(session, stream)
-  stream.establish()
-  discard await self.requestRefill(session)
   keepStream = true
   keepReservation = true
   self.handlerTasks.trackFut(runProtocolHandler(session, stream, protocol))
+  discard await self.requestRefill(session)
 
 proc handleDelivery(
     self: MixTransport, delivery: MixDelivery
