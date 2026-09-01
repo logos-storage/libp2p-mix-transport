@@ -4,7 +4,7 @@
 
 import std/[importutils, unittest]
 
-import chronos, results, tables
+import chronicles, chronos, results, tables
 import stew/byteutils
 import
   libp2p/[
@@ -22,6 +22,8 @@ import libp2p_mix/delay_strategy
 
 import libp2p_mix_transport
 import libp2p_mix_transport/transport {.all.}
+
+import ./logging
 
 privateAccess(MixProtocol)
 privateAccess(MixTransport)
@@ -107,23 +109,59 @@ type RoundTripOutcome = object
   receivedRequest: seq[byte]
   receivedResponse: seq[byte]
 
-proc establishSessionAndStream(): Future[RoundTripOutcome] {.
-    async: (raises: [CancelledError, LPError])
-.} =
+type DelayedAckMixTransport = ref object of MixTransport
+  interAckDelay: Duration
+
+method sendWithSurbGroup(
+    self: DelayedAckMixTransport, surbs: sink seq[SURB], payload: sink seq[byte]
+): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
+  let
+    frame = MixTransportFrame.decode(payload).get()
+    isAck = frame.kind == FrameKind.ConnectAck or frame.kind == FrameKind.StreamAck
+
+  var sent = false
+  for surb in surbs.mitems:
+    # Each SURB is consumed once, but every redundant packet needs the same
+    # payload. Passing payload without move lets Nim copy it for each send.
+    if (await self.mix.sendWithSurb(move(surb), payload)).isOk:
+      sent = true
+
+    if isAck:
+      info "delaying next ack send",
+        duration = $self.interAckDelay, frameKind = frame.kind
+      await sleepAsync(self.interAckDelay)
+
+  if not sent:
+    return err("could not send through any SURB in the reply group")
+  ok()
+
+proc establishSessionAndStream(
+    interAckDelay: Opt[Duration] = Opt.none(Duration)
+): Future[RoundTripOutcome] {.async: (raises: [CancelledError, LPError]).} =
   let
     nodes = createMixNodes(5)
     initiatorMix = nodes[0]
     recipientMix = nodes[^1]
-    initiator = newMixTransport(
+    initiator = MixTransport.newMixTransport(
       initiatorMix,
       connectTimeout = TestOperationTimeout,
       streamOpenTimeout = TestOperationTimeout,
     )
-    recipient = newMixTransport(
-      recipientMix,
-      connectTimeout = TestOperationTimeout,
-      streamOpenTimeout = TestOperationTimeout,
-    )
+    recipient =
+      if interAckDelay.isSome:
+        var transport = DelayedAckMixTransport.newMixTransport(
+          recipientMix,
+          connectTimeout = TestOperationTimeout,
+          streamOpenTimeout = TestOperationTimeout,
+        )
+        transport.interAckDelay = interAckDelay.get()
+        transport
+      else:
+        MixTransport.newMixTransport(
+          recipientMix,
+          connectTimeout = TestOperationTimeout,
+          streamOpenTimeout = TestOperationTimeout,
+        )
 
   # StreamAck confirms that the recipient has a mounted handler for the
   # requested application codec. The handler remains active until transport
@@ -186,16 +224,21 @@ proc establishSessionAndStream(): Future[RoundTripOutcome] {.
   let initiatorStream = (await initiator.dial(destination, TestCodec)).expect(
     "could not establish MixTransport stream"
   )
+
   let recipientSession = recipient.sessions.get(session.sessionId).expect(
       "recipient did not retain the established session"
     )
   let recipientStream = recipientSession.getStream(initiatorStream.streamId).expect(
       "recipient did not retain the inbound stream"
     )
+
+  # When we're delaying ACKs, we want the initiator to start sending data
+  # as quickly as possible, or this will cover up the state transition bugs
+  # we're trying to test for.
   let invocationFuture = protocolInvocations.get()
-  if not await invocationFuture.withTimeout(TestOperationTimeout):
-    raise newException(LPError, "recipient protocol handler was not invoked")
-  let invocation = await invocationFuture
+  if interAckDelay.isNone:
+    if not await invocationFuture.withTimeout(TestOperationTimeout):
+      raise newException(LPError, "recipient protocol handler was not invoked")
 
   # Application bytes use the ordinary libp2p Connection interface. The
   # transport divides the write into Data frames, restores stream order at the
@@ -230,6 +273,9 @@ proc establishSessionAndStream(): Future[RoundTripOutcome] {.
       raise newException(LPError, "redundant reply did not reach the initiator")
     replyDispositions.add(await observed)
 
+  # These futures must've been completed
+  let invocation = await invocationFuture
+
   RoundTripOutcome(
     destination: destination,
     session: session,
@@ -249,6 +295,9 @@ proc establishSessionAndStream(): Future[RoundTripOutcome] {.
   )
 
 suite "MixTransport session and stream handshakes":
+  setup:
+    updateLogLevel("INFO;trace:mix_transport")
+
   test "StreamAck establishes a stream and StreamReject rejects an unsupported codec":
     let outcome = waitFor establishSessionAndStream()
 
@@ -282,6 +331,12 @@ suite "MixTransport session and stream handshakes":
           RawSurbReplyDisposition.Handled, RawSurbReplyDisposition.Handled,
           RawSurbReplyDisposition.Handled, RawSurbReplyDisposition.Handled,
         ]
+
+  test "data packets are not rejected if ACK arrives too fast":
+    try:
+      discard waitFor establishSessionAndStream(Opt.some(2.seconds))
+    except LPError as err:
+      raiseAssert "Unexpected error: " & err.msg
 
 type
   Synchronizer = ref object

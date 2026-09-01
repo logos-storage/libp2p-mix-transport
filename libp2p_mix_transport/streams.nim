@@ -4,12 +4,15 @@
 
 import std/tables
 
-import chronos, results
+import chronicles, chronos, results
 import libp2p/peerid
 import libp2p/stream/bufferstream
 import libp2p/utils/opt
 
 from ./wire import AckBitmapBytes, MaxInflightChunks, ReceiveWindowChunks
+
+logScope:
+  scope = "mix_transport streams"
 
 type
   StreamWriteHandler* = proc(data: sink seq[byte]): Future[void] {.
@@ -186,8 +189,10 @@ proc waitForOutboundCapacity*(
     if stream.closed:
       raise newLPStreamClosedError()
     stream.sendStateChanged.clear()
-    if not stream.canReserveOutbound:
-      await stream.sendStateChanged.wait()
+    trace "awaiting for outbound capacity", sessionId = stream.sessionId
+    await stream.sendStateChanged.wait()
+
+  trace "stream has outbound capacity", sessionId = stream.sessionId
 
 proc reserveOutbound*(
     stream: TransportStream, payload: seq[byte]
