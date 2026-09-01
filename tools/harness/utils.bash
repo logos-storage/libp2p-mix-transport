@@ -27,7 +27,7 @@ await() {
     if ((SECONDS - start >= timeout)); then
       return 1
     fi
-    sleep 0.5
+    sleep 0.1
   done
 }
 

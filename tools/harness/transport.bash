@@ -28,13 +28,13 @@ _tr_urls() {
 
 _node_ready() {
   local node_index=$1
-  tr_status "$node_index" | jq -e '.running == true' >/dev/null
+  tr_status "$node_index" | jq -e '.running == true' > /dev/null
 }
 
 tr_status() {
   local node_index=$1
   local api_port=$((_base_api_port + node_index))
-  curl -fsS "http://127.0.0.1:$api_port/status" 2>/dev/null | jq .
+  curl -fsS "http://127.0.0.1:$api_port/status" 2> /dev/null | jq .
 }
 
 tr_start_node() {
@@ -67,10 +67,12 @@ tr_start_node() {
 tr_start_network() {
   local node_count=$1
   local max_connections=$((node_count * 2))
+  shift
+
   echoerr "Starting network with $node_count nodes"
   for ((i = 0; i < node_count; i++)); do
     echoerr "Starting node $i"
-    tr_start_node "$i" "--max-connections=${max_connections}"
+    tr_start_node "$i" "--max-connections=${max_connections}" "$@"
     await 10 _node_ready "$i"
     echoerr "Node $i is ready"
   done
@@ -86,8 +88,8 @@ tr_transfer_regular() {
   echo_log "Starting transfer." "$label" "$logfile"
   with_log "$label" "$logfile" \
     curl -fsS -X POST "http://127.0.0.1:$source_api_port/request" \
-    -H "Content-Type: application/json" \
-    -d '{"address": "/ip4/127.0.0.1/tcp/'"$dest_listen_port/"'", "size": '"$size"'}'
+      -H "Content-Type: application/json" \
+      -d '{"address": "/ip4/127.0.0.1/tcp/'"$dest_listen_port/"'", "size": '"$size"'}'
 }
 
 tr_transfer_mix() {
@@ -110,8 +112,8 @@ tr_transfer_mix() {
   echo_log "Starting mix transfer ($source_node -> $dest_node)." "$label" "$logfile"
   with_log "$label" "$logfile" \
     curl --fail-with-body --no-progress-meter -X POST "http://127.0.0.1:$source_api_port/request" \
-    -H "Content-Type: application/json" \
-    -d '{"peerId": "'"$dest_peer_id"'", "size": '"$size"'}'
+      -H "Content-Type: application/json" \
+      -d '{"peerId": "'"$dest_peer_id"'", "size": '"$size"'}'
 }
 
 tr_kill_node() {
