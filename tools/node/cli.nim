@@ -23,6 +23,7 @@ const
   DefaultListenPort = 0.uint
   DefaultListenIp = "127.0.0.1"
   DefaultLogLevel = "INFO"
+  DefaultMaxConnections = 50 # same as libp2p
 
 template echoerr(msg: string) =
   stderr.writeLine(msg)
@@ -72,6 +73,7 @@ proc main() =
     apiPort: uint = DefaultApiPort
     listenPort: uint = DefaultListenPort
     listenIp: string = DefaultListenIp
+    maxConnections: int = DefaultMaxConnections
     positionalArgs: seq[string]
 
   var optparser = initOptParser(quoteShellCommand(commandLineParams()))
@@ -90,6 +92,8 @@ proc main() =
         listenPort = val.parseUint()
       of "listen-ip", "i":
         listenIp = val
+      of "max-connections", "m":
+        maxConnections = val.parseInt()
       of "log-level", "e":
         updateLogLevel(val)
       else:
@@ -101,7 +105,7 @@ proc main() =
 
   let
     mixNodes = collectMixConfigs(positionalArgs)
-    node = Node.init(mixNodes, listenIp, listenPort).valueOr:
+    node = Node.init(mixNodes, listenIp, listenPort, maxConnections).valueOr:
       error "Failed to initialize node", msg = error
       quit(1)
     server = newServer(node, listenIp, apiPort).valueOr:
