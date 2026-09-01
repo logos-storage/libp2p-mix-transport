@@ -69,12 +69,13 @@ while [ "${_remaining}" -gt 0 ]; do
     _max_launch=$((_remaining - ${#_running[@]}))
     _to_launch=$(( _to_launch < _max_launch ? _to_launch : _max_launch ))
     if [ $_to_launch -gt 0 ]; then
+        echoerr "${#_running[@]}/${N_CONCURRENT} transfers running, starting ${_to_launch} more"
         for _ in $(seq 1 $_to_launch); do
             mapfile -t _pair < <(shuf -i "${MIX_PATH_LENGTH}"-$((N_NODES - 1)) -n 2 | sort -nr)
-            echoerr "Transfer ${_pair[0]} -> ${_pair[1]} (${N_BYTES} bytes)"
-            $_tr_transfer "${_pair[0]}" "${_pair[1]}" "${N_BYTES}" &
+            _src=${_pair[0]}
+            _dst=${_pair[1]}
+            $_tr_transfer "${_src}" "${_dst}" "${N_BYTES}" &
             _running+=($!)
-            echo "LAUNCHED ${_pair[0]} -> ${_pair[1]}"
         done
     fi
     poll_transfers

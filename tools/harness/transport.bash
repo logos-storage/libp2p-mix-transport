@@ -16,6 +16,8 @@ MIX_PATH_LENGTH=3
 _base_api_port=8000
 _base_listen_port=9000
 
+TR_TRANSFER_LOGS="${TR_LOGS_FOLDER}/transfers"
+
 _tr_urls() {
   local -n urls_ref=$1
   local idx
@@ -26,23 +28,25 @@ _tr_urls() {
 
 _node_ready() {
   local node_index=$1
-  tr_status "$node_index" | jq -e '.running == true' > /dev/null
+  tr_status "$node_index" | jq -e '.running == true' >/dev/null
 }
 
 tr_status() {
   local node_index=$1
   local api_port=$((_base_api_port + node_index))
-  curl -fsS "http://127.0.0.1:$api_port/status" 2> /dev/null | jq .
+  curl -fsS "http://127.0.0.1:$api_port/status" 2>/dev/null | jq .
 }
 
 tr_start_node() {
   local node_index=$1
   local api_port=$((_base_api_port + node_index))
   local listen_port=$((_base_listen_port + node_index))
-  local args=(
+  shift
+  local args=("$@")
+  args+=(
     "--api-port=$api_port"
     "--listen-port=$listen_port"
-    --log-level="$TR_LOG_LEVEL"
+    "--log-level=$TR_LOG_LEVEL"
   )
 
   local tr_cmd=(
@@ -62,10 +66,11 @@ tr_start_node() {
 
 tr_start_network() {
   local node_count=$1
+  local max_connections=$((node_count * 2))
   echoerr "Starting network with $node_count nodes"
   for ((i = 0; i < node_count; i++)); do
     echoerr "Starting node $i"
-    tr_start_node "$i"
+    tr_start_node "$i" "--max-connections=${max_connections}"
     await 10 _node_ready "$i"
     echoerr "Node $i is ready"
   done
@@ -75,9 +80,12 @@ tr_transfer_regular() {
   local source_node=$1 dest_node=$2 size=$3
   local source_api_port=$((_base_api_port + source_node))
   local dest_listen_port=$((_base_listen_port + dest_node))
+  local label="${source_node} -> ${dest_node}"
+  local logfile="${TR_TRANSFER_LOGS}/regular-${source_node}-${dest_node}-${RANDOM}.log"
 
-  echoerr "Starting transfer."
-  curl -fsS -X POST "http://127.0.0.1:$source_api_port/request" \
+  echo_log "Starting transfer." "$label" "$logfile"
+  with_log "$label" "$logfile" \
+    curl -fsS -X POST "http://127.0.0.1:$source_api_port/request" \
     -H "Content-Type: application/json" \
     -d '{"address": "/ip4/127.0.0.1/tcp/'"$dest_listen_port/"'", "size": '"$size"'}'
 }
@@ -87,6 +95,8 @@ tr_transfer_mix() {
   local source_api_port=$((_base_api_port + source_node))
   local dest_peer_id
   dest_peer_id=$(tr_peer_id "$dest_node")
+  local label="${source_node} -> ${dest_node}"
+  local logfile="${TR_TRANSFER_LOGS}/mix-${source_node}-${dest_node}-${RANDOM}.log"
 
   # This ensures that the node knows enough mix nodes to build a path, assuming that
   # they're not launching non-contiguous node IDs. To get a more accurate predicate
@@ -97,8 +107,9 @@ tr_transfer_mix() {
     return 1
   fi
 
-  echoerr "Starting mix transfer."
-  curl -fsS -X POST "http://127.0.0.1:$source_api_port/request" \
+  echo_log "Starting mix transfer ($source_node -> $dest_node)." "$label" "$logfile"
+  with_log "$label" "$logfile" \
+    curl --fail-with-body --no-progress-meter -X POST "http://127.0.0.1:$source_api_port/request" \
     -H "Content-Type: application/json" \
     -d '{"peerId": "'"$dest_peer_id"'", "size": '"$size"'}'
 }
@@ -134,6 +145,7 @@ tr_list_nodes() {
 
 tr_init() {
   init_folders || true
+  mkdir -p "${TR_TRANSFER_LOGS}"
   unset _node_pids
   declare -gA _node_pids
 }

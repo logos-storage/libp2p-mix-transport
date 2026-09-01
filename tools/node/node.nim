@@ -94,7 +94,7 @@ proc handleTransferRequest(
     remaining = request.size.int
     rand = initRand(request.seed)
 
-  info "sending random stream", remaining = remaining
+  info "sending random stream", remaining = remaining, sessionId = stream.peerId
   while remaining > 0:
     # write eats our buffer with sink, so we might as well
     # just allocate a new one on every pass (hoping the compiler
@@ -105,13 +105,16 @@ proc handleTransferRequest(
     await stream.write(batch)
     remaining -= batch.len
 
-  info "Bytes sent", size = request.size, seed = request.seed
+  info "Bytes sent", size = request.size, sessionId = stream.peerId, seed = request.seed
 
 proc handleTransferResponse(
     stream: Stream, response: TransferResponse
 ) {.async: (raises: [CancelledError, LPError]).} =
   info "receiving libp2p transfer response",
-    status = response.status, size = response.request.size, seed = response.request.seed
+    status = response.status,
+    size = response.request.size,
+    sessionId = stream.peerId,
+    seed = response.request.seed
   if response.status != ResponseStatus.Accepted:
     raise newException(LPError, "Transfer rejected")
 
@@ -132,7 +135,7 @@ proc handleTransferResponse(
     size = response.request.size, seed = response.request.seed
 
 proc request(
-    stream: Stream, size: int32, seed: Option[int64] = int64.none
+    stream: Stream, size: int32, seed: Option[int64] = int64.none, peerId: PeerId
 ): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
   defer:
     await stream.close()
@@ -144,13 +147,15 @@ proc request(
     else:
       seed.get()
 
-  info "Sending libp2p transfer request", size = size, seed = seedValue
+  info "Sending libp2p transfer request", size = size, peerId = peerId, seed = seedValue
 
   try:
     await stream.send(
       TransferRequest(size: size, seed: seedValue), MsgType.transferRequest
     )
-    await handleTransferResponse(stream, await receive[TransferResponse](stream, MsgType.transferResponse))
+    await handleTransferResponse(
+      stream, await receive[TransferResponse](stream, MsgType.transferResponse)
+    )
   except CancelledError as e:
     raise e
   except CatchableError as e:
@@ -167,7 +172,7 @@ proc request*(
   let stream = (await self.mixTransport.dial(target, TransferCodec)).valueOr:
     return err(error)
 
-  await request(stream, size, seed)
+  await request(stream, size, seed, stream.sessionId)
 
 ## Asks the remote peer for a random byte stream of size `size` using
 ## an optionally provided seed, and then waits for the result and
@@ -184,7 +189,7 @@ proc request*(
     except CatchableError as e:
       return err(e.msg)
 
-  ? await request(stream, size, seed)
+  ?await request(stream, size, seed, stream.peerId)
 
   # Because we're calling `connect` without a peer id, the ConnManager will internally
   # open a connection per dial. If we don't drop the peer, we'll exhaust the maximum
@@ -203,7 +208,9 @@ proc newTransferProtocol*(): LPProtocol =
     try:
       debug "entering read loop", peer = stream.peerId
       while not stream.atEof:
-        await handleTransferRequest(stream, await receive[TransferRequest](stream, MsgType.transferRequest))
+        await handleTransferRequest(
+          stream, await receive[TransferRequest](stream, MsgType.transferRequest)
+        )
     except CancelledError as e:
       raise e
     except LPStreamEOFError:
@@ -216,6 +223,7 @@ proc newTransferProtocol*(): LPProtocol =
 proc createSwitch(
     multiAddr: MultiAddress,
     rng: Rng,
+    maxConnections: int,
     libp2pPrivKey: Opt[SkPrivateKey] = Opt.none(SkPrivateKey),
 ): Switch =
   let
@@ -226,6 +234,7 @@ proc createSwitch(
     .withRng(rng)
     .withPrivateKey(privKey)
     .withAddress(multiAddr)
+    .withMaxConnections(maxConnections)
     .withTcpTransport()
     .withMplex()
     .withNoise()
@@ -243,13 +252,17 @@ proc createMixNodeInfo(info: PeerInfo, listenAddress: MultiAddress): MixNodeInfo
   )
 
 proc init*(
-    T: type Node, mixPool: MixPool, listenIp: string, listenPort: uint
+    T: type Node,
+    mixPool: MixPool,
+    listenIp: string,
+    listenPort: uint,
+    maxConnections: int,
 ): Result[Node, string] =
   let listenAddress = ?MultiAddress.init(fmt"/ip4/{listenIp}/tcp/{listenPort}")
 
   let
     rng = newRng()
-    switch = createSwitch(listenAddress, rng)
+    switch = createSwitch(listenAddress, rng, maxConnections)
     mixNodeInfo = createMixNodeInfo(switch.peerInfo, listenAddress)
     mixProto = MixProtocol.new(mixNodeInfo, switch)
     transferProto = newTransferProtocol()
@@ -262,16 +275,18 @@ proc init*(
     info: mixNodeInfo,
     switch: switch,
     mixProto: mixProto,
-    mixTransport: newMixTransport(mixProto),
+    mixTransport: MixTransport.newMixTransport(mixProto),
   ).ok
 
-proc start*(self: Node): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
+proc start*(
+    self: Node
+): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
   try:
     await self.switch.start()
     await self.mixProto.start()
   except CatchableError as e:
     error "Error starting node", msg = e.msg
     return err(e.msg)
-  ? await self.mixTransport.start()
+  ?await self.mixTransport.start()
   self.running = true
   ok()

@@ -9,7 +9,10 @@ source "$LIB_SRC/utils.bash"
 TR_RUNTIME_FOLDER=$(realpath "${LIB_SRC}/../runtime")
 TR_NODE_BINARY="$(realpath "${LIB_SRC}/../node/node")"
 TR_LOGS_FOLDER="${TR_RUNTIME_FOLDER}/logs"
-TR_LOG_LEVEL="INFO;trace:mix_transport"
+TR_LOG_LEVEL="INFO"
+
+# Use for debugging:
+# TR_LOG_LEVEL="INFO;trace:mix_transport,transport"
 
 export TR_RUNTIME_FOLDER
 export TR_NODE_BINARY
