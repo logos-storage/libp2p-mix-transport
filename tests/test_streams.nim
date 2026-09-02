@@ -226,6 +226,66 @@ suite "MixTransport streams":
     expect LPStreamError:
       waitFor stream.waitForOutboundCapacity()
 
+  test "outbound retransmission deadlines select the earliest due chunk":
+    let
+      rng = newRng()
+      store = newSessionStore()
+      session = store.addRecipientSession(randomPeerId(rng)).expect(
+          "could not add recipient session"
+        )
+    session.establish()
+    let stream =
+      session.addInboundStream(1, "/test/1").expect("could not add inbound stream")
+    let
+      now = Moment.now()
+      firstSequence =
+        stream.reserveOutbound(@[1'u8]).expect("could not reserve first outbound chunk")
+      secondSequence = stream.reserveOutbound(@[2'u8]).expect(
+          "could not reserve second outbound chunk"
+        )
+
+    stream.scheduleOutboundRetransmission(firstSequence, 2.seconds, now)
+    stream.scheduleOutboundRetransmission(secondSequence, 1.seconds, now)
+
+    check:
+      stream.earliestRetransmissionDeadline().get() == now + 1.seconds
+      stream.takeDueOutboundRetransmission(now).isNone
+
+    let retransmission = stream.takeDueOutboundRetransmission(now + 1.seconds).expect(
+        "second chunk was not ready for retransmission"
+      )
+    check:
+      retransmission.sequence == secondSequence
+      retransmission.payload == @[2'u8]
+      stream.earliestRetransmissionDeadline().get() == now + 2.seconds
+      stream.takeDueOutboundRetransmission(now + 1.seconds).isNone
+
+  test "finishing an overlapping retransmission does not restore an acknowledged chunk":
+    let
+      rng = newRng()
+      store = newSessionStore()
+      session = store.addRecipientSession(randomPeerId(rng)).expect(
+          "could not add recipient session"
+        )
+    session.establish()
+    let stream =
+      session.addInboundStream(1, "/test/1").expect("could not add inbound stream")
+    let
+      now = Moment.now()
+      sequence =
+        stream.reserveOutbound(@[1'u8]).expect("could not reserve outbound chunk")
+    stream.scheduleOutboundRetransmission(sequence, 1.seconds, now)
+    discard stream.takeDueOutboundRetransmission(now + 1.seconds).expect(
+        "chunk was not ready for retransmission"
+      )
+
+    check stream.applyAcknowledgement(2, newSeq[byte](AckBitmapBytes))
+    stream.scheduleOutboundRetransmission(sequence, 1.seconds, now + 1.seconds)
+
+    check:
+      stream.pendingOutboundCount == 0
+      stream.earliestRetransmissionDeadline().isNone
+
   test "stream shutdown cancels and waits for its owned tasks":
     let
       rng = newRng()

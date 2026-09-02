@@ -28,6 +28,10 @@ type
     receiveBase*: SequenceNumber
     acknowledgementBitmap*: seq[byte]
 
+  OutboundChunk = object
+    payload: seq[byte]
+    nextRetransmissionAt: Opt[Moment]
+
   StreamDirection* {.pure.} = enum
     Outbound
     Inbound
@@ -51,8 +55,9 @@ type
     writeLock: AsyncLock
     nextOutboundSequence: SequenceNumber
     remoteReceiveBase: SequenceNumber
-    pendingOutbound: Table[SequenceNumber, seq[byte]]
+    pendingOutbound: Table[SequenceNumber, OutboundChunk]
     sendStateChanged: AsyncEvent
+    retransmissionStateChanged: AsyncEvent
     receiveBase: SequenceNumber
     acknowledgementBitmap: seq[byte]
     pendingInbound: Table[SequenceNumber, seq[byte]]
@@ -210,13 +215,69 @@ proc reserveOutbound*(
     return err("stream has no outbound capacity")
   let sequence = stream.nextOutboundSequence
   inc stream.nextOutboundSequence
-  stream.pendingOutbound[sequence] = payload
+  stream.pendingOutbound[sequence] =
+    OutboundChunk(payload: payload, nextRetransmissionAt: Opt.none(Moment))
   ok(sequence)
+
+proc scheduleOutboundRetransmission*(
+    stream: TransportStream,
+    sequence: SequenceNumber,
+    delay: Duration,
+    now: Moment = Moment.now(),
+) =
+  doAssert delay > ZeroDuration, "retransmission delay must be positive"
+  stream.pendingOutbound.withValue(sequence, chunk):
+    chunk.nextRetransmissionAt = Opt.some(now + delay)
+    stream.retransmissionStateChanged.fire()
+
+proc takeDueOutboundRetransmission*(
+    stream: TransportStream, now: Moment = Moment.now()
+): Opt[tuple[sequence: SequenceNumber, payload: seq[byte]]] =
+  var
+    selectedSequence = Opt.none(SequenceNumber)
+    selectedDeadline = Opt.none(Moment)
+
+  for sequence, chunk in stream.pendingOutbound:
+    chunk.nextRetransmissionAt.withValue(deadline):
+      if deadline > now:
+        continue
+      if selectedDeadline.isNone:
+        selectedSequence = Opt.some(sequence)
+        selectedDeadline = Opt.some(deadline)
+        continue
+      if deadline < selectedDeadline.get() or
+          (deadline == selectedDeadline.get() and sequence < selectedSequence.get()):
+        selectedSequence = Opt.some(sequence)
+        selectedDeadline = Opt.some(deadline)
+
+  let sequence = selectedSequence.valueOr:
+    return Opt.none(tuple[sequence: SequenceNumber, payload: seq[byte]])
+  stream.pendingOutbound.withValue(sequence, chunk):
+    chunk.nextRetransmissionAt = Opt.none(Moment)
+    return Opt.some((sequence: sequence, payload: chunk.payload))
+  Opt.none(tuple[sequence: SequenceNumber, payload: seq[byte]])
+
+func earliestRetransmissionDeadline*(stream: TransportStream): Opt[Moment] =
+  var earliest = Opt.none(Moment)
+  for chunk in stream.pendingOutbound.values:
+    chunk.nextRetransmissionAt.withValue(deadline):
+      if earliest.isNone or deadline < earliest.get():
+        earliest = Opt.some(deadline)
+  earliest
+
+proc clearRetransmissionStateChanged*(stream: TransportStream) =
+  stream.retransmissionStateChanged.clear()
+
+proc waitForRetransmissionStateChange*(
+    stream: TransportStream
+): Future[void] {.async: (raw: true, raises: [CancelledError]).} =
+  stream.retransmissionStateChanged.wait()
 
 proc cancelOutbound*(stream: TransportStream, sequence: SequenceNumber) =
   if stream.pendingOutbound.hasKey(sequence):
     stream.pendingOutbound.del(sequence)
     stream.sendStateChanged.fire()
+    stream.retransmissionStateChanged.fire()
 
 proc applyAcknowledgement*(
     stream: TransportStream, receiveBase: SequenceNumber, bitmap: openArray[byte]
@@ -241,6 +302,7 @@ proc applyAcknowledgement*(
   stream.remoteReceiveBase = receiveBase
   if changed:
     stream.sendStateChanged.fire()
+    stream.retransmissionStateChanged.fire()
   changed
 
 proc setWriteHandler*(stream: TransportStream, handler: StreamWriteHandler) =
@@ -315,6 +377,7 @@ method closeImpl*(
   stream.dataAvailable.fire()
   stream.shouldSendAck.fire()
   stream.sendStateChanged.fire()
+  stream.retransmissionStateChanged.fire()
   stream.resolved.fire()
   stream.streamTasks.cancelSoon()
   if not stream.handlerTask.isNil:
@@ -345,8 +408,9 @@ proc newTransportStream*(
     writeLock: newAsyncLock(),
     nextOutboundSequence: 1,
     remoteReceiveBase: 1,
-    pendingOutbound: initTable[SequenceNumber, seq[byte]](),
+    pendingOutbound: initTable[SequenceNumber, OutboundChunk](),
     sendStateChanged: newAsyncEvent(),
+    retransmissionStateChanged: newAsyncEvent(),
     receiveBase: 1,
     acknowledgementBitmap: newSeq[byte](AckBitmapBytes),
     pendingInbound: initTable[SequenceNumber, seq[byte]](),
