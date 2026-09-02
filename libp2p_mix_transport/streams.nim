@@ -7,6 +7,7 @@ import std/tables
 import chronos, results
 import libp2p/peerid
 import libp2p/stream/bufferstream
+import libp2p/utils/future
 import libp2p/utils/opt
 
 from ./wire import
@@ -44,6 +45,8 @@ type
     state: StreamState
     rejectionReason: string
     resolved: AsyncEvent
+    handlerTask: Future[void].Raising([CancelledError])
+    streamTasks: seq[Future[void].Raising([CancelledError])]
     writeHandler: StreamWriteHandler
     writeLock: AsyncLock
     nextOutboundSequence: SequenceNumber
@@ -259,6 +262,36 @@ proc waitUntilResolved*(
 ): Future[void] {.async: (raw: true, raises: [CancelledError]).} =
   stream.resolved.wait()
 
+proc trackStreamTask*(
+    stream: TransportStream, task: Future[void].Raising([CancelledError])
+) =
+  stream.streamTasks.trackFut(task)
+
+proc setHandlerTask*(
+    stream: TransportStream, task: Future[void].Raising([CancelledError])
+) =
+  doAssert stream.handlerTask.isNil, "stream protocol handler task is already set"
+  stream.handlerTask = task
+
+proc clearHandlerTask*(stream: TransportStream) =
+  stream.handlerTask = nil
+
+proc cancelAndWaitForStreamTasks*(
+    stream: TransportStream
+): Future[void] {.async: (raises: []).} =
+  await noCancel stream.streamTasks.cancelAndWait()
+  stream.streamTasks.setLen(0)
+
+proc shutdown*(stream: TransportStream): Future[void] {.async: (raises: []).} =
+  # Keep a local reference because a cancelled handler clears the field while
+  # completing its own cleanup.
+  let handlerTask = stream.handlerTask
+  await stream.close()
+  await stream.cancelAndWaitForStreamTasks()
+  if not handlerTask.isNil:
+    await noCancel handlerTask.cancelAndWait()
+  stream.handlerTask = nil
+
 method write*(
     stream: TransportStream, msg: sink seq[byte]
 ): Future[void] {.async: (raises: [CancelledError, LPStreamError]).} =
@@ -282,6 +315,10 @@ method closeImpl*(
   stream.dataAvailable.fire()
   stream.shouldSendAck.fire()
   stream.sendStateChanged.fire()
+  stream.resolved.fire()
+  stream.streamTasks.cancelSoon()
+  if not stream.handlerTask.isNil:
+    stream.handlerTask.cancelSoon()
   procCall BufferStream(stream).closeImpl()
 
 proc newTransportStream*(

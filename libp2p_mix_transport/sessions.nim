@@ -26,6 +26,7 @@ type
   SessionState* {.pure.} = enum
     Pending
     Established
+    Closed
 
   TransportSession* = ref object
     sessionId: PeerId
@@ -365,6 +366,21 @@ proc removeStream*(
   session.streams.del(streamId)
   Opt.some(stream)
 
+proc takeStreams*(session: TransportSession): seq[TransportStream] =
+  result = newSeqOfCap[TransportStream](session.streams.len)
+  for stream in session.streams.values:
+    result.add(stream)
+  session.streams.clear()
+
+proc shutdown*(session: TransportSession): Future[void] {.async: (raises: []).} =
+  session.state = SessionState.Closed
+  session.established.fire()
+  let streams = session.takeStreams()
+  var shutdownTasks = newSeqOfCap[Future[void].Raising([])](streams.len)
+  for stream in streams:
+    shutdownTasks.add(stream.shutdown())
+  await noCancel shutdownTasks.allFutures()
+
 proc remove*(store: SessionStore, sessionId: PeerId): Opt[TransportSession] =
   let session = store.get(sessionId).valueOr:
     return Opt.none(TransportSession)
@@ -377,6 +393,12 @@ proc remove*(store: SessionStore, sessionId: PeerId): Opt[TransportSession] =
 proc clear*(store: SessionStore) =
   store.bySessionId.clear()
   store.byDestination.clear()
+
+proc takeSessions*(store: SessionStore): seq[TransportSession] =
+  result = newSeqOfCap[TransportSession](store.bySessionId.len)
+  for session in store.bySessionId.values:
+    result.add(session)
+  store.clear()
 
 proc newSessionStore*(
     refillResponseLifetime = DefaultRefillResponseLifetime,

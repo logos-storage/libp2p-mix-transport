@@ -106,6 +106,7 @@ proc newTestProtocol(
 type RoundTripOutcome = object
   destination: PeerId
   session: TransportSession
+  establishedSessionState: SessionState
   reused: TransportSession
   initiatorStream: TransportStream
   recipientStream: TransportStream
@@ -246,6 +247,7 @@ proc establishSessionAndStream(): Future[RoundTripOutcome] {.
   RoundTripOutcome(
     destination: destination,
     session: session,
+    establishedSessionState: session.state,
     reused: reused,
     initiatorStream: initiatorStream,
     recipientStream: recipientStream,
@@ -267,7 +269,8 @@ suite "MixTransport session and stream handshakes":
 
     check:
       outcome.session.role == SessionRole.Initiator
-      outcome.session.state == SessionState.Established
+      outcome.establishedSessionState == SessionState.Established
+      outcome.session.state == SessionState.Closed
       outcome.session.peerId == outcome.destination
       outcome.reused == outcome.session
       outcome.initiatorStream.sessionId == outcome.session.sessionId

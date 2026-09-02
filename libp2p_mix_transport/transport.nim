@@ -8,7 +8,6 @@ import libp2p/peerid
 import libp2p/protocols/protocol
 import libp2p/stream/bufferstream
 import libp2p/stream/connection
-import libp2p/utils/future
 import libp2p/utils/opt
 import libp2p_mix
 import ./[reply_credentials, sessions, streams, wire]
@@ -36,8 +35,6 @@ type MixTransport* = ref object
   connectTimeout: Duration
   streamOpenTimeout: Duration
   refillRequestTimeout: Duration
-  handlerTasks: seq[Future[void].Raising([CancelledError])]
-  streamTasks: seq[Future[void].Raising([CancelledError])]
   started: bool
 
 type PreparedReplyGroups = object
@@ -57,9 +54,11 @@ proc runProtocolHandler(
     session: TransportSession, stream: TransportStream, protocol: LPProtocol
 ) {.async: (raises: [CancelledError]).} =
   defer:
+    stream.clearHandlerTask()
+    await noCancel stream.close()
+    await noCancel stream.cancelAndWaitForStreamTasks()
     protocol.releaseIncoming(stream.peerId)
     discard session.removeStream(stream.streamId)
-    await noCancel stream.close()
 
   # Binding the template accessor preserves LPProtoHandler's raises list.
   let handler: LPProtoHandler = protocol.handler
@@ -258,8 +257,8 @@ proc configureStream(
   ): Future[void] {.async: (raw: true, raises: [CancelledError, LPStreamError]).} =
     self.writeStream(session, stream, move(data))
   stream.setWriteHandler(writeHandler)
-  self.streamTasks.trackFut(runInboundDelivery(stream))
-  self.streamTasks.trackFut(runAcknowledgements(self, session, stream))
+  stream.trackStreamTask(runInboundDelivery(stream))
+  stream.trackStreamTask(runAcknowledgements(self, session, stream))
 
 proc handleData(self: MixTransport, frame: MixTransportFrame) {.gcsafe, raises: [].} =
   let session = self.sessions.get(frame.sessionId).valueOr:
@@ -456,7 +455,7 @@ proc handleOpenStream(
   defer:
     if not keepStream:
       discard session.removeStream(stream.streamId)
-      await noCancel stream.close()
+      await noCancel stream.shutdown()
 
   # StreamAck allows the initiator to send Data immediately. Install the
   # bounded receive path before the first redundant ACK copy can arrive.
@@ -467,7 +466,9 @@ proc handleOpenStream(
 
   keepStream = true
   keepReservation = true
-  self.handlerTasks.trackFut(runProtocolHandler(session, stream, protocol))
+  let handlerTask = runProtocolHandler(session, stream, protocol)
+  if not handlerTask.finished:
+    stream.setHandlerTask(handlerTask)
   discard await self.requestRefill(session)
 
 proc handleDelivery(
@@ -648,6 +649,8 @@ proc connect*(
 
   if not await session.waitUntilEstablished().withTimeout(self.connectTimeout):
     return err("MixTransport connect timed out")
+  if session.state != SessionState.Established:
+    return err("MixTransport session closed while connecting")
 
   keepSession = true
   ok(session)
@@ -670,6 +673,7 @@ proc dial*(
   defer:
     if not keepStream:
       discard session.removeStream(stream.streamId)
+      await noCancel stream.shutdown()
 
   let prepared = self.createReplyGroups(
     destination, session.sessionId, DefaultOpenStreamReplyGroups,
@@ -701,6 +705,8 @@ proc dial*(
 
   if not await stream.waitUntilResolved().withTimeout(self.streamOpenTimeout):
     return err("MixTransport stream opening timed out")
+  if stream.closed:
+    return err("MixTransport stream closed while opening")
   if stream.state == StreamState.Rejected:
     return err(stream.rejectionReason)
 
@@ -740,12 +746,12 @@ proc stop*(self: MixTransport): Future[void] {.async: (raises: [CancelledError])
 
   self.mix.unregisterRawSurbReplyHandler()
   self.mix.unregisterMixDeliveryHandler(MixTransportCodec)
-  await self.handlerTasks.cancelAndWait()
-  self.handlerTasks.setLen(0)
-  await self.streamTasks.cancelAndWait()
-  self.streamTasks.setLen(0)
+  let sessions = self.sessions.takeSessions()
+  var shutdownTasks = newSeqOfCap[Future[void].Raising([])](sessions.len)
+  for session in sessions:
+    shutdownTasks.add(session.shutdown())
+  await noCancel shutdownTasks.allFutures()
   self.replyCredentials.clear()
-  self.sessions.clear()
   self.started = false
 
 {.pop.}
