@@ -2,13 +2,16 @@
 
 {.used.}
 
-import std/unittest
+import std/[importutils, unittest]
 
 import chronos, results
 import libp2p/[crypto/crypto, peerid, stream/connection]
 import libp2p_mix
 
 import libp2p_mix_transport
+
+privateAccess(TransportSession)
+privateAccess(TransportStream)
 
 # Callers using the package facade must register streams through their session.
 static:
@@ -58,6 +61,24 @@ suite "MixTransport streams":
       firstInitiatorStream.state == StreamState.Pending
       firstInitiatorStream.sessionId == initiatorSession.sessionId
       firstInitiatorStream.codec == "/test/1"
+
+  test "the final stream identifier is allocated once before exhaustion":
+    let
+      rng = newRng()
+      store = newSessionStore()
+      session = store.addInitiatorSession(randomPeerId(rng), randomPeerId(rng)).expect(
+          "could not add initiator session"
+        )
+    session.establish()
+    session.nextOutboundStreamId = Opt.some(StreamId.high)
+
+    let finalStream = session.addOutboundStream("/test/final").expect(
+        "could not allocate final stream identifier"
+      )
+
+    check:
+      finalStream.streamId == StreamId.high
+      session.addOutboundStream("/test/exhausted").isErr
 
   test "an inbound stream keeps the identifier selected by its remote opener":
     let
@@ -151,14 +172,149 @@ suite "MixTransport streams":
     check:
       first.sequence == 1
       first.payload == @[1'u8]
-    stream.markInboundDelivered(first.sequence)
+    stream.advanceReceiveWindow(first.sequence)
 
     var second = stream.takeNextInbound().expect("sequence 2 was not ready")
     check:
       second.sequence == 2
       second.payload == @[2'u8]
-    stream.markInboundDelivered(second.sequence)
+    stream.advanceReceiveWindow(second.sequence)
 
     check:
       stream.receiveBase == 3
       stream.pendingInboundCount == 0
+
+  test "closing wakes a writer blocked by the outbound capacity limit":
+    let
+      rng = newRng()
+      store = newSessionStore()
+      session = store.addRecipientSession(randomPeerId(rng)).expect(
+          "could not add recipient session"
+        )
+    session.establish()
+    let stream =
+      session.addInboundStream(1, "/test/1").expect("could not add inbound stream")
+
+    for index in 0 ..< MaxInflightChunks:
+      discard stream.reserveOutbound(@[byte(index)]).expect(
+          "could not fill outbound capacity"
+        )
+
+    let waitingForCapacity = stream.waitForOutboundCapacity()
+    check not waitingForCapacity.finished
+
+    # TransportStream.closeImpl fires sendStateChanged so a writer blocked on
+    # outbound capacity can wake and observe that the stream has closed.
+    waitFor stream.close()
+
+    expect LPStreamClosedError:
+      waitFor waitingForCapacity
+
+  test "a writer observes sequence exhaustion instead of waiting forever":
+    let
+      rng = newRng()
+      store = newSessionStore()
+      session = store.addRecipientSession(randomPeerId(rng)).expect(
+          "could not add recipient session"
+        )
+    session.establish()
+    let stream =
+      session.addInboundStream(1, "/test/1").expect("could not add inbound stream")
+    stream.nextOutboundSequence = SequenceNumber.high
+
+    check stream.reserveOutbound(@[1'u8]).isErr
+    expect LPStreamError:
+      waitFor stream.waitForOutboundCapacity()
+
+  test "outbound retransmission deadlines select the earliest due chunk":
+    let
+      rng = newRng()
+      store = newSessionStore()
+      session = store.addRecipientSession(randomPeerId(rng)).expect(
+          "could not add recipient session"
+        )
+    session.establish()
+    let stream =
+      session.addInboundStream(1, "/test/1").expect("could not add inbound stream")
+    let
+      now = Moment.now()
+      firstSequence =
+        stream.reserveOutbound(@[1'u8]).expect("could not reserve first outbound chunk")
+      secondSequence = stream.reserveOutbound(@[2'u8]).expect(
+          "could not reserve second outbound chunk"
+        )
+
+    stream.scheduleOutboundRetransmission(firstSequence, 2.seconds, now)
+    stream.scheduleOutboundRetransmission(secondSequence, 1.seconds, now)
+
+    check:
+      stream.earliestRetransmissionDeadline().get() == now + 1.seconds
+      stream.takeDueOutboundRetransmission(now).isNone
+
+    let retransmission = stream.takeDueOutboundRetransmission(now + 1.seconds).expect(
+        "second chunk was not ready for retransmission"
+      )
+    check:
+      retransmission.sequence == secondSequence
+      retransmission.payload == @[2'u8]
+      stream.earliestRetransmissionDeadline().get() == now + 2.seconds
+      stream.takeDueOutboundRetransmission(now + 1.seconds).isNone
+
+  test "finishing an overlapping retransmission does not restore an acknowledged chunk":
+    let
+      rng = newRng()
+      store = newSessionStore()
+      session = store.addRecipientSession(randomPeerId(rng)).expect(
+          "could not add recipient session"
+        )
+    session.establish()
+    let stream =
+      session.addInboundStream(1, "/test/1").expect("could not add inbound stream")
+    let
+      now = Moment.now()
+      sequence =
+        stream.reserveOutbound(@[1'u8]).expect("could not reserve outbound chunk")
+    stream.scheduleOutboundRetransmission(sequence, 1.seconds, now)
+    discard stream.takeDueOutboundRetransmission(now + 1.seconds).expect(
+        "chunk was not ready for retransmission"
+      )
+
+    check stream.applyAcknowledgement(2, newSeq[byte](AckBitmapBytes))
+    stream.scheduleOutboundRetransmission(sequence, 1.seconds, now + 1.seconds)
+
+    check:
+      stream.pendingOutboundCount == 0
+      stream.earliestRetransmissionDeadline().isNone
+
+  test "stream shutdown cancels and waits for its owned tasks":
+    let
+      rng = newRng()
+      store = newSessionStore()
+      session = store.addRecipientSession(randomPeerId(rng)).expect(
+          "could not add recipient session"
+        )
+    session.establish()
+    let stream =
+      session.addInboundStream(1, "/test/1").expect("could not add inbound stream")
+
+    let
+      streamTaskBlocker = newAsyncEvent()
+      handlerTaskBlocker = newAsyncEvent()
+      streamTask = streamTaskBlocker.wait()
+      handlerTask = handlerTaskBlocker.wait()
+    stream.trackStreamTask(streamTask)
+    stream.setHandlerTask(handlerTask)
+    let waitingForResolution = stream.waitUntilResolved()
+
+    check:
+      not streamTask.finished
+      not handlerTask.finished
+      not waitingForResolution.finished
+
+    waitFor stream.shutdown()
+
+    check:
+      stream.closed
+      streamTask.cancelled()
+      handlerTask.cancelled()
+      waitingForResolution.finished

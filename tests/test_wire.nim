@@ -32,8 +32,8 @@ suite "MixTransport wire format":
       version: MixTransportVersion,
       sessionId: randomSessionId(),
       kind: FrameKind.Data,
-      streamId: Opt.some(7'u64),
-      sequence: Opt.some(11'u64),
+      streamId: Opt.some(StreamId(7)),
+      sequence: Opt.some(SequenceNumber(11)),
       payload: Opt.some(@[1'u8, 2, 3]),
     )
 
@@ -49,13 +49,48 @@ suite "MixTransport wire format":
       decoded.sequence == frame.sequence
       decoded.payload == frame.payload
 
+  test "fixed Data identifiers give every frame the same payload capacity":
+    let
+      sessionId = randomSessionId()
+      smallIdentifiers = MixTransportFrame(
+        version: MixTransportVersion,
+        sessionId: sessionId,
+        kind: FrameKind.Data,
+        streamId: Opt.some(StreamId(1)),
+        sequence: Opt.some(SequenceNumber(1)),
+        payload: Opt.some(newSeq[byte](MaxDataPayloadBytes)),
+      )
+      largestIdentifiers = MixTransportFrame(
+        version: MixTransportVersion,
+        sessionId: sessionId,
+        kind: FrameKind.Data,
+        streamId: Opt.some(StreamId.high),
+        sequence: Opt.some(MaxDataSequenceNumber),
+        payload: Opt.some(newSeq[byte](MaxDataPayloadBytes)),
+      )
+
+    check:
+      sessionId.len == MaxSessionIdBytes
+      smallIdentifiers.encode().expect("small identifiers did not encode").len ==
+        MaxTransportFrameBytes
+      largestIdentifiers.encode().expect("largest identifiers did not encode").len ==
+        MaxTransportFrameBytes
+
+    var oversized = largestIdentifiers
+    oversized.payload = Opt.some(newSeq[byte](MaxDataPayloadBytes + 1))
+    var exhausted = largestIdentifiers
+    exhausted.sequence = Opt.some(SequenceNumber.high)
+    check:
+      oversized.encode().isErr
+      exhausted.encode().isErr
+
   test "acknowledgement bitmap has the fixed receive-window size":
     let frame = MixTransportFrame(
       version: MixTransportVersion,
       sessionId: randomSessionId(),
       kind: FrameKind.Ack,
-      streamId: Opt.some(7'u64),
-      receiveBase: Opt.some(12'u64),
+      streamId: Opt.some(StreamId(7)),
+      receiveBase: Opt.some(SequenceNumber(12)),
       acknowledgementBitmap: Opt.some(newSeq[byte](AckBitmapBytes)),
     )
 
@@ -76,9 +111,7 @@ suite "MixTransport wire format":
       version: MixTransportVersion,
       sessionId: randomSessionId(),
       kind: FrameKind.Refill,
-      batchId: Opt.some(42'u64),
-      partIndex: Opt.some(0'u32),
-      partCount: Opt.some(1'u32),
+      refillRequestId: Opt.some(RefillRequestId(42)),
       surbGroups: @[SurbGroup(surbs: @[newSeq[byte](SurbSize)])],
     )
 
@@ -87,9 +120,7 @@ suite "MixTransport wire format":
       .expect("decode failed")
 
     check:
-      decoded.batchId == frame.batchId
-      decoded.partIndex == frame.partIndex
-      decoded.partCount == frame.partCount
+      decoded.refillRequestId == frame.refillRequestId
       decoded.surbGroups == frame.surbGroups
 
   test "SURB groups use the canonical Mix serialization boundary":
@@ -120,7 +151,7 @@ suite "MixTransport wire format":
       version: MixTransportVersion,
       sessionId: randomSessionId(),
       kind: FrameKind.OpenStream,
-      streamId: Opt.some(1'u64),
+      streamId: Opt.some(StreamId(1)),
       codec: Opt.some("/example/1.0.0"),
     )
 
@@ -131,7 +162,7 @@ suite "MixTransport wire format":
       version: MixTransportVersion,
       sessionId: randomSessionId(),
       kind: FrameKind.StreamReject,
-      streamId: Opt.some(3'u64),
+      streamId: Opt.some(StreamId(3)),
       rejectionReason: Opt.some("requested protocol is not supported"),
     )
 
@@ -150,7 +181,7 @@ suite "MixTransport wire format":
       version: MixTransportVersion,
       sessionId: randomSessionId(),
       kind: FrameKind.StreamReject,
-      streamId: Opt.some(5'u64),
+      streamId: Opt.some(StreamId(5)),
     ).encode().isOk
 
   test "unsupported versions and oversized frames are rejected":
@@ -163,8 +194,8 @@ suite "MixTransport wire format":
       version: MixTransportVersion,
       sessionId: randomSessionId(),
       kind: FrameKind.Data,
-      streamId: Opt.some(1'u64),
-      sequence: Opt.some(0'u64),
+      streamId: Opt.some(StreamId(1)),
+      sequence: Opt.some(SequenceNumber(1)),
       payload: Opt.some(newSeq[byte](MaxTransportFrameBytes)),
     )
 

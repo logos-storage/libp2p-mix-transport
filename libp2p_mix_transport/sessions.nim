@@ -4,16 +4,22 @@
 
 import std/[deques, tables]
 
-import chronos
+import chronicles, chronos
 import results
 import libp2p/peerid
 import libp2p/utils/opt
 import libp2p_mix
 import ./streams
+from ./wire import MaxSessionIdBytes, RefillRequestId, StreamId
+
+logScope:
+  topics = "mix-transport sessions"
 
 const
   ReplyControlReserveGroups* = 2
   ReplyRefillLowWatermarkGroups* = ReplyControlReserveGroups
+  DefaultRefillResponseLifetime* = 30.minutes
+  DefaultMaxOutstandingRefillRequests* = 1_024
 
 type
   SessionRole* {.pure.} = enum
@@ -23,6 +29,7 @@ type
   SessionState* {.pure.} = enum
     Pending
     Established
+    Closed
 
   TransportSession* = ref object
     sessionId: PeerId
@@ -31,16 +38,21 @@ type
     state: SessionState
     established: AsyncEvent
     receivedSurbGroups: Deque[seq[SURB]]
-    receivedSurbGroupsAvailable: AsyncEvent
+    replyCapacityStateChanged: AsyncEvent
     replySendLock: AsyncLock
-    pendingRefillBatchId: Opt[uint64]
-    nextRefillBatchId: uint64
-    streams: Table[uint64, TransportStream]
-    nextOutboundStreamId: uint64
+    nextRefillRequestAt: Opt[Moment]
+    outstandingRefillRequests: Table[RefillRequestId, Moment]
+    nextRefillRequestId: Opt[RefillRequestId]
+    refillResponseLifetime: Duration
+    maxOutstandingRefillRequests: int
+    streams: Table[StreamId, TransportStream]
+    nextOutboundStreamId: Opt[StreamId]
 
   SessionStore* = ref object
     bySessionId: Table[PeerId, TransportSession]
     byDestination: Table[PeerId, TransportSession]
+    refillResponseLifetime: Duration
+    maxOutstandingRefillRequests: int
 
 func sessionId*(session: TransportSession): PeerId =
   session.sessionId
@@ -87,6 +99,8 @@ proc addInitiatorSession*(
     return err("destination must not be empty")
   if sessionId.len == 0:
     return err("sessionId must not be empty")
+  if sessionId.len > MaxSessionIdBytes:
+    return err("sessionId is too long")
   if store.byDestination.hasKey(destination):
     return err("destination already has a session")
   if store.bySessionId.hasKey(sessionId):
@@ -99,12 +113,15 @@ proc addInitiatorSession*(
     state: SessionState.Pending,
     established: newAsyncEvent(),
     receivedSurbGroups: initDeque[seq[SURB]](),
-    receivedSurbGroupsAvailable: newAsyncEvent(),
+    replyCapacityStateChanged: newAsyncEvent(),
     replySendLock: newAsyncLock(),
-    pendingRefillBatchId: Opt.none(uint64),
-    nextRefillBatchId: 1,
-    streams: initTable[uint64, TransportStream](),
-    nextOutboundStreamId: 1,
+    nextRefillRequestAt: Opt.none(Moment),
+    outstandingRefillRequests: initTable[RefillRequestId, Moment](),
+    nextRefillRequestId: Opt.some(RefillRequestId(1)),
+    refillResponseLifetime: store.refillResponseLifetime,
+    maxOutstandingRefillRequests: store.maxOutstandingRefillRequests,
+    streams: initTable[StreamId, TransportStream](),
+    nextOutboundStreamId: Opt.some(StreamId(1)),
   )
   store.bySessionId[sessionId] = session
   store.byDestination[destination] = session
@@ -115,6 +132,8 @@ proc addRecipientSession*(
 ): Result[TransportSession, string] =
   if sessionId.len == 0:
     return err("sessionId must not be empty")
+  if sessionId.len > MaxSessionIdBytes:
+    return err("sessionId is too long")
   if store.bySessionId.hasKey(sessionId):
     return err("sessionId is already registered")
 
@@ -125,21 +144,27 @@ proc addRecipientSession*(
     state: SessionState.Pending,
     established: newAsyncEvent(),
     receivedSurbGroups: initDeque[seq[SURB]](),
-    receivedSurbGroupsAvailable: newAsyncEvent(),
+    replyCapacityStateChanged: newAsyncEvent(),
     replySendLock: newAsyncLock(),
-    pendingRefillBatchId: Opt.none(uint64),
-    nextRefillBatchId: 1,
-    streams: initTable[uint64, TransportStream](),
-    nextOutboundStreamId: 2,
+    nextRefillRequestAt: Opt.none(Moment),
+    outstandingRefillRequests: initTable[RefillRequestId, Moment](),
+    nextRefillRequestId: Opt.some(RefillRequestId(1)),
+    refillResponseLifetime: store.refillResponseLifetime,
+    maxOutstandingRefillRequests: store.maxOutstandingRefillRequests,
+    streams: initTable[StreamId, TransportStream](),
+    nextOutboundStreamId: Opt.some(StreamId(2)),
   )
   store.bySessionId[sessionId] = session
   ok(session)
 
 proc establish*(session: TransportSession) =
+  trace "session established successfully", sessionId = session.sessionId, role = session.role
   session.state = SessionState.Established
   session.established.fire()
 
-proc waitUntilEstablished*(session: TransportSession): Future[void] =
+proc waitUntilEstablished*(
+    session: TransportSession
+): Future[void] {.async: (raw: true, raises: [CancelledError]).} =
   session.established.wait()
 
 proc addReceivedSurbGroups*(
@@ -154,7 +179,9 @@ proc addReceivedSurbGroups*(
   for group in groups.mitems:
     session.receivedSurbGroups.addLast(move(group))
   if groups.len > 0:
-    session.receivedSurbGroupsAvailable.fire()
+    if session.receivedSurbGroups.len > ReplyRefillLowWatermarkGroups:
+      session.nextRefillRequestAt = Opt.none(Moment)
+    session.replyCapacityStateChanged.fire()
   ok()
 
 proc takeReceivedSurbGroup*(session: TransportSession): Result[seq[SURB], string] =
@@ -162,23 +189,23 @@ proc takeReceivedSurbGroup*(session: TransportSession): Result[seq[SURB], string
     return err("session has no received SURB groups")
   ok(session.receivedSurbGroups.popFirst())
 
-proc takeOrdinarySurbGroup*(session: TransportSession): Result[seq[SURB], string] =
+proc takeUnreservedSurbGroup*(session: TransportSession): Result[seq[SURB], string] =
   if session.receivedSurbGroups.len <= ReplyControlReserveGroups:
     return err("session reply capacity is reserved for control traffic")
   ok(session.receivedSurbGroups.popFirst())
 
-proc waitForOrdinarySurbGroup*(
+proc clearReplyCapacityStateChanged*(session: TransportSession) =
+  session.replyCapacityStateChanged.clear()
+
+proc waitForReplyCapacityStateChange*(
     session: TransportSession
-): Future[void] {.async: (raises: [CancelledError]).} =
-  while session.receivedSurbGroups.len <= ReplyControlReserveGroups:
-    session.receivedSurbGroupsAvailable.clear()
-    if session.receivedSurbGroups.len <= ReplyControlReserveGroups:
-      await session.receivedSurbGroupsAvailable.wait()
+): Future[void] {.async: (raw: true, raises: [CancelledError]).} =
+  session.replyCapacityStateChanged.wait()
 
 proc acquireReplySend*(
     session: TransportSession
-): Future[void] {.async: (raises: [CancelledError]).} =
-  await session.replySendLock.acquire()
+): Future[void] {.async: (raw: true, raises: [CancelledError]).} =
+  session.replySendLock.acquire()
 
 proc releaseReplySend*(session: TransportSession) =
   try:
@@ -186,30 +213,96 @@ proc releaseReplySend*(session: TransportSession) =
   except AsyncLockError as exc:
     raiseAssert "session reply-send lock was not held: " & exc.msg
 
-func refillNeeded*(session: TransportSession): bool =
-  session.role == SessionRole.Recipient and
-    session.receivedSurbGroups.len <= ReplyRefillLowWatermarkGroups and
-    session.pendingRefillBatchId.isNone
-
-proc beginRefill*(session: TransportSession): Opt[uint64] =
-  if not session.refillNeeded:
-    return Opt.none(uint64)
-  let batchId = session.nextRefillBatchId
-  inc session.nextRefillBatchId
-  session.pendingRefillBatchId = Opt.some(batchId)
-  Opt.some(batchId)
-
-proc cancelRefill*(session: TransportSession, batchId: uint64) =
-  if session.pendingRefillBatchId == Opt.some(batchId):
-    session.pendingRefillBatchId = Opt.none(uint64)
-
-proc completeRefill*(session: TransportSession, batchId: uint64): bool =
-  if session.pendingRefillBatchId != Opt.some(batchId):
+func refillRequestDue*(session: TransportSession, now: Moment = Moment.now()): bool =
+  if session.role != SessionRole.Recipient or
+      session.receivedSurbGroups.len > ReplyRefillLowWatermarkGroups:
     return false
-  session.pendingRefillBatchId = Opt.none(uint64)
+  let nextRefillRequestAt = session.nextRefillRequestAt.valueOr:
+    return true
+  nextRefillRequestAt <= now
+
+func timeUntilNextRefillRequest*(
+    session: TransportSession, now: Moment = Moment.now()
+): Duration =
+  let nextRefillRequestAt = session.nextRefillRequestAt.valueOr:
+    return ZeroDuration
+  if nextRefillRequestAt <= now:
+    ZeroDuration
+  else:
+    nextRefillRequestAt - now
+
+proc scheduleNextRefillRequest*(
+    session: TransportSession, delay: Duration, now: Moment = Moment.now()
+) =
+  doAssert delay > ZeroDuration, "refill request delay must be positive"
+  session.nextRefillRequestAt = Opt.some(now + delay)
+
+func outstandingRefillRequestCount*(session: TransportSession): int =
+  session.outstandingRefillRequests.len
+
+proc purgeExpiredRefillRequests*(
+    session: TransportSession, now: Moment = Moment.now()
+): int =
+  var expired: seq[RefillRequestId]
+  for refillRequestId, expiresAt in session.outstandingRefillRequests:
+    if expiresAt <= now:
+      expired.add(refillRequestId)
+  for refillRequestId in expired:
+    session.outstandingRefillRequests.del(refillRequestId)
+  expired.len
+
+proc registerRefillRequest*(
+    session: TransportSession, now: Moment = Moment.now()
+): Result[RefillRequestId, string] =
+  if session.role != SessionRole.Recipient:
+    return err("only recipient sessions can request SURB refills")
+  if session.receivedSurbGroups.len > ReplyRefillLowWatermarkGroups:
+    return err("session does not need a SURB refill")
+
+  discard session.purgeExpiredRefillRequests(now)
+  if session.outstandingRefillRequests.len >= session.maxOutstandingRefillRequests:
+    var
+      found = false
+      oldestRequestId: RefillRequestId
+      oldestDeadline: Moment
+    for refillRequestId, expiresAt in session.outstandingRefillRequests:
+      if not found or expiresAt < oldestDeadline:
+        found = true
+        oldestRequestId = refillRequestId
+        oldestDeadline = expiresAt
+    doAssert found, "a full refill request table must contain an entry"
+    session.outstandingRefillRequests.del(oldestRequestId)
+
+  let refillRequestId = session.nextRefillRequestId.valueOr:
+    return err("refill request identifier space is exhausted")
+  session.nextRefillRequestId =
+    if refillRequestId == RefillRequestId.high:
+      Opt.none(RefillRequestId)
+    else:
+      Opt.some(refillRequestId + 1)
+  session.outstandingRefillRequests[refillRequestId] =
+    now + session.refillResponseLifetime
+  ok(refillRequestId)
+
+proc cancelRefillRequest*(session: TransportSession, refillRequestId: RefillRequestId) =
+  session.outstandingRefillRequests.del(refillRequestId)
+  session.nextRefillRequestAt = Opt.none(Moment)
+  session.replyCapacityStateChanged.fire()
+
+proc acceptRefillResponse*(
+    session: TransportSession,
+    refillRequestId: RefillRequestId,
+    now: Moment = Moment.now(),
+): bool =
+  discard session.purgeExpiredRefillRequests(now)
+  if not session.outstandingRefillRequests.hasKey(refillRequestId):
+    return false
+  session.outstandingRefillRequests.del(refillRequestId)
+  session.nextRefillRequestAt = Opt.none(Moment)
+  session.replyCapacityStateChanged.fire()
   true
 
-func isValidInboundStreamId(session: TransportSession, streamId: uint64): bool =
+func isValidInboundStreamId(session: TransportSession, streamId: StreamId): bool =
   if streamId == 0:
     return false
 
@@ -219,10 +312,21 @@ func isValidInboundStreamId(session: TransportSession, streamId: uint64): bool =
   of SessionRole.Recipient:
     streamId mod 2 == 1
 
-proc getStream*(session: TransportSession, streamId: uint64): Opt[TransportStream] =
+proc getStream*(session: TransportSession, streamId: StreamId): Opt[TransportStream] =
   session.streams.withValue(streamId, stream):
     return Opt.some(stream[])
   Opt.none(TransportStream)
+
+proc takeNextOutboundStreamId(session: TransportSession): Result[StreamId, string] =
+  let streamId = session.nextOutboundStreamId.valueOr:
+    return err("stream identifier space is exhausted")
+
+  session.nextOutboundStreamId =
+    if streamId > StreamId.high - 2:
+      Opt.none(StreamId)
+    else:
+      Opt.some(streamId + 2)
+  ok(streamId)
 
 proc addOutboundStream*(
     session: TransportSession, codec: string
@@ -232,16 +336,16 @@ proc addOutboundStream*(
   if codec.len == 0:
     return err("stream codec must not be empty")
 
+  let streamId = session.takeNextOutboundStreamId().valueOr:
+    return err(error)
   let stream = newTransportStream(
-    session.sessionId, session.peerId, session.nextOutboundStreamId, codec,
-    StreamDirection.Outbound,
+    session.sessionId, session.peerId, streamId, codec, StreamDirection.Outbound
   )
   session.streams[stream.streamId] = stream
-  session.nextOutboundStreamId += 2
   ok(stream)
 
 proc addInboundStream*(
-    session: TransportSession, streamId: uint64, codec: string
+    session: TransportSession, streamId: StreamId, codec: string
 ): Result[TransportStream, string] =
   if session.state != SessionState.Established:
     return err("cannot accept a stream before the session is established")
@@ -258,15 +362,35 @@ proc addInboundStream*(
   session.streams[streamId] = stream
   ok(stream)
 
-proc removeStream*(session: TransportSession, streamId: uint64): Opt[TransportStream] =
+proc removeStream*(
+    session: TransportSession, streamId: StreamId
+): Opt[TransportStream] =
   let stream = session.getStream(streamId).valueOr:
     return Opt.none(TransportStream)
   session.streams.del(streamId)
   Opt.some(stream)
 
+proc takeStreams*(session: TransportSession): seq[TransportStream] =
+  result = newSeqOfCap[TransportStream](session.streams.len)
+  for stream in session.streams.values:
+    result.add(stream)
+  session.streams.clear()
+
+proc shutdown*(session: TransportSession): Future[void] {.async: (raises: []).} =
+  session.state = SessionState.Closed
+  session.established.fire()
+  let streams = session.takeStreams()
+  var shutdownTasks = newSeqOfCap[Future[void].Raising([])](streams.len)
+  for stream in streams:
+    shutdownTasks.add(stream.shutdown())
+  await noCancel shutdownTasks.allFutures()
+
 proc remove*(store: SessionStore, sessionId: PeerId): Opt[TransportSession] =
   let session = store.get(sessionId).valueOr:
     return Opt.none(TransportSession)
+
+  trace "removing session", sessionId = session.sessionId,
+    role = session.role, state = session.state
 
   store.bySessionId.del(sessionId)
   session.destination.withValue(destination):
@@ -277,10 +401,25 @@ proc clear*(store: SessionStore) =
   store.bySessionId.clear()
   store.byDestination.clear()
 
-proc newSessionStore*(): SessionStore =
+proc takeSessions*(store: SessionStore): seq[TransportSession] =
+  result = newSeqOfCap[TransportSession](store.bySessionId.len)
+  for session in store.bySessionId.values:
+    result.add(session)
+  store.clear()
+
+proc newSessionStore*(
+    refillResponseLifetime = DefaultRefillResponseLifetime,
+    maxOutstandingRefillRequests = DefaultMaxOutstandingRefillRequests,
+): SessionStore =
+  doAssert refillResponseLifetime > ZeroDuration,
+    "refill response lifetime must be positive"
+  doAssert maxOutstandingRefillRequests > 0,
+    "maximum outstanding refill requests must be positive"
   SessionStore(
     bySessionId: initTable[PeerId, TransportSession](),
     byDestination: initTable[PeerId, TransportSession](),
+    refillResponseLifetime: refillResponseLifetime,
+    maxOutstandingRefillRequests: maxOutstandingRefillRequests,
   )
 
 {.pop.}
