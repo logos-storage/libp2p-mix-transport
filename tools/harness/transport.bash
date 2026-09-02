@@ -17,6 +17,24 @@ _base_api_port=8000
 _base_listen_port=9000
 
 TR_TRANSFER_LOGS="${TR_LOGS_FOLDER}/transfers"
+TR_MEASUREMENTS="${TR_BASE}/${TR_RUN_ID}-transfer-times.csv"
+
+# Extra measurement columns, appended to every row. Experiments use tr_field to
+# record their own parameters (network size, concurrency, ...). Values are
+# constant for the whole run, so set them before calling tr_init.
+declare -gA TR_FIELDS
+_tr_ext_values=""
+
+tr_field() {
+  TR_FIELDS["$1"]="$2"
+}
+
+_tr_timeformat() {
+  local reply=$1 source_node=$2 dest_node=$3 size=$4 ts
+  timestamp ts
+  printf -v "$reply" '%s,%s,%s,%s,%%E,%%U%s' \
+    "$ts" "$size" "$source_node" "$dest_node" "$_tr_ext_values"
+}
 
 _tr_urls() {
   local -n urls_ref=$1
@@ -85,11 +103,13 @@ tr_transfer_regular() {
   local label="${source_node} -> ${dest_node}"
   local logfile="${TR_TRANSFER_LOGS}/regular-${source_node}-${dest_node}-${RANDOM}.log"
 
+  _tr_timeformat TIMEFORMAT "$source_node" "$dest_node" "$size"
+
   echo_log "Starting transfer." "$label" "$logfile"
-  with_log "$label" "$logfile" \
-    curl -fsS -X POST "http://127.0.0.1:$source_api_port/request" \
-      -H "Content-Type: application/json" \
-      -d '{"address": "/ip4/127.0.0.1/tcp/'"$dest_listen_port/"'", "size": '"$size"'}'
+  { time with_log "$label" "$logfile" \
+      curl -fsS -X POST "http://127.0.0.1:$source_api_port/request" \
+        -H "Content-Type: application/json" \
+        -d '{"address": "/ip4/127.0.0.1/tcp/'"$dest_listen_port/"'", "size": '"$size"'}' ; } 2>> "${TR_MEASUREMENTS}"
 }
 
 tr_transfer_mix() {
@@ -109,11 +129,13 @@ tr_transfer_mix() {
     return 1
   fi
 
+  _tr_timeformat TIMEFORMAT "$source_node" "$dest_node" "$size"
+
   echo_log "Starting mix transfer ($source_node -> $dest_node)." "$label" "$logfile"
-  with_log "$label" "$logfile" \
-    curl --fail-with-body --no-progress-meter -X POST "http://127.0.0.1:$source_api_port/request" \
-      -H "Content-Type: application/json" \
-      -d '{"peerId": "'"$dest_peer_id"'", "size": '"$size"'}'
+  { time with_log "$label" "$logfile" \
+      curl --fail-with-body --no-progress-meter -X POST "http://127.0.0.1:$source_api_port/request" \
+        -H "Content-Type: application/json" \
+        -d '{"peerId": "'"$dest_peer_id"'", "size": '"$size"'}' ; } 2>> "${TR_MEASUREMENTS}"
 }
 
 tr_kill_node() {
@@ -145,14 +167,20 @@ tr_list_nodes() {
   done
 }
 
+_tr_init_measurements() {
+  local key columns=""
+  _tr_ext_values=""
+  for key in "${!TR_FIELDS[@]}"; do
+    columns+=",${key}"
+    _tr_ext_values+=",${TR_FIELDS[$key]}"
+  done
+  echo "timestamp,filesize,source,destination,wallclock,cpu${columns}" > "$TR_MEASUREMENTS"
+}
+
 tr_init() {
   init_folders || true
   mkdir -p "${TR_TRANSFER_LOGS}"
   unset _node_pids
   declare -gA _node_pids
-}
-
-tr_destroy() {
-  tr_kill_nodes
-  clean_folders
+  _tr_init_measurements
 }

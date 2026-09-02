@@ -93,9 +93,9 @@ proc main() =
         printUsage()
         quit(0)
       of "api-port", "a":
-        apiPort = val.parseUint()
+        apiPort = val.parseUInt()
       of "listen-port", "l":
-        listenPort = val.parseUint()
+        listenPort = val.parseUInt()
       of "listen-ip", "i":
         listenIp = val
       of "max-connections", "m":
