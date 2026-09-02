@@ -2,13 +2,15 @@
 
 {.used.}
 
-import std/unittest
+import std/[importutils, unittest]
 
 import chronos, results
 import libp2p/[builders, crypto/crypto, crypto/secp, switch]
 import libp2p_mix
 
 import libp2p_mix_transport
+
+privateAccess(MixTransport)
 
 proc createMixProtocol(): MixProtocol =
   let
@@ -28,6 +30,17 @@ proc createMixProtocol(): MixProtocol =
   MixProtocol.new(nodeInfo, switch)
 
 suite "MixTransport lifecycle":
+  test "Data retransmissions are enabled by default and can be disabled":
+    let
+      mix = createMixProtocol()
+      defaultTransport = MixTransport.newMixTransport(mix)
+      retransmissionsDisabled = MixTransport.newMixTransport(mix,
+        enableDataRetransmissions = false)
+
+    check:
+      defaultTransport.dataRetransmissionsEnabled
+      not retransmissionsDisabled.dataRetransmissionsEnabled
+
   test "start and stop own the Mix plug-in registrations":
     let
       mix = createMixProtocol()
