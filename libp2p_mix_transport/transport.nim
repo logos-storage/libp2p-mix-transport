@@ -19,6 +19,7 @@ const
   DefaultConnectTimeout* = 30.seconds
   DefaultStreamOpenTimeout* = 30.seconds
   DefaultRefillRequestTimeout* = 30.seconds
+  DefaultDataRetransmissionTimeout* = 30.seconds
   MinimumConnectReplyGroups* = 2
   DefaultConnectReplyGroups* = MinimumConnectReplyGroups
   DefaultConnectSurbRedundancy* = 2
@@ -35,6 +36,8 @@ type MixTransport* = ref object
   connectTimeout: Duration
   streamOpenTimeout: Duration
   refillRequestTimeout: Duration
+  dataRetransmissionTimeout: Duration
+  dataRetransmissionsEnabled: bool
   started: bool
 
 type PreparedReplyGroups = object
@@ -212,6 +215,10 @@ proc writeStream(
     (await self.sendStreamFrame(session, frame)).isOkOr:
       stream.cancelOutbound(reservedSequence)
       raise newException(LPStreamError, error)
+    if self.dataRetransmissionsEnabled:
+      stream.scheduleOutboundRetransmission(
+        reservedSequence, self.dataRetransmissionTimeout
+      )
     offset += chunkLength
     stream.activity = true
 
@@ -249,6 +256,40 @@ proc runAcknowledgements(
     if (await self.sendStreamFrame(session, frame)).isErr:
       return
 
+proc runRetransmissions(
+    self: MixTransport, session: TransportSession, stream: TransportStream
+) {.async: (raises: [CancelledError]).} =
+  while not stream.closed:
+    stream.clearRetransmissionStateChanged()
+
+    var retransmission = stream.takeDueOutboundRetransmission().valueOr:
+      let deadline = stream.earliestRetransmissionDeadline().valueOr:
+        await stream.waitForRetransmissionStateChange()
+        continue
+      let waitTime = deadline - Moment.now()
+      if waitTime > ZeroDuration:
+        discard await stream.waitForRetransmissionStateChange().withTimeout(waitTime)
+      continue
+
+    let frame = MixTransportFrame(
+      version: MixTransportVersion,
+      sessionId: session.sessionId,
+      kind: FrameKind.Data,
+      streamId: Opt.some(stream.streamId),
+      sequence: Opt.some(retransmission.sequence),
+      payload: Opt.some(move(retransmission.payload)),
+    )
+    let sent = await self.sendStreamFrame(session, frame)
+    if sent.isErr:
+      debug "Could not retransmit Data frame",
+        sessionId = session.sessionId,
+        streamId = stream.streamId,
+        sequence = retransmission.sequence,
+        error = sent.error
+    stream.scheduleOutboundRetransmission(
+      retransmission.sequence, self.dataRetransmissionTimeout
+    )
+
 proc configureStream(
     self: MixTransport, session: TransportSession, stream: TransportStream
 ) =
@@ -259,6 +300,8 @@ proc configureStream(
   stream.setWriteHandler(writeHandler)
   stream.trackStreamTask(runInboundDelivery(stream))
   stream.trackStreamTask(runAcknowledgements(self, session, stream))
+  if self.dataRetransmissionsEnabled:
+    stream.trackStreamTask(runRetransmissions(self, session, stream))
 
 proc handleData(self: MixTransport, frame: MixTransportFrame) {.gcsafe, raises: [].} =
   let session = self.sessions.get(frame.sessionId).valueOr:
@@ -513,6 +556,8 @@ proc newMixTransport*(
     connectTimeout = DefaultConnectTimeout,
     streamOpenTimeout = DefaultStreamOpenTimeout,
     refillRequestTimeout = DefaultRefillRequestTimeout,
+    dataRetransmissionTimeout = DefaultDataRetransmissionTimeout,
+    enableDataRetransmissions = true,
     refillResponseLifetime = DefaultRefillResponseLifetime,
     maxOutstandingRefillRequests = DefaultMaxOutstandingRefillRequests,
 ): MixTransport =
@@ -521,6 +566,8 @@ proc newMixTransport*(
   doAssert streamOpenTimeout > ZeroDuration, "stream open timeout must be positive"
   doAssert refillRequestTimeout > ZeroDuration,
     "refill request timeout must be positive"
+  doAssert dataRetransmissionTimeout > ZeroDuration,
+    "Data retransmission timeout must be positive"
   MixTransport(
     mix: mix,
     replyCredentials: ReplyCredentialStore.new(),
@@ -528,6 +575,8 @@ proc newMixTransport*(
     connectTimeout: connectTimeout,
     streamOpenTimeout: streamOpenTimeout,
     refillRequestTimeout: refillRequestTimeout,
+    dataRetransmissionTimeout: dataRetransmissionTimeout,
+    dataRetransmissionsEnabled: enableDataRetransmissions,
   )
 
 proc createReplyGroups(
