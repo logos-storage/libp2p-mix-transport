@@ -6,7 +6,7 @@ import std/[sequtils, unittest]
 
 import chronos
 import results
-import libp2p/[crypto/crypto, peerid]
+import libp2p/[crypto/crypto, peerid, stream/connection]
 import libp2p_mix
 
 import libp2p_mix_transport
@@ -206,3 +206,70 @@ suite "MixTransport sessions":
       store.get(sessionId).isNone
       store.getByDestination(destination).isNone
       store.remove(sessionId).isNone
+
+  test "session shutdown detaches its streams and waits for their tasks":
+    let
+      rng = newRng()
+      store = newSessionStore()
+      session = store.addRecipientSession(randomPeerId(rng)).expect(
+          "could not add recipient session"
+        )
+    session.establish()
+    let
+      firstStream =
+        session.addInboundStream(1, "/test/1").expect("could not add first stream")
+      secondStream =
+        session.addInboundStream(3, "/test/2").expect("could not add second stream")
+      firstTask = newAsyncEvent().wait()
+      secondTask = newAsyncEvent().wait()
+    firstStream.trackStreamTask(firstTask)
+    secondStream.trackStreamTask(secondTask)
+
+    waitFor session.shutdown()
+
+    check:
+      session.state == SessionState.Closed
+      session.streamCount == 0
+      firstStream.closed
+      secondStream.closed
+      firstTask.cancelled()
+      secondTask.cancelled()
+
+  test "taking sessions clears both store indexes":
+    let
+      rng = newRng()
+      store = newSessionStore()
+      destination = randomPeerId(rng)
+      initiatorSession = store
+        .addInitiatorSession(destination, randomPeerId(rng))
+        .expect("could not add initiator session")
+      recipientSession = store.addRecipientSession(randomPeerId(rng)).expect(
+          "could not add recipient session"
+        )
+
+    let sessions = store.takeSessions()
+
+    check:
+      sessions.len == 2
+      initiatorSession in sessions
+      recipientSession in sessions
+      store.len == 0
+      store.get(initiatorSession.sessionId).isNone
+      store.getByDestination(destination).isNone
+
+  test "session shutdown wakes pending establishment":
+    let
+      rng = newRng()
+      store = newSessionStore()
+      session = store.addRecipientSession(randomPeerId(rng)).expect(
+          "could not add recipient session"
+        )
+      waitingForEstablishment = session.waitUntilEstablished()
+
+    check not waitingForEstablishment.finished
+
+    waitFor session.shutdown()
+
+    check:
+      session.state == SessionState.Closed
+      waitingForEstablishment.finished

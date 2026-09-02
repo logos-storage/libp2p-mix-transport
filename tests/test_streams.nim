@@ -225,3 +225,36 @@ suite "MixTransport streams":
     check stream.reserveOutbound(@[1'u8]).isErr
     expect LPStreamError:
       waitFor stream.waitForOutboundCapacity()
+
+  test "stream shutdown cancels and waits for its owned tasks":
+    let
+      rng = newRng()
+      store = newSessionStore()
+      session = store.addRecipientSession(randomPeerId(rng)).expect(
+          "could not add recipient session"
+        )
+    session.establish()
+    let stream =
+      session.addInboundStream(1, "/test/1").expect("could not add inbound stream")
+
+    let
+      streamTaskBlocker = newAsyncEvent()
+      handlerTaskBlocker = newAsyncEvent()
+      streamTask = streamTaskBlocker.wait()
+      handlerTask = handlerTaskBlocker.wait()
+    stream.trackStreamTask(streamTask)
+    stream.setHandlerTask(handlerTask)
+    let waitingForResolution = stream.waitUntilResolved()
+
+    check:
+      not streamTask.finished
+      not handlerTask.finished
+      not waitingForResolution.finished
+
+    waitFor stream.shutdown()
+
+    check:
+      stream.closed
+      streamTask.cancelled()
+      handlerTask.cancelled()
+      waitingForResolution.finished
