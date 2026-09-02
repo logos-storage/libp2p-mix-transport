@@ -11,16 +11,20 @@ source "${SCRIPT_DIR}/../harness/harness.bash"
 
 # How many nodes should the network have?
 N_NODES=${1:-40}
+tr_field netsize "${N_NODES}"
 # How many transfers we want to run?
 N_TRANSFERS=${2:-50}
 # How many to run concurrently?
 N_CONCURRENT=${3:-5}
+tr_field concurrent "${N_CONCURRENT}"
 # What file size?
 N_BYTES=${4:-1048576}
 # Use mix?
 USE_MIX=${5:-true}
+tr_field mix "${USE_MIX}"
 # What delay strategy?
 MIX_STRATEGY=${6:-default}
+tr_field strategy "${MIX_STRATEGY}"
 
 echoerr "Running multitransfer experiment with:"
 echoerr "  Nodes: ${N_NODES}"
@@ -33,7 +37,7 @@ echoerr "  Mix delay strategy: ${MIX_STRATEGY}"
 _running=()
 _remaining="${N_TRANSFERS}"
 
-tr_destroy
+tr_kill_nodes
 tr_init
 tr_start_network "${N_NODES}" "--mix-config=${MIX_STRATEGY}"
 
