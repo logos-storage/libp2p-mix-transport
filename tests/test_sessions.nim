@@ -2,7 +2,7 @@
 
 {.used.}
 
-import std/[sequtils, unittest]
+import std/unittest
 
 import chronos
 import results
@@ -52,25 +52,24 @@ suite "MixTransport sessions":
       store.get(sessionId).get() == session
       store.getByDestination(sessionId).isNone
 
-  test "recipient sessions retain and consume complete SURB groups":
+  test "recipient sessions store SURBs and form redundancy batches on demand":
     let
       rng = newRng()
       store = newSessionStore()
       session = store.addRecipientSession(randomPeerId(rng)).expect(
           "could not add recipient session"
         )
-      first = @[SURB(), SURB()]
-      second = @[SURB()]
+      supplied = @[SURB(), SURB(), SURB()]
 
-    store.get(session.sessionId).get().addReceivedSurbGroups(@[first, second]).expect(
-      "could not add received SURB groups"
+    store.get(session.sessionId).get().addReceivedSurbs(supplied).expect(
+      "could not add received SURBs"
     )
 
-    check session.receivedSurbGroupCount == 2
-    check session.takeReceivedSurbGroup().expect("could not take first group").len == 2
-    check session.receivedSurbGroupCount == 1
-    check session.takeReceivedSurbGroup().expect("could not take second group").len == 1
-    check session.takeReceivedSurbGroup().isErr
+    check session.receivedSurbCount == 3
+    check session.takeReceivedSurbs(2).expect("could not form redundancy batch").len == 2
+    check session.receivedSurbCount == 1
+    check session.takeReceivedSurbs(2).isErr
+    check session.takeReceivedSurbs(1).expect("could not consume final SURB").len == 1
 
   test "a short refill permits another request immediately":
     let
@@ -80,37 +79,37 @@ suite "MixTransport sessions":
           "could not add recipient session"
         )
 
-    session
-      .addReceivedSurbGroups(toSeq(0 ..< ReplyControlReserveGroups).mapIt(@[SURB()]))
-      .expect("could not add initial SURB groups")
+    session.addReceivedSurbs(newSeq[SURB](ReplyControlReserveSurbs)).expect(
+      "could not add initial SURBs"
+    )
 
     let
       now = Moment.now()
       firstRefillRequestId = session.registerRefillRequest(now).expect(
           "could not register first refill request"
         )
-    discard session.takeReceivedSurbGroup().expect(
-        "could not consume the refill request group"
+    discard session.takeReceivedSurbs(DefaultReplySurbRedundancy).expect(
+        "could not form the refill request redundancy batch"
       )
     session.scheduleNextRefillRequest(30.seconds, now)
     session.clearReplyCapacityStateChanged()
 
     check not session.refillRequestDue(now + 1.seconds)
 
-    # A response may retain fewer valid groups than requested. Accepting the
+    # A response may retain fewer valid SURBs than requested. Accepting the
     # response wakes the waiting send so that it can recheck the queue and retry
-    # instead of waiting for an unreserved group indefinitely.
+    # instead of waiting for enough unreserved SURBs indefinitely.
     check session.acceptRefillResponse(firstRefillRequestId, now + 1.seconds)
-    session.addReceivedSurbGroups(@[@[SURB()]]).expect(
-      "could not add the valid part of the refill"
+    session.addReceivedSurbs(newSeq[SURB](DefaultReplySurbRedundancy)).expect(
+      "could not add valid SURBs from the refill"
     )
     waitFor session.waitForReplyCapacityStateChange()
 
     check:
-      session.receivedSurbGroupCount == ReplyControlReserveGroups
+      session.receivedSurbCount == ReplyControlReserveSurbs
       session.refillRequestDue(now + 1.seconds)
 
-  test "late refill responses contribute their SURB groups exactly once":
+  test "late refill responses contribute their SURBs exactly once":
     let
       rng = newRng()
       store = newSessionStore()
@@ -118,32 +117,36 @@ suite "MixTransport sessions":
           "could not add recipient session"
         )
 
-    session
-      .addReceivedSurbGroups(toSeq(0 ..< ReplyControlReserveGroups).mapIt(@[SURB()]))
-      .expect("could not add initial SURB groups")
+    session.addReceivedSurbs(newSeq[SURB](ReplyControlReserveSurbs)).expect(
+      "could not add initial SURBs"
+    )
 
     let firstRequestId =
       session.registerRefillRequest().expect("could not register first request")
-    discard session.takeReceivedSurbGroup().expect("could not send first request")
+    discard session.takeReceivedSurbs(DefaultReplySurbRedundancy).expect(
+        "could not send first request"
+      )
     let retryRequestId =
       session.registerRefillRequest().expect("could not register retry request")
-    discard session.takeReceivedSurbGroup().expect("could not send retry request")
+    discard session.takeReceivedSurbs(DefaultReplySurbRedundancy).expect(
+        "could not send retry request"
+      )
 
     check session.acceptRefillResponse(retryRequestId)
-    session.addReceivedSurbGroups(@[@[SURB()], @[SURB()]]).expect(
-      "could not add retry response groups"
+    session.addReceivedSurbs(newSeq[SURB](DefaultRefillSurbs)).expect(
+      "could not add retry response SURBs"
     )
     check:
       session.refillRequestDue
-      session.receivedSurbGroupCount == ReplyControlReserveGroups
+      session.receivedSurbCount == ReplyControlReserveSurbs
 
     check session.acceptRefillResponse(firstRequestId)
-    session.addReceivedSurbGroups(@[@[SURB()], @[SURB()]]).expect(
-      "could not add late response groups"
+    session.addReceivedSurbs(newSeq[SURB](DefaultRefillSurbs)).expect(
+      "could not add late response SURBs"
     )
     check:
       not session.refillRequestDue
-      session.receivedSurbGroupCount == 2 * ReplyControlReserveGroups
+      session.receivedSurbCount == 2 * ReplyControlReserveSurbs
       not session.acceptRefillResponse(firstRequestId)
 
   test "the oldest refill request is evicted when correlation state is full":
@@ -157,9 +160,9 @@ suite "MixTransport sessions":
         )
       now = Moment.now()
 
-    session
-      .addReceivedSurbGroups(toSeq(0 ..< ReplyControlReserveGroups).mapIt(@[SURB()]))
-      .expect("could not add initial SURB groups")
+    session.addReceivedSurbs(newSeq[SURB](ReplyControlReserveSurbs)).expect(
+      "could not add initial SURBs"
+    )
     let
       firstRequestId = session.registerRefillRequest(now).expect("first request")
       secondRequestId =

@@ -110,7 +110,7 @@ type RoundTripOutcome = object
   reused: TransportSession
   initiatorStream: TransportStream
   recipientStream: TransportStream
-  recipientReplyGroups: int
+  recipientReplySurbs: int
   rejectionError: string
   initiatorStreamCount: int
   recipientStreamCount: int
@@ -196,7 +196,7 @@ proc establishSessionAndStream(): Future[RoundTripOutcome] {.
 
   # dial reuses the established session, sends OpenStream, and returns only
   # after the recipient has registered the same stream identifier and sent a
-  # StreamAck through one of the session's reply groups.
+  # StreamAck through a temporary redundancy batch formed from the session's SURBs.
   let initiatorStream = (await initiator.dial(destination, TestCodec)).expect(
     "could not establish MixTransport stream"
   )
@@ -221,8 +221,8 @@ proc establishSessionAndStream(): Future[RoundTripOutcome] {.
   let receivedRequest = await receivedRequestFuture
 
   # The handler writes its response through the same virtual connection. On
-  # the recipient this consumes a SURB group; low reply capacity is replenished
-  # before return traffic is allowed to consume a group above the control reserve.
+  # the recipient this consumes one temporary SURB redundancy batch; low reply capacity is replenished
+  # before return traffic is allowed to consume SURBs above the control reserve.
   let receivedResponseFuture = initiatorStream.readLp(1024)
   if not await receivedResponseFuture.withTimeout(TestOperationTimeout):
     raise newException(LPError, "initiator did not receive stream response")
@@ -236,8 +236,7 @@ proc establishSessionAndStream(): Future[RoundTripOutcome] {.
     raise newException(LPError, "unsupported codec unexpectedly opened a stream")
 
   var replyDispositions: seq[RawSurbReplyDisposition]
-  let expectedReplies =
-    DefaultConnectSurbRedundancy + 2 * DefaultOpenStreamSurbRedundancy
+  let expectedReplies = 3 * DefaultReplySurbRedundancy
   for _ in 0 ..< expectedReplies:
     let observed = observedReplies.get()
     if not await observed.withTimeout(TestOperationTimeout):
@@ -251,7 +250,7 @@ proc establishSessionAndStream(): Future[RoundTripOutcome] {.
     reused: reused,
     initiatorStream: initiatorStream,
     recipientStream: recipientStream,
-    recipientReplyGroups: recipientSession.receivedSurbGroupCount,
+    recipientReplySurbs: recipientSession.receivedSurbCount,
     rejectionError: rejected.error,
     initiatorStreamCount: session.streamCount,
     recipientStreamCount: recipientSession.streamCount,
@@ -286,7 +285,7 @@ suite "MixTransport session and stream handshakes":
       outcome.rejectionError == "requested protocol is not supported"
       outcome.initiatorStreamCount == 1
       outcome.recipientStreamCount == 1
-      outcome.recipientReplyGroups >= ReplyControlReserveGroups
+      outcome.recipientReplySurbs >= ReplyControlReserveSurbs
       outcome.handlerPeerId == outcome.session.sessionId
       outcome.handlerCodec == TestCodec
       outcome.handlerReceivedStream
@@ -299,7 +298,7 @@ suite "MixTransport session and stream handshakes":
           RawSurbReplyDisposition.Handled, RawSurbReplyDisposition.Handled,
         ]
 
-  test "a refill retains valid groups and permits another short-supply request":
+  test "a refill retains each valid SURB and permits another short-supply request":
     let
       mix = createMixNodes(1)[0]
       transport = newMixTransport(mix)
@@ -310,13 +309,13 @@ suite "MixTransport session and stream handshakes":
         .expect("could not add recipient session")
 
     session.establish()
-    session.addReceivedSurbGroups(@[@[SURB()], @[SURB()]]).expect(
-      "could not add initial reply groups"
+    session.addReceivedSurbs(newSeq[SURB](ReplyControlReserveSurbs)).expect(
+      "could not add initial reply SURBs"
     )
     let refillRequestId =
       session.registerRefillRequest().expect("could not register refill request")
-    discard session.takeReceivedSurbGroup().expect(
-        "could not consume the refill request group"
+    discard session.takeReceivedSurbs(DefaultReplySurbRedundancy).expect(
+        "could not form the refill request redundancy batch"
       )
 
     (waitFor transport.start()).expect("could not start transport")
@@ -328,14 +327,11 @@ suite "MixTransport session and stream handshakes":
       sessionId: session.sessionId,
       kind: FrameKind.Refill,
       refillRequestId: Opt.some(refillRequestId),
-      surbGroups: @[
-        SurbGroup.init(@[testSurb(1)]).expect("could not encode valid SURB group"),
-        SurbGroup(surbs: @[@[0'u8]]),
-      ],
+      surbs: @[testSurb(1).serializeSurb(), @[0'u8], testSurb(2).serializeSurb()],
     )
 
     # Invoke the same delivery callback that Mix uses for a forward Refill.
-    # The valid group is retained, the malformed group is ignored, and the
+    # Each valid SURB is retained, the malformed SURB is ignored, and the
     # completed request allows the recipient to request more capacity.
     check frame.encode().isErr
     waitFor mix.deliveryHandlers[MixTransportCodec](
@@ -343,11 +339,11 @@ suite "MixTransport session and stream handshakes":
         service: MixTransportCodec,
         # Bypass the strict local encoder to model malformed bytes received
         # from a remote endpoint. The inbound decoder performs structural
-        # validation and leaves each SURB group for independent decoding.
+        # validation and leaves each SURB for independent decoding.
         payload: Protobuf.encode(frame),
       )
     )
 
     check:
-      session.receivedSurbGroupCount == ReplyControlReserveGroups
+      session.receivedSurbCount == ReplyControlReserveSurbs
       session.refillRequestDue

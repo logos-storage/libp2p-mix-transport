@@ -23,7 +23,7 @@ const
   ReceiveWindowChunks* = 256
   AckBitmapBytes* = ReceiveWindowChunks div 8
   MaxInflightChunks* = 64
-  MaxRefillGroupsPerFrame* = 2
+  MaxRefillSurbsPerFrame* = 4
   MaxSessionIdBytes* = 39
   MaxDataSequenceNumber* = SequenceNumber.high - 1
 
@@ -72,9 +72,6 @@ type
     ResetSession = 12
     StreamReject = 13
 
-  SurbGroup* {.proto2.} = object ## Each entry contains one opaque, serialized SURB.
-    surbs* {.fieldNumber: 1.}: seq[seq[byte]]
-
   MixTransportFrame* {.proto2.} = object
     version* {.fieldNumber: 1, required, pint.}: uint32
     sessionId* {.fieldNumber: 2, required, ext.}: PeerId
@@ -86,44 +83,21 @@ type
     receiveBase* {.fieldNumber: 8, fixed.}: Opt[SequenceNumber]
     acknowledgementBitmap* {.fieldNumber: 9.}: Opt[seq[byte]]
     refillRequestId* {.fieldNumber: 10, pint.}: Opt[RefillRequestId]
-    requestedGroups* {.fieldNumber: 11, pint.}: Opt[uint32]
-    surbGroups* {.fieldNumber: 14.}: seq[SurbGroup]
+    requestedSurbs* {.fieldNumber: 11, pint.}: Opt[uint32]
+    surbs* {.fieldNumber: 14.}: seq[seq[byte]]
     rejectionReason* {.fieldNumber: 15.}: Opt[string]
 
 template require(condition: bool, message: string): untyped =
   if not condition:
     return err(message)
 
-proc init*(T: type SurbGroup, surbs: openArray[SURB]): Result[T, string] =
-  require surbs.len > 0, "SURB groups must not be empty"
-
-  var encoded = newSeqOfCap[seq[byte]](surbs.len)
-  for surb in surbs:
-    encoded.add(surb.serializeSurb())
-  ok(T(surbs: encoded))
-
-proc decodeSurbs*(group: SurbGroup): Result[seq[SURB], string] =
-  require group.surbs.len > 0, "SURB groups must not be empty"
-
-  var decoded = newSeqOfCap[SURB](group.surbs.len)
-  for encoded in group.surbs:
-    let surb = encoded.deserializeSurb().valueOr:
-      return err("could not deserialize SURB: " & error)
-    decoded.add(surb)
-  ok(decoded)
-
-proc validateSurbGroups(
-    groups: openArray[SurbGroup], requireValidEncoding: bool
+proc validateSurbs(
+    surbs: openArray[seq[byte]], requireValidEncoding: bool
 ): Result[void, string] =
-  var surbCount = 0
-  for group in groups:
-    if requireValidEncoding:
-      require group.surbs.len > 0, "SURB groups must not be empty"
-    surbCount += group.surbs.len
-    require surbCount <= MaxTransportFrameBytes div SurbSize, "too many SURBs"
-    if requireValidEncoding:
-      for surb in group.surbs:
-        require surb.len == SurbSize, "invalid serialized SURB size"
+  require surbs.len <= MaxTransportFrameBytes div SurbSize, "too many SURBs"
+  if requireValidEncoding:
+    for surb in surbs:
+      require surb.len == SurbSize, "invalid serialized SURB size"
   ok()
 
 proc validateFrame(
@@ -137,7 +111,7 @@ proc validateFrame(
   require frame.rejectionReason.isNone or
     frame.rejectionReason.get().len <= MaxStreamRejectionReasonBytes,
     "stream rejection reason is too long"
-  frame.surbGroups.validateSurbGroups(requireValidSurbEncoding).isOkOr:
+  frame.surbs.validateSurbs(requireValidSurbEncoding).isOkOr:
     return err(error)
 
   let
@@ -168,16 +142,15 @@ proc validateFrame(
   require frame.refillRequestId.isSome ==
     (frame.kind in {FrameKind.RefillRequest, FrameKind.Refill}),
     "refillRequestId does not match the frame kind"
-  require frame.requestedGroups.isSome == (frame.kind == FrameKind.RefillRequest),
-    "requestedGroups does not match the frame kind"
-  require frame.surbGroups.len == 0 or carriesSurbs,
-    "SURB groups do not match the frame kind"
+  require frame.requestedSurbs.isSome == (frame.kind == FrameKind.RefillRequest),
+    "requestedSurbs does not match the frame kind"
+  require frame.surbs.len == 0 or carriesSurbs, "SURBs do not match the frame kind"
   require frame.rejectionReason.isNone or frame.kind == FrameKind.StreamReject,
     "rejectionReason does not match the frame kind"
 
   case frame.kind
   of FrameKind.Connect:
-    require frame.surbGroups.len > 0, "connect must provide at least one SURB group"
+    require frame.surbs.len > 0, "connect must provide at least one SURB"
   of FrameKind.OpenStream:
     require frame.codec.get().len > 0, "application codec must not be empty"
   of FrameKind.Data:
@@ -187,11 +160,11 @@ proc validateFrame(
     require frame.payload.get().len > 0, "data payload must not be empty"
     require frame.payload.get().len <= MaxDataPayloadBytes, "data payload is too large"
   of FrameKind.RefillRequest:
-    require frame.requestedGroups.get() > 0, "refill must request at least one group"
-    require frame.requestedGroups.get() <= MaxRefillGroupsPerFrame,
-      "refill requests too many groups"
+    require frame.requestedSurbs.get() > 0, "refill must request at least one SURB"
+    require frame.requestedSurbs.get() <= MaxRefillSurbsPerFrame,
+      "refill requests too many SURBs"
   of FrameKind.Refill:
-    require frame.surbGroups.len > 0, "refill must provide at least one SURB group"
+    require frame.surbs.len > 0, "refill must provide at least one SURB"
   else:
     discard
 
