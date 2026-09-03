@@ -20,13 +20,10 @@ const
   DefaultStreamOpenTimeout* = 30.seconds
   DefaultRefillRequestTimeout* = 30.seconds
   DefaultDataRetransmissionTimeout* = 30.seconds
-  MinimumConnectReplyGroups* = 2
-  DefaultConnectReplyGroups* = MinimumConnectReplyGroups
-  DefaultConnectSurbRedundancy* = 2
-  DefaultOpenStreamReplyGroups* = 2
-  DefaultOpenStreamSurbRedundancy* = 2
-  DefaultRefillGroups* = MaxRefillGroupsPerFrame.int
-  DefaultRefillSurbRedundancy* = 2
+  MinimumConnectReplySurbs* = ReplyControlReserveSurbs
+  DefaultConnectReplySurbs* = MinimumConnectReplySurbs
+  DefaultOpenStreamReplySurbs* = 4
+  DefaultRefillSurbs* = MaxRefillSurbsPerFrame.int
   UnknownStreamRejectionReason = "remote rejected the stream for an unknown reason"
 
 type MixTransport* = ref object
@@ -40,9 +37,9 @@ type MixTransport* = ref object
   dataRetransmissionsEnabled: bool
   started: bool
 
-type PreparedReplyGroups = object
-  encoded: seq[SurbGroup]
-  credentials: seq[ReplyCredentialGroup]
+type PreparedReplySurbs = object
+  encoded: seq[seq[byte]]
+  credentials: seq[ReplyCredential]
 
 proc handleRefillRequest(
   self: MixTransport, session: TransportSession, frame: MixTransportFrame
@@ -104,7 +101,7 @@ proc handleReplyFrame(
   else:
     discard
 
-proc sendWithSurbGroup(
+proc sendWithSurbRedundancyBatch(
     self: MixTransport, surbs: sink seq[SURB], payload: sink seq[byte]
 ): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
   var sent = false
@@ -115,7 +112,7 @@ proc sendWithSurbGroup(
       sent = true
 
   if not sent:
-    return err("could not send through any SURB in the reply group")
+    return err("could not send through any SURB in the redundancy batch")
   ok()
 
 proc requestRefill(
@@ -127,32 +124,32 @@ proc requestRefill(
   let refillRequestId = session.registerRefillRequest().valueOr:
     return err(error)
 
-  var replyGroup = session.takeReceivedSurbGroup().valueOr:
+  var replyBatch = session.takeReceivedSurbs(DefaultReplySurbRedundancy).valueOr:
     session.cancelRefillRequest(refillRequestId)
-    return err("could not reserve a SURB group for refill: " & error)
+    return err("could not reserve SURBs for refill: " & error)
   let request = MixTransportFrame(
     version: MixTransportVersion,
     sessionId: session.sessionId,
     kind: FrameKind.RefillRequest,
     refillRequestId: Opt.some(refillRequestId),
-    requestedGroups: Opt.some(DefaultRefillGroups.uint32),
+    requestedSurbs: Opt.some(DefaultRefillSurbs.uint32),
   ).encode().valueOr:
     session.cancelRefillRequest(refillRequestId)
     return err("could not encode RefillRequest: " & error)
   session.scheduleNextRefillRequest(self.refillRequestTimeout)
-  (await self.sendWithSurbGroup(replyGroup, request)).isOkOr:
+  (await self.sendWithSurbRedundancyBatch(replyBatch, request)).isOkOr:
     session.cancelRefillRequest(refillRequestId)
     return err("could not send RefillRequest: " & error)
   ok()
 
-proc ensureUnreservedSurbGroup(
+proc ensureUnreservedSurbs(
     self: MixTransport, session: TransportSession
 ): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
-  while session.receivedSurbGroupCount <= ReplyControlReserveGroups:
+  while session.receivedSurbCount < ReplyControlReserveSurbs + DefaultReplySurbRedundancy:
     session.clearReplyCapacityStateChanged()
     (await self.requestRefill(session)).isOkOr:
       return err(error)
-    if session.receivedSurbGroupCount <= ReplyControlReserveGroups:
+    if session.receivedSurbCount < ReplyControlReserveSurbs + DefaultReplySurbRedundancy:
       let waitTime = session.timeUntilNextRefillRequest()
       if waitTime > ZeroDuration:
         discard await session.waitForReplyCapacityStateChange().withTimeout(waitTime)
@@ -178,11 +175,11 @@ proc sendStreamFrame(
     await session.acquireReplySend()
     defer:
       session.releaseReplySend()
-    (await self.ensureUnreservedSurbGroup(session)).isOkOr:
+    (await self.ensureUnreservedSurbs(session)).isOkOr:
       return err(error)
-    var replyGroup = session.takeUnreservedSurbGroup().valueOr:
+    var replyBatch = session.takeUnreservedSurbs(DefaultReplySurbRedundancy).valueOr:
       return err(error)
-    (await self.sendWithSurbGroup(replyGroup, payload)).isOkOr:
+    (await self.sendWithSurbRedundancyBatch(replyBatch, payload)).isOkOr:
       return err("could not send " & $frame.kind & " frame: " & error)
     (await self.requestRefill(session)).isOkOr:
       return err(error)
@@ -364,12 +361,12 @@ proc handleRefill(self: MixTransport, frame: MixTransportFrame) {.gcsafe, raises
   if not session.acceptRefillResponse(refillRequestId):
     return
 
-  var decodedGroups = newSeqOfCap[seq[SURB]](frame.surbGroups.len)
-  for encodedGroup in frame.surbGroups:
-    let group = encodedGroup.decodeSurbs().valueOr:
+  var decodedSurbs = newSeqOfCap[SURB](frame.surbs.len)
+  for encodedSurb in frame.surbs:
+    let surb = encodedSurb.deserializeSurb().valueOr:
       continue
-    decodedGroups.add(group)
-  discard session.addReceivedSurbGroups(decodedGroups)
+    decodedSurbs.add(surb)
+  discard session.addReceivedSurbs(decodedSurbs)
 
 proc sendStreamResponse(
     self: MixTransport,
@@ -387,7 +384,7 @@ proc sendStreamResponse(
     else:
       rejectionReason
 
-  var replyGroup = session.takeReceivedSurbGroup().valueOr:
+  var replyBatch = session.takeReceivedSurbs(DefaultReplySurbRedundancy).valueOr:
     return false
   let response = MixTransportFrame(
     version: MixTransportVersion,
@@ -401,21 +398,21 @@ proc sendStreamResponse(
         Opt.none(string),
   ).encode().valueOr:
     return false
-  (await self.sendWithSurbGroup(replyGroup, response)).isOk
+  (await self.sendWithSurbRedundancyBatch(replyBatch, response)).isOk
 
 proc handleConnect(
     self: MixTransport, frame: MixTransportFrame
 ): Future[void] {.async: (raises: [CancelledError]).} =
   if self.sessions.get(frame.sessionId).isSome:
     return
-  if frame.surbGroups.len < MinimumConnectReplyGroups:
-    return
 
-  var decodedGroups = newSeqOfCap[seq[SURB]](frame.surbGroups.len)
-  for encodedGroup in frame.surbGroups:
-    let group = encodedGroup.decodeSurbs().valueOr:
-      return
-    decodedGroups.add(group)
+  var decodedSurbs = newSeqOfCap[SURB](frame.surbs.len)
+  for encodedSurb in frame.surbs:
+    let surb = encodedSurb.deserializeSurb().valueOr:
+      continue
+    decodedSurbs.add(surb)
+  if decodedSurbs.len < MinimumConnectReplySurbs:
+    return
 
   let session = self.sessions.addRecipientSession(frame.sessionId).valueOr:
     return
@@ -424,10 +421,10 @@ proc handleConnect(
     if not keepSession:
       discard self.sessions.remove(frame.sessionId)
 
-  session.addReceivedSurbGroups(decodedGroups).isOkOr:
+  session.addReceivedSurbs(decodedSurbs).isOkOr:
     return
 
-  var replyGroup = session.takeReceivedSurbGroup().valueOr:
+  var replyBatch = session.takeReceivedSurbs(DefaultReplySurbRedundancy).valueOr:
     return
   let acknowledgement = MixTransportFrame(
     version: MixTransportVersion, sessionId: frame.sessionId, kind: FrameKind.ConnectAck
@@ -437,7 +434,7 @@ proc handleConnect(
   # ConnectAck allows the initiator to send session traffic immediately. Make
   # the recipient ready before the first redundant ACK copy can arrive.
   session.establish()
-  (await self.sendWithSurbGroup(replyGroup, acknowledgement)).isOkOr:
+  (await self.sendWithSurbRedundancyBatch(replyBatch, acknowledgement)).isOkOr:
     return
   keepSession = true
 
@@ -456,12 +453,12 @@ proc handleOpenStream(
       sessionId = frame.sessionId, sessionState = session.state
     return
 
-  var decodedGroups = newSeqOfCap[seq[SURB]](frame.surbGroups.len)
-  for encodedGroup in frame.surbGroups:
-    let group = encodedGroup.decodeSurbs().valueOr:
-      return
-    decodedGroups.add(group)
-  session.addReceivedSurbGroups(decodedGroups).isOkOr:
+  var decodedSurbs = newSeqOfCap[SURB](frame.surbs.len)
+  for encodedSurb in frame.surbs:
+    let surb = encodedSurb.deserializeSurb().valueOr:
+      continue
+    decodedSurbs.add(surb)
+  session.addReceivedSurbs(decodedSurbs).isOkOr:
     return
 
   let protocol = self.mix.switch.ms.lookupProtocol(frame.codec.get()).valueOr:
@@ -579,58 +576,38 @@ proc newMixTransport*(
     dataRetransmissionsEnabled: enableDataRetransmissions,
   )
 
-proc createReplyGroups(
-    self: MixTransport,
-    destination: PeerId,
-    sessionId: PeerId,
-    groupCount: int,
-    redundancy: int,
-): Result[PreparedReplyGroups, string] =
+proc createReplySurbs(
+    self: MixTransport, destination: PeerId, sessionId: PeerId, count: int
+): Result[PreparedReplySurbs, string] =
   let mixDestination = MixDestination.exitNode(destination)
-  var prepared = PreparedReplyGroups(
-    encoded: newSeqOfCap[SurbGroup](groupCount),
-    credentials: newSeqOfCap[ReplyCredentialGroup](groupCount),
+  var prepared = PreparedReplySurbs(
+    encoded: newSeqOfCap[seq[byte]](count),
+    credentials: newSeqOfCap[ReplyCredential](count),
   )
 
-  for _ in 0 ..< groupCount:
-    var
-      surbs = newSeqOfCap[SURB](redundancy)
-      credentials = newSeqOfCap[ReplyCredential](redundancy)
-    for _ in 0 ..< redundancy:
-      var created = self.mix.createSurb(mixDestination).valueOr:
-        for group in prepared.credentials:
-          self.replyCredentials.consume(group)
-        return err("could not create SURB: " & error)
-      surbs.add(move(created.surb))
-      credentials.add(created.credential)
+  for _ in 0 ..< count:
+    var created = self.mix.createSurb(mixDestination).valueOr:
+      return err("could not create SURB: " & error)
+    prepared.encoded.add(created.surb.serializeSurb())
+    prepared.credentials.add(created.credential)
 
-    let encoded = SurbGroup.init(surbs).valueOr:
-      for group in prepared.credentials:
-        self.replyCredentials.consume(group)
-      return err("could not encode SURB group: " & error)
-    let credentialGroup = self.replyCredentials.addGroup(sessionId, credentials).valueOr:
-      for group in prepared.credentials:
-        self.replyCredentials.consume(group)
-      return err("could not register reply credentials: " & error)
-    prepared.encoded.add(encoded)
-    prepared.credentials.add(credentialGroup)
+  self.replyCredentials.add(sessionId, prepared.credentials).isOkOr:
+    return err("could not register reply credentials: " & error)
 
   ok(prepared)
 
-proc retireReplyGroups(self: MixTransport, groups: openArray[ReplyCredentialGroup]) =
-  for group in groups:
-    self.replyCredentials.consume(group)
+proc retireReplyCredentials(
+    self: MixTransport, credentials: openArray[ReplyCredential]
+) =
+  self.replyCredentials.consume(credentials)
 
 proc handleRefillRequest(
     self: MixTransport, session: TransportSession, frame: MixTransportFrame
 ): Future[void] {.async: (raises: [CancelledError]).} =
   let destination = session.destination.valueOr:
     return
-  let prepared = self.createReplyGroups(
-    destination,
-    session.sessionId,
-    frame.requestedGroups.get().int,
-    DefaultRefillSurbRedundancy,
+  let prepared = self.createReplySurbs(
+    destination, session.sessionId, frame.requestedSurbs.get().int
   ).valueOr:
     return
 
@@ -639,26 +616,24 @@ proc handleRefillRequest(
     sessionId: session.sessionId,
     kind: FrameKind.Refill,
     refillRequestId: frame.refillRequestId,
-    surbGroups: prepared.encoded,
+    surbs: prepared.encoded,
   )
   (await self.sendStreamFrame(session, refill)).isOkOr:
-    self.retireReplyGroups(prepared.credentials)
+    self.retireReplyCredentials(prepared.credentials)
     return
 
 proc createConnectFrame(
     self: MixTransport, destination: PeerId, sessionId: PeerId
 ): Result[MixTransportFrame, string] =
-  let prepared = self.createReplyGroups(
-    destination, sessionId, DefaultConnectReplyGroups, DefaultConnectSurbRedundancy
-  ).valueOr:
-    return err("could not prepare Connect reply groups: " & error)
+  let prepared = self.createReplySurbs(destination, sessionId, DefaultConnectReplySurbs).valueOr:
+    return err("could not prepare Connect reply SURBs: " & error)
 
   ok(
     MixTransportFrame(
       version: MixTransportVersion,
       sessionId: sessionId,
       kind: FrameKind.Connect,
-      surbGroups: prepared.encoded,
+      surbs: prepared.encoded,
     )
   )
 
@@ -724,15 +699,14 @@ proc dial*(
       discard session.removeStream(stream.streamId)
       await noCancel stream.shutdown()
 
-  let prepared = self.createReplyGroups(
-    destination, session.sessionId, DefaultOpenStreamReplyGroups,
-    DefaultOpenStreamSurbRedundancy,
+  let prepared = self.createReplySurbs(
+    destination, session.sessionId, DefaultOpenStreamReplySurbs
   ).valueOr:
-    return err("could not prepare OpenStream reply groups: " & error)
-  var keepReplyGroups = false
+    return err("could not prepare OpenStream reply SURBs: " & error)
+  var keepReplyCredentials = false
   defer:
-    if not keepReplyGroups:
-      self.retireReplyGroups(prepared.credentials)
+    if not keepReplyCredentials:
+      self.retireReplyCredentials(prepared.credentials)
 
   let frame = MixTransportFrame(
     version: MixTransportVersion,
@@ -740,7 +714,7 @@ proc dial*(
     kind: FrameKind.OpenStream,
     streamId: Opt.some(stream.streamId),
     codec: Opt.some(codec),
-    surbGroups: prepared.encoded,
+    surbs: prepared.encoded,
   )
   let payload = frame.encode().valueOr:
     return err("could not encode OpenStream frame: " & error)
@@ -750,7 +724,7 @@ proc dial*(
     )
   ).isOkOr:
     return err("could not send OpenStream frame: " & error)
-  keepReplyGroups = true
+  keepReplyCredentials = true
 
   if not await stream.waitUntilResolved().withTimeout(self.streamOpenTimeout):
     return err("MixTransport stream opening timed out")

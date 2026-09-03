@@ -13,8 +13,10 @@ import ./streams
 from ./wire import MaxSessionIdBytes, RefillRequestId, StreamId
 
 const
-  ReplyControlReserveGroups* = 2
-  ReplyRefillLowWatermarkGroups* = ReplyControlReserveGroups
+  DefaultReplySurbRedundancy* = 2
+  ReplyControlReserveBatches* = 2
+  ReplyControlReserveSurbs* = ReplyControlReserveBatches * DefaultReplySurbRedundancy
+  ReplyRefillLowWatermarkSurbs* = ReplyControlReserveSurbs
   DefaultRefillResponseLifetime* = 30.minutes
   DefaultMaxOutstandingRefillRequests* = 1_024
 
@@ -34,7 +36,7 @@ type
     role: SessionRole
     state: SessionState
     established: AsyncEvent
-    receivedSurbGroups: Deque[seq[SURB]]
+    receivedSurbs: Deque[SURB]
     replyCapacityStateChanged: AsyncEvent
     replySendLock: AsyncLock
     nextRefillRequestAt: Opt[Moment]
@@ -63,8 +65,8 @@ func role*(session: TransportSession): SessionRole =
 func state*(session: TransportSession): SessionState =
   session.state
 
-func receivedSurbGroupCount*(session: TransportSession): int =
-  session.receivedSurbGroups.len
+func receivedSurbCount*(session: TransportSession): int =
+  session.receivedSurbs.len
 
 func streamCount*(session: TransportSession): int =
   session.streams.len
@@ -109,7 +111,7 @@ proc addInitiatorSession*(
     role: SessionRole.Initiator,
     state: SessionState.Pending,
     established: newAsyncEvent(),
-    receivedSurbGroups: initDeque[seq[SURB]](),
+    receivedSurbs: initDeque[SURB](),
     replyCapacityStateChanged: newAsyncEvent(),
     replySendLock: newAsyncLock(),
     nextRefillRequestAt: Opt.none(Moment),
@@ -140,7 +142,7 @@ proc addRecipientSession*(
     role: SessionRole.Recipient,
     state: SessionState.Pending,
     established: newAsyncEvent(),
-    receivedSurbGroups: initDeque[seq[SURB]](),
+    receivedSurbs: initDeque[SURB](),
     replyCapacityStateChanged: newAsyncEvent(),
     replySendLock: newAsyncLock(),
     nextRefillRequestAt: Opt.none(Moment),
@@ -163,32 +165,42 @@ proc waitUntilEstablished*(
 ): Future[void] {.async: (raw: true, raises: [CancelledError]).} =
   session.established.wait()
 
-proc addReceivedSurbGroups*(
-    session: TransportSession, groups: sink seq[seq[SURB]]
+proc addReceivedSurbs*(
+    session: TransportSession, surbs: sink seq[SURB]
 ): Result[void, string] =
   if session.role != SessionRole.Recipient:
-    return err("only recipient sessions can store received SURB groups")
-  for group in groups:
-    if group.len == 0:
-      return err("received SURB groups must not be empty")
+    return err("only recipient sessions can store received SURBs")
 
-  for group in groups.mitems:
-    session.receivedSurbGroups.addLast(move(group))
-  if groups.len > 0:
-    if session.receivedSurbGroups.len > ReplyRefillLowWatermarkGroups:
+  for surb in surbs.mitems:
+    session.receivedSurbs.addLast(move(surb))
+  if surbs.len > 0:
+    if session.receivedSurbs.len > ReplyRefillLowWatermarkSurbs:
       session.nextRefillRequestAt = Opt.none(Moment)
     session.replyCapacityStateChanged.fire()
   ok()
 
-proc takeReceivedSurbGroup*(session: TransportSession): Result[seq[SURB], string] =
-  if session.receivedSurbGroups.len == 0:
-    return err("session has no received SURB groups")
-  ok(session.receivedSurbGroups.popFirst())
+proc takeReceivedSurbs*(
+    session: TransportSession, count: int
+): Result[seq[SURB], string] =
+  if count <= 0:
+    return err("SURB count must be positive")
+  if session.receivedSurbs.len < count:
+    return err("session does not have enough received SURBs")
 
-proc takeUnreservedSurbGroup*(session: TransportSession): Result[seq[SURB], string] =
-  if session.receivedSurbGroups.len <= ReplyControlReserveGroups:
+  var surbs = newSeqOfCap[SURB](count)
+  for _ in 0 ..< count:
+    surbs.add(session.receivedSurbs.popFirst())
+  ok(surbs)
+
+proc takeUnreservedSurbs*(
+    session: TransportSession, count: int
+): Result[seq[SURB], string] =
+  if count <= 0:
+    return err("SURB count must be positive")
+  if session.receivedSurbs.len < count or
+      session.receivedSurbs.len - count < ReplyControlReserveSurbs:
     return err("session reply capacity is reserved for control traffic")
-  ok(session.receivedSurbGroups.popFirst())
+  session.takeReceivedSurbs(count)
 
 proc clearReplyCapacityStateChanged*(session: TransportSession) =
   session.replyCapacityStateChanged.clear()
@@ -211,7 +223,7 @@ proc releaseReplySend*(session: TransportSession) =
 
 func refillRequestDue*(session: TransportSession, now: Moment = Moment.now()): bool =
   if session.role != SessionRole.Recipient or
-      session.receivedSurbGroups.len > ReplyRefillLowWatermarkGroups:
+      session.receivedSurbs.len > ReplyRefillLowWatermarkSurbs:
     return false
   let nextRefillRequestAt = session.nextRefillRequestAt.valueOr:
     return true
@@ -252,7 +264,7 @@ proc registerRefillRequest*(
 ): Result[RefillRequestId, string] =
   if session.role != SessionRole.Recipient:
     return err("only recipient sessions can request SURB refills")
-  if session.receivedSurbGroups.len > ReplyRefillLowWatermarkGroups:
+  if session.receivedSurbs.len > ReplyRefillLowWatermarkSurbs:
     return err("session does not need a SURB refill")
 
   discard session.purgeExpiredRefillRequests(now)

@@ -106,13 +106,13 @@ suite "MixTransport wire format":
     wrongSize.acknowledgementBitmap = Opt.some(newSeq[byte](AckBitmapBytes - 1))
     check wrongSize.encode().isErr
 
-  test "refill frame preserves grouped SURBs":
+  test "refill frame preserves individual SURBs":
     let frame = MixTransportFrame(
       version: MixTransportVersion,
       sessionId: randomSessionId(),
       kind: FrameKind.Refill,
       refillRequestId: Opt.some(RefillRequestId(42)),
-      surbGroups: @[SurbGroup(surbs: @[newSeq[byte](SurbSize)])],
+      surbs: @[newSeq[byte](SurbSize), newSeq[byte](SurbSize)],
     )
 
     let decoded = MixTransportFrame
@@ -121,20 +121,22 @@ suite "MixTransport wire format":
 
     check:
       decoded.refillRequestId == frame.refillRequestId
-      decoded.surbGroups == frame.surbGroups
+      decoded.surbs == frame.surbs
 
-  test "SURB groups use the canonical Mix serialization boundary":
+  test "each SURB uses the canonical Mix serialization boundary":
     let
       original = @[testSurb(1), testSurb(2)]
-      group = SurbGroup.init(original).expect("could not encode SURB group")
-      decoded = group.decodeSurbs().expect("could not decode SURB group")
+      firstEncoded = original[0].serializeSurb()
+      secondEncoded = original[1].serializeSurb()
+      firstDecoded =
+        firstEncoded.deserializeSurb().expect("could not decode first SURB")
+      secondDecoded =
+        secondEncoded.deserializeSurb().expect("could not decode second SURB")
 
     check:
-      decoded.len == original.len
-      decoded[0].serializeSurb() == original[0].serializeSurb()
-      decoded[1].serializeSurb() == original[1].serializeSurb()
-      SurbGroup.init(newSeq[SURB]()).isErr
-      SurbGroup(surbs: @[@[0'u8]]).decodeSurbs().isErr
+      firstDecoded.serializeSurb() == firstEncoded
+      secondDecoded.serializeSurb() == secondEncoded
+      @[0'u8].deserializeSurb().isErr
 
   test "frame fields must agree with their declared kind - e.g. ConnectAck should not include payload":
     let frame = MixTransportFrame(
@@ -146,7 +148,7 @@ suite "MixTransport wire format":
 
     check frame.encode().isErr
 
-  test "open stream does not require an attached SURB group":
+  test "open stream does not require attached SURBs":
     let frame = MixTransportFrame(
       version: MixTransportVersion,
       sessionId: randomSessionId(),
