@@ -6,8 +6,13 @@
 # multitransfer.bash <n_nodes> <n_transfers> <concurrent> <filesize_bytes> <use_mix>
 set -euo pipefail
 SCRIPT_DIR=${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
+
+# Data goes into ./output
+TR_BASE=$(realpath "${SCRIPT_DIR}/output")
+export TR_BASE
+
 # shellcheck source=../harness/harness.bash
-source "${SCRIPT_DIR}/../harness/harness.bash"
+source "${SCRIPT_DIR}/../../harness/harness.bash"
 
 # How many nodes should the network have?
 N_NODES=${1:-40}

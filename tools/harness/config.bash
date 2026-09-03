@@ -7,7 +7,7 @@ source "$LIB_SRC/utils.bash"
 
 # Stuff you might want to change:
 TR_RUN_ID=$(date +%Y%m%d%H%M%S-${RANDOM})
-TR_BASE=$(realpath "${LIB_SRC}/../../runtime")
+TR_BASE=${TR_BASE:-$(realpath "${LIB_SRC}/../../experiment-output")}
 TR_RUNTIME_FOLDER="${TR_BASE}/${TR_RUN_ID}"
 TR_NODE_BINARY="$(realpath "${LIB_SRC}/../node/node")"
 TR_LOGS_FOLDER="${TR_RUNTIME_FOLDER}/logs"
