@@ -71,110 +71,159 @@ suite "MixTransport sessions":
     check session.takeReceivedSurbs(2).isErr
     check session.takeReceivedSurbs(1).expect("could not consume final SURB").len == 1
 
-  test "a short refill permits another request immediately":
+  test "recipient supply is bounded and duplicate numbered SURBs are ignored":
     let
       rng = newRng()
-      store = newSessionStore()
+      store = newSessionStore(recipientSurbCapacity = 6)
       session = store.addRecipientSession(randomPeerId(rng)).expect(
           "could not add recipient session"
         )
 
     session.addReceivedSurbs(newSeq[SURB](ReplyControlReserveSurbs)).expect(
-      "could not add initial SURBs"
+      "could not add bootstrap SURBs"
     )
+    discard session.takeReceivedSurbs(DefaultReplySurbRedundancy).expect(
+        "could not form the ConnectAck redundancy batch"
+      )
+    session.initializeSurbSupply().expect("could not initialize SURB supply")
 
+    let initialSnapshot = session.surbSupplySnapshot()
+    check:
+      session.receivedSurbCount == 2
+      initialSnapshot.receiveBase == 0
+      initialSnapshot.supplyLimit == 4
+
+    check session.acceptSurbSupply(1, SURB()) == SurbSupplyDisposition.Accepted
+    check session.acceptSurbSupply(1, SURB()) == SurbSupplyDisposition.Duplicate
+    check session.surbSupplySnapshot().receiveBase == 0
+    check session.acceptSurbSupply(0, SURB()) == SurbSupplyDisposition.Accepted
+    check session.surbSupplySnapshot().receiveBase == 2
+    check session.acceptSurbSupply(3, SURB()) == SurbSupplyDisposition.Accepted
+    check session.acceptSurbSupply(2, SURB()) == SurbSupplyDisposition.Accepted
+    check:
+      session.receivedSurbCount == 6
+      session.surbSupplySnapshot().receiveBase == 4
+      session.acceptSurbSupply(4, SURB()) == SurbSupplyDisposition.OutsideWindow
+
+    # Consuming two stored SURBs grants exactly two new absolute supply slots.
+    discard session.takeReceivedSurbs(2).expect("could not consume received SURBs")
+    check session.surbSupplySnapshot().supplyLimit == 6
+    check session.acceptSurbSupply(4, SURB()) == SurbSupplyDisposition.Accepted
+    check session.acceptSurbSupply(5, SURB()) == SurbSupplyDisposition.Accepted
+    check session.receivedSurbCount == session.recipientSurbCapacity
+
+  test "initiator applies absolute supply acknowledgements and credit":
     let
+      rng = newRng()
+      session = newSessionStore()
+        .addInitiatorSession(randomPeerId(rng), randomPeerId(rng))
+        .expect("could not add initiator session")
+      emptyBitmap = newSeq[byte](SurbSupplyAckBitmapBytes)
+
+    check session.applySurbSupplySnapshot(
+      SurbSupplySnapshot(
+        receiveBase: 0, acknowledgementBitmap: emptyBitmap, supplyLimit: 4
+      )
+    )
+    check session.availableSurbSupplySlots == 4
+    check session
+      .registerSurbSupply(
+        @[newSeq[byte](1), newSeq[byte](1), newSeq[byte](1), newSeq[byte](1)],
+        newSeq[SURBIdentifier](4),
+      )
+      .expect("could not register SURB supply") == 0
+    check:
+      session.pendingSurbSupplyCount == 4
+      session.availableSurbSupplySlots == 0
+
+    # The snapshot acknowledges sequences 0 and 1 through its receive base and
+    # sequence 3 through bitmap offset 1. Sequence 2 remains pending.
+    var acknowledgementBitmap = newSeq[byte](SurbSupplyAckBitmapBytes)
+    acknowledgementBitmap[0] = 0b00000010
+    check session.applySurbSupplySnapshot(
+      SurbSupplySnapshot(
+        receiveBase: 2, acknowledgementBitmap: acknowledgementBitmap, supplyLimit: 6
+      )
+    )
+    check:
+      session.pendingSurbSupplyCount == 1
+      session.remoteSurbSupplyLimit == 6
+      session.availableSurbSupplySlots == 2
+
+    session.requestSurbSupply()
+    check session.isSurbSupplyRequested
+    session.clearSurbSupplyRequest()
+    check not session.isSurbSupplyRequested
+
+  test "unacknowledged SURB supply retains its credential association":
+    let
+      rng = newRng()
+      session = newSessionStore()
+        .addInitiatorSession(randomPeerId(rng), randomPeerId(rng))
+        .expect("could not add initiator session")
       now = Moment.now()
-      firstRefillRequestId = session.registerRefillRequest(now).expect(
-          "could not register first refill request"
-        )
-    discard session.takeReceivedSurbs(DefaultReplySurbRedundancy).expect(
-        "could not form the refill request redundancy batch"
+      firstEncodedSurb = @[1'u8, 2, 3]
+      secondEncodedSurb = @[4'u8, 5, 6]
+    var
+      firstCredentialIdentifier: SURBIdentifier
+      secondCredentialIdentifier: SURBIdentifier
+    firstCredentialIdentifier[0] = 1
+    secondCredentialIdentifier[0] = 2
+
+    check session.applySurbSupplySnapshot(
+      SurbSupplySnapshot(
+        receiveBase: 0,
+        acknowledgementBitmap: newSeq[byte](SurbSupplyAckBitmapBytes),
+        supplyLimit: 2,
       )
-    session.scheduleNextRefillRequest(30.seconds, now)
-    session.clearReplyCapacityStateChanged()
-
-    check not session.refillRequestDue(now + 1.seconds)
-
-    # A response may retain fewer valid SURBs than requested. Accepting the
-    # response wakes the waiting send so that it can recheck the queue and retry
-    # instead of waiting for enough unreserved SURBs indefinitely.
-    check session.acceptRefillResponse(firstRefillRequestId, now + 1.seconds)
-    session.addReceivedSurbs(newSeq[SURB](DefaultReplySurbRedundancy)).expect(
-      "could not add valid SURBs from the refill"
     )
-    waitFor session.waitForReplyCapacityStateChange()
+    let firstSequence = session
+      .registerSurbSupply(
+        @[firstEncodedSurb, secondEncodedSurb],
+        @[firstCredentialIdentifier, secondCredentialIdentifier],
+      )
+      .expect("could not register SURB supply")
+    session.scheduleSurbSupplyRetransmission(firstSequence, 2, 30.seconds, now)
 
     check:
-      session.receivedSurbCount == ReplyControlReserveSurbs
-      session.refillRequestDue(now + 1.seconds)
+      session.earliestSurbSupplyRetransmission() == Opt.some(now + 30.seconds)
+      session.takeDueSurbSupplyRetransmission(now + 29.seconds).isNone
 
-  test "late refill responses contribute their SURBs exactly once":
-    let
-      rng = newRng()
-      store = newSessionStore()
-      session = store.addRecipientSession(randomPeerId(rng)).expect(
-          "could not add recipient session"
-        )
+    let retransmission = session
+      .takeDueSurbSupplyRetransmission(now + 30.seconds)
+      .expect("first supplied SURB was not ready for retransmission")
+    check:
+      retransmission.sequence == firstSequence
+      retransmission.encodedSurb == firstEncodedSurb
+      retransmission.credentialIdentifier == firstCredentialIdentifier
 
-    session.addReceivedSurbs(newSeq[SURB](ReplyControlReserveSurbs)).expect(
-      "could not add initial SURBs"
+    # Taking a due entry temporarily removes its deadline but retains the
+    # serialized public SURB. Sending code schedules its next deadline after
+    # the retransmission attempt completes.
+    check session.earliestSurbSupplyRetransmission() == Opt.some(now + 30.seconds)
+
+    # The transport removes a pending public serialization instead of
+    # retransmitting it after its matching reply credential has expired.
+    session.removePendingSurbSupply(retransmission.sequence)
+    check session.pendingSurbSupplyCount == 1
+
+    session.scheduleSurbSupplyRetransmission(
+      retransmission.sequence, 1, 30.seconds, now + 30.seconds
     )
+    check session.earliestSurbSupplyRetransmission() == Opt.some(now + 30.seconds)
 
-    let firstRequestId =
-      session.registerRefillRequest().expect("could not register first request")
-    discard session.takeReceivedSurbs(DefaultReplySurbRedundancy).expect(
-        "could not send first request"
+    # A later absolute snapshot acknowledges both sequences. Acknowledgement
+    # removes the retained serializations even if a retry deadline exists.
+    check session.applySurbSupplySnapshot(
+      SurbSupplySnapshot(
+        receiveBase: 2,
+        acknowledgementBitmap: newSeq[byte](SurbSupplyAckBitmapBytes),
+        supplyLimit: 2,
       )
-    let retryRequestId =
-      session.registerRefillRequest().expect("could not register retry request")
-    discard session.takeReceivedSurbs(DefaultReplySurbRedundancy).expect(
-        "could not send retry request"
-      )
-
-    check session.acceptRefillResponse(retryRequestId)
-    session.addReceivedSurbs(newSeq[SURB](DefaultRefillSurbs)).expect(
-      "could not add retry response SURBs"
     )
     check:
-      session.refillRequestDue
-      session.receivedSurbCount == ReplyControlReserveSurbs
-
-    check session.acceptRefillResponse(firstRequestId)
-    session.addReceivedSurbs(newSeq[SURB](DefaultRefillSurbs)).expect(
-      "could not add late response SURBs"
-    )
-    check:
-      not session.refillRequestDue
-      session.receivedSurbCount == 2 * ReplyControlReserveSurbs
-      not session.acceptRefillResponse(firstRequestId)
-
-  test "the oldest refill request is evicted when correlation state is full":
-    let
-      rng = newRng()
-      store = newSessionStore(
-        refillResponseLifetime = 30.minutes, maxOutstandingRefillRequests = 2
-      )
-      session = store.addRecipientSession(randomPeerId(rng)).expect(
-          "could not add recipient session"
-        )
-      now = Moment.now()
-
-    session.addReceivedSurbs(newSeq[SURB](ReplyControlReserveSurbs)).expect(
-      "could not add initial SURBs"
-    )
-    let
-      firstRequestId = session.registerRefillRequest(now).expect("first request")
-      secondRequestId =
-        session.registerRefillRequest(now + 1.seconds).expect("second request")
-      thirdRequestId =
-        session.registerRefillRequest(now + 2.seconds).expect("third request")
-
-    check:
-      session.outstandingRefillRequestCount == 2
-      not session.acceptRefillResponse(firstRequestId, now + 3.seconds)
-      session.acceptRefillResponse(secondRequestId, now + 3.seconds)
-      session.acceptRefillResponse(thirdRequestId, now + 3.seconds)
+      session.pendingSurbSupplyCount == 0
+      session.earliestSurbSupplyRetransmission().isNone
 
   test "duplicate indexes are rejected without replacing existing sessions":
     let

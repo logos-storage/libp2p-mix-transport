@@ -20,10 +20,11 @@ const
   DefaultStreamOpenTimeout* = 30.seconds
   DefaultRefillRequestTimeout* = 30.seconds
   DefaultDataRetransmissionTimeout* = 30.seconds
+  DefaultSurbSupplyRetransmissionTimeout* = 30.seconds
+  DefaultSurbStatusProbeInterval* = 2.minutes
   MinimumConnectReplySurbs* = ReplyControlReserveSurbs
   DefaultConnectReplySurbs* = MinimumConnectReplySurbs
-  DefaultOpenStreamReplySurbs* = 4
-  DefaultRefillSurbs* = MaxRefillSurbsPerFrame.int
+  DefaultOpenStreamReplySurbs* = DefaultReplySurbRedundancy
   UnknownStreamRejectionReason = "remote rejected the stream for an unknown reason"
 
 type MixTransport* = ref object
@@ -34,20 +35,23 @@ type MixTransport* = ref object
   streamOpenTimeout: Duration
   refillRequestTimeout: Duration
   dataRetransmissionTimeout: Duration
+  surbSupplyRetransmissionTimeout: Duration
+  surbStatusProbeInterval: Duration
   dataRetransmissionsEnabled: bool
+  proactiveSurbReplenishmentEnabled: bool
   started: bool
 
 type PreparedReplySurbs = object
   encoded: seq[seq[byte]]
   credentials: seq[ReplyCredential]
 
-proc handleRefillRequest(
-  self: MixTransport, session: TransportSession, frame: MixTransportFrame
-): Future[void] {.async: (raises: [CancelledError]).}
-
 proc handleData(self: MixTransport, frame: MixTransportFrame) {.gcsafe, raises: [].}
 proc handleAcknowledgement(
   self: MixTransport, frame: MixTransportFrame
+) {.gcsafe, raises: [].}
+
+proc startSurbSupplier(
+  self: MixTransport, session: TransportSession
 ) {.gcsafe, raises: [].}
 
 proc runProtocolHandler(
@@ -64,17 +68,42 @@ proc runProtocolHandler(
   let handler: LPProtoHandler = protocol.handler
   await handler(stream, stream.codec)
 
+proc attachSurbSupplySnapshot(session: TransportSession, frame: var MixTransportFrame) =
+  let snapshot = session.surbSupplySnapshot()
+  frame.surbSupplyReceiveBase = Opt.some(snapshot.receiveBase)
+  frame.surbSupplyAcknowledgementBitmap = Opt.some(snapshot.acknowledgementBitmap)
+  frame.surbSupplyLimit = Opt.some(snapshot.supplyLimit)
+
+proc applySurbSupplySnapshot(
+    session: TransportSession, frame: MixTransportFrame
+): bool =
+  if frame.surbSupplyReceiveBase.isNone:
+    return true
+  session.applySurbSupplySnapshot(
+    SurbSupplySnapshot(
+      receiveBase: frame.surbSupplyReceiveBase.get(),
+      acknowledgementBitmap: frame.surbSupplyAcknowledgementBitmap.get(),
+      supplyLimit: frame.surbSupplyLimit.get(),
+    )
+  )
+
 proc handleReplyFrame(
     self: MixTransport, frame: MixTransportFrame
 ): Future[void] {.async: (raises: [CancelledError]).} =
   let session = self.sessions.get(frame.sessionId).valueOr:
     return
 
+  if not session.applySurbSupplySnapshot(frame):
+    return
+  if frame.surbSupplyReceiveBase.isSome:
+    session.noteReverseActivity(self.surbStatusProbeInterval)
+
   case frame.kind
   of FrameKind.ConnectAck:
     if session.role != SessionRole.Initiator or session.state != SessionState.Pending:
       return
     session.establish()
+    self.startSurbSupplier(session)
   of FrameKind.StreamAck, FrameKind.StreamReject:
     if session.state != SessionState.Established:
       return
@@ -97,7 +126,9 @@ proc handleReplyFrame(
   of FrameKind.RefillRequest:
     if session.role == SessionRole.Initiator and
         session.state == SessionState.Established:
-      await self.handleRefillRequest(session, frame)
+      session.requestSurbSupply()
+  of FrameKind.SurbStatus:
+    discard
   else:
     discard
 
@@ -121,24 +152,21 @@ proc requestRefill(
   if not session.refillRequestDue:
     return ok()
 
-  let refillRequestId = session.registerRefillRequest().valueOr:
-    return err(error)
-
   var replyBatch = session.takeReceivedSurbs(DefaultReplySurbRedundancy).valueOr:
-    session.cancelRefillRequest(refillRequestId)
+    session.scheduleNextRefillRequest(self.refillRequestTimeout)
+    if self.proactiveSurbReplenishmentEnabled:
+      return ok()
     return err("could not reserve SURBs for refill: " & error)
-  let request = MixTransportFrame(
+  var request = MixTransportFrame(
     version: MixTransportVersion,
     sessionId: session.sessionId,
     kind: FrameKind.RefillRequest,
-    refillRequestId: Opt.some(refillRequestId),
-    requestedSurbs: Opt.some(DefaultRefillSurbs.uint32),
-  ).encode().valueOr:
-    session.cancelRefillRequest(refillRequestId)
+  )
+  session.attachSurbSupplySnapshot(request)
+  let payload = request.encode().valueOr:
     return err("could not encode RefillRequest: " & error)
   session.scheduleNextRefillRequest(self.refillRequestTimeout)
-  (await self.sendWithSurbRedundancyBatch(replyBatch, request)).isOkOr:
-    session.cancelRefillRequest(refillRequestId)
+  (await self.sendWithSurbRedundancyBatch(replyBatch, payload)).isOkOr:
     return err("could not send RefillRequest: " & error)
   ok()
 
@@ -158,11 +186,10 @@ proc ensureUnreservedSurbs(
 proc sendStreamFrame(
     self: MixTransport, session: TransportSession, frame: MixTransportFrame
 ): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
-  let payload = frame.encode().valueOr:
-    return err("could not encode " & $frame.kind & " frame: " & error)
-
   case session.role
   of SessionRole.Initiator:
+    let payload = frame.encode().valueOr:
+      return err("could not encode " & $frame.kind & " frame: " & error)
     let destination = session.destination.valueOr:
       return err("initiator session has no destination")
     (
@@ -179,6 +206,10 @@ proc sendStreamFrame(
       return err(error)
     var replyBatch = session.takeUnreservedSurbs(DefaultReplySurbRedundancy).valueOr:
       return err(error)
+    var replyFrame = frame
+    session.attachSurbSupplySnapshot(replyFrame)
+    let payload = replyFrame.encode().valueOr:
+      return err("could not encode " & $frame.kind & " frame: " & error)
     (await self.sendWithSurbRedundancyBatch(replyBatch, payload)).isOkOr:
       return err("could not send " & $frame.kind & " frame: " & error)
     (await self.requestRefill(session)).isOkOr:
@@ -344,33 +375,32 @@ proc handleAcknowledgement(
     frame.receiveBase.get(), frame.acknowledgementBitmap.get()
   )
 
-proc handleRefill(self: MixTransport, frame: MixTransportFrame) {.gcsafe, raises: [].} =
+proc handleSurbSupply(
+    self: MixTransport, frame: MixTransportFrame
+) {.gcsafe, raises: [].} =
   let session = self.sessions.get(frame.sessionId).valueOr:
-    debug "Dropping Refill frame for unknown session", sessionId = frame.sessionId
+    debug "Dropping SurbSupply frame for unknown session", sessionId = frame.sessionId
     return
   if session.role != SessionRole.Recipient:
-    debug "Dropping Refill frame for session with unexpected role",
+    debug "Dropping SurbSupply frame for session with unexpected role",
       sessionId = frame.sessionId, sessionRole = session.role
     return
   if session.state != SessionState.Established:
-    debug "Dropping Refill frame because session is not established",
+    debug "Dropping SurbSupply frame because session is not established",
       sessionId = frame.sessionId, sessionState = session.state
     return
 
-  let refillRequestId = frame.refillRequestId.get()
-  if not session.acceptRefillResponse(refillRequestId):
-    return
-
-  var decodedSurbs = newSeqOfCap[SURB](frame.surbs.len)
-  for encodedSurb in frame.surbs:
+  let firstSequence = frame.firstSurbSequence.get()
+  for index, encodedSurb in frame.surbs:
+    let sequence = firstSequence + SurbSupplySequence(index)
     let surb = encodedSurb.deserializeSurb().valueOr:
       continue
-    decodedSurbs.add(surb)
-  discard session.addReceivedSurbs(decodedSurbs)
+    discard session.acceptSurbSupply(sequence, surb)
 
 proc sendStreamResponse(
     self: MixTransport,
     session: TransportSession,
+    replyBatch: sink seq[SURB],
     streamId: StreamId,
     kind: FrameKind,
     rejectionReason = "",
@@ -384,9 +414,7 @@ proc sendStreamResponse(
     else:
       rejectionReason
 
-  var replyBatch = session.takeReceivedSurbs(DefaultReplySurbRedundancy).valueOr:
-    return false
-  let response = MixTransportFrame(
+  var response = MixTransportFrame(
     version: MixTransportVersion,
     sessionId: session.sessionId,
     kind: kind,
@@ -396,9 +424,11 @@ proc sendStreamResponse(
         Opt.some(boundedRejectionReason)
       else:
         Opt.none(string),
-  ).encode().valueOr:
+  )
+  session.attachSurbSupplySnapshot(response)
+  let payload = response.encode().valueOr:
     return false
-  (await self.sendWithSurbRedundancyBatch(replyBatch, response)).isOk
+  (await self.sendWithSurbRedundancyBatch(replyBatch, payload)).isOk
 
 proc handleConnect(
     self: MixTransport, frame: MixTransportFrame
@@ -426,15 +456,19 @@ proc handleConnect(
 
   var replyBatch = session.takeReceivedSurbs(DefaultReplySurbRedundancy).valueOr:
     return
-  let acknowledgement = MixTransportFrame(
+  session.initializeSurbSupply().isOkOr:
+    return
+  var acknowledgement = MixTransportFrame(
     version: MixTransportVersion, sessionId: frame.sessionId, kind: FrameKind.ConnectAck
-  ).encode().valueOr:
+  )
+  session.attachSurbSupplySnapshot(acknowledgement)
+  let payload = acknowledgement.encode().valueOr:
     return
 
   # ConnectAck allows the initiator to send session traffic immediately. Make
   # the recipient ready before the first redundant ACK copy can arrive.
   session.establish()
-  (await self.sendWithSurbRedundancyBatch(replyBatch, acknowledgement)).isOkOr:
+  (await self.sendWithSurbRedundancyBatch(replyBatch, payload)).isOkOr:
     return
   keepSession = true
 
@@ -458,12 +492,16 @@ proc handleOpenStream(
     let surb = encodedSurb.deserializeSurb().valueOr:
       continue
     decodedSurbs.add(surb)
-  session.addReceivedSurbs(decodedSurbs).isOkOr:
+  if decodedSurbs.len < DefaultReplySurbRedundancy:
     return
+  var replyBatch = newSeqOfCap[SURB](DefaultReplySurbRedundancy)
+  for index in 0 ..< DefaultReplySurbRedundancy:
+    replyBatch.add(move(decodedSurbs[index]))
 
   let protocol = self.mix.switch.ms.lookupProtocol(frame.codec.get()).valueOr:
     discard await self.sendStreamResponse(
       session,
+      move(replyBatch),
       frame.streamId.get(),
       FrameKind.StreamReject,
       "requested protocol is not supported",
@@ -473,6 +511,7 @@ proc handleOpenStream(
   if not protocol.reserveIncoming(session.peerId):
     discard await self.sendStreamResponse(
       session,
+      move(replyBatch),
       frame.streamId.get(),
       FrameKind.StreamReject,
       "requested protocol cannot accept another incoming stream",
@@ -487,7 +526,11 @@ proc handleOpenStream(
   let streamResult = session.addInboundStream(frame.streamId.get(), frame.codec.get())
   if streamResult.isErr:
     discard await self.sendStreamResponse(
-      session, frame.streamId.get(), FrameKind.StreamReject, streamResult.error
+      session,
+      move(replyBatch),
+      frame.streamId.get(),
+      FrameKind.StreamReject,
+      streamResult.error,
     )
     return
   let stream = streamResult.get()
@@ -501,7 +544,9 @@ proc handleOpenStream(
   # bounded receive path before the first redundant ACK copy can arrive.
   self.configureStream(session, stream)
   stream.establish()
-  if not await self.sendStreamResponse(session, stream.streamId, FrameKind.StreamAck):
+  if not await self.sendStreamResponse(
+    session, move(replyBatch), stream.streamId, FrameKind.StreamAck
+  ):
     return
 
   keepStream = true
@@ -510,6 +555,34 @@ proc handleOpenStream(
   if not handlerTask.finished:
     stream.setHandlerTask(handlerTask)
   discard await self.requestRefill(session)
+
+proc handleSurbStatusProbe(
+    self: MixTransport, frame: MixTransportFrame
+): Future[void] {.async: (raises: [CancelledError]).} =
+  let session = self.sessions.get(frame.sessionId).valueOr:
+    return
+  if session.role != SessionRole.Recipient or session.state != SessionState.Established:
+    return
+
+  var replyBatch = newSeqOfCap[SURB](DefaultReplySurbRedundancy)
+  for encodedSurb in frame.surbs:
+    let surb = encodedSurb.deserializeSurb().valueOr:
+      continue
+    replyBatch.add(surb)
+    if replyBatch.len == DefaultReplySurbRedundancy:
+      break
+  if replyBatch.len < DefaultReplySurbRedundancy:
+    return
+
+  var response = MixTransportFrame(
+    version: MixTransportVersion,
+    sessionId: session.sessionId,
+    kind: FrameKind.SurbStatus,
+  )
+  session.attachSurbSupplySnapshot(response)
+  let payload = response.encode().valueOr:
+    return
+  discard await self.sendWithSurbRedundancyBatch(replyBatch, payload)
 
 proc handleDelivery(
     self: MixTransport, delivery: MixDelivery
@@ -525,8 +598,10 @@ proc handleDelivery(
     self.handleData(frame)
   of FrameKind.Ack:
     self.handleAcknowledgement(frame)
-  of FrameKind.Refill:
-    self.handleRefill(frame)
+  of FrameKind.SurbSupply:
+    self.handleSurbSupply(frame)
+  of FrameKind.SurbStatusProbe:
+    await self.handleSurbStatusProbe(frame)
   else:
     discard
 
@@ -554,9 +629,11 @@ proc newMixTransport*(
     streamOpenTimeout = DefaultStreamOpenTimeout,
     refillRequestTimeout = DefaultRefillRequestTimeout,
     dataRetransmissionTimeout = DefaultDataRetransmissionTimeout,
+    surbSupplyRetransmissionTimeout = DefaultSurbSupplyRetransmissionTimeout,
+    surbStatusProbeInterval = DefaultSurbStatusProbeInterval,
     enableDataRetransmissions = true,
-    refillResponseLifetime = DefaultRefillResponseLifetime,
-    maxOutstandingRefillRequests = DefaultMaxOutstandingRefillRequests,
+    enableProactiveSurbReplenishment = true,
+    recipientSurbCapacity = DefaultRecipientSurbCapacity,
 ): MixTransport =
   doAssert not mix.isNil, "MixProtocol must not be nil"
   doAssert connectTimeout > ZeroDuration, "connect timeout must be positive"
@@ -565,15 +642,22 @@ proc newMixTransport*(
     "refill request timeout must be positive"
   doAssert dataRetransmissionTimeout > ZeroDuration,
     "Data retransmission timeout must be positive"
+  doAssert surbSupplyRetransmissionTimeout > ZeroDuration,
+    "SURB supply retransmission timeout must be positive"
+  doAssert surbStatusProbeInterval > ZeroDuration,
+    "SURB status probe interval must be positive"
   MixTransport(
     mix: mix,
     replyCredentials: ReplyCredentialStore.new(),
-    sessions: newSessionStore(refillResponseLifetime, maxOutstandingRefillRequests),
+    sessions: newSessionStore(recipientSurbCapacity),
     connectTimeout: connectTimeout,
     streamOpenTimeout: streamOpenTimeout,
     refillRequestTimeout: refillRequestTimeout,
     dataRetransmissionTimeout: dataRetransmissionTimeout,
+    surbSupplyRetransmissionTimeout: surbSupplyRetransmissionTimeout,
+    surbStatusProbeInterval: surbStatusProbeInterval,
     dataRetransmissionsEnabled: enableDataRetransmissions,
+    proactiveSurbReplenishmentEnabled: enableProactiveSurbReplenishment,
   )
 
 proc createReplySurbs(
@@ -601,26 +685,143 @@ proc retireReplyCredentials(
 ) =
   self.replyCredentials.consume(credentials)
 
-proc handleRefillRequest(
-    self: MixTransport, session: TransportSession, frame: MixTransportFrame
+proc sendSurbSupply(
+    self: MixTransport,
+    session: TransportSession,
+    firstSequence: SurbSupplySequence,
+    encodedSurbs: seq[seq[byte]],
+): Future[void] {.async: (raises: [CancelledError]).} =
+  let frame = MixTransportFrame(
+    version: MixTransportVersion,
+    sessionId: session.sessionId,
+    kind: FrameKind.SurbSupply,
+    firstSurbSequence: Opt.some(firstSequence),
+    surbs: encodedSurbs,
+  )
+  let sent = await self.sendStreamFrame(session, frame)
+  if sent.isErr:
+    debug "Could not send SURB supply",
+      sessionId = session.sessionId, firstSequence, error = sent.error
+  session.scheduleSurbSupplyRetransmission(
+    firstSequence, encodedSurbs.len, self.surbSupplyRetransmissionTimeout
+  )
+
+proc createAndSendSurbSupply(
+    self: MixTransport, session: TransportSession, count: int
+): Future[bool] {.async: (raises: [CancelledError]).} =
+  let destination = session.destination.valueOr:
+    return false
+  let prepared = self.createReplySurbs(destination, session.sessionId, count).valueOr:
+    debug "Could not create proactive SURBs", sessionId = session.sessionId, error
+    return false
+  var credentialIdentifiers = newSeqOfCap[SURBIdentifier](prepared.credentials.len)
+  for credential in prepared.credentials:
+    credentialIdentifiers.add(credential.identifier)
+  let firstSequence = session.registerSurbSupply(
+    prepared.encoded, credentialIdentifiers
+  ).valueOr:
+    self.retireReplyCredentials(prepared.credentials)
+    debug "Could not register proactive SURBs", sessionId = session.sessionId, error
+    return false
+  await self.sendSurbSupply(session, firstSequence, prepared.encoded)
+  true
+
+proc retransmitSurbSupply(
+    self: MixTransport,
+    session: TransportSession,
+    sequence: SurbSupplySequence,
+    encodedSurb: seq[byte],
+): Future[void] {.async: (raises: [CancelledError]).} =
+  await self.sendSurbSupply(session, sequence, @[encodedSurb])
+
+proc sendSurbStatusProbe(
+    self: MixTransport, session: TransportSession
 ): Future[void] {.async: (raises: [CancelledError]).} =
   let destination = session.destination.valueOr:
     return
   let prepared = self.createReplySurbs(
-    destination, session.sessionId, frame.requestedSurbs.get().int
+    destination, session.sessionId, DefaultReplySurbRedundancy
   ).valueOr:
+    debug "Could not create SURB status probe reply paths",
+      sessionId = session.sessionId, error
     return
-
-  let refill = MixTransportFrame(
+  let probe = MixTransportFrame(
     version: MixTransportVersion,
     sessionId: session.sessionId,
-    kind: FrameKind.Refill,
-    refillRequestId: frame.refillRequestId,
+    kind: FrameKind.SurbStatusProbe,
     surbs: prepared.encoded,
   )
-  (await self.sendStreamFrame(session, refill)).isOkOr:
+  (await self.sendStreamFrame(session, probe)).isOkOr:
     self.retireReplyCredentials(prepared.credentials)
     return
+
+proc runSurbSupplier(
+    self: MixTransport, session: TransportSession
+) {.async: (raises: [CancelledError]), gcsafe.} =
+  defer:
+    session.clearSurbSupplierTask()
+
+  session.noteReverseActivity(self.surbStatusProbeInterval)
+  while session.state == SessionState.Established:
+    session.clearSurbSupplyStateChanged()
+
+    let shouldCreateSupply =
+      self.proactiveSurbReplenishmentEnabled or session.isSurbSupplyRequested
+    if shouldCreateSupply and session.availableSurbSupplySlots > 0:
+      let count = min(MaxSurbSupplyPerFrame, session.availableSurbSupplySlots)
+      if await self.createAndSendSurbSupply(session, count):
+        continue
+
+    if session.isSurbSupplyRequested and session.availableSurbSupplySlots == 0:
+      session.clearSurbSupplyRequest()
+
+    let retransmission = session.takeDueSurbSupplyRetransmission()
+    if retransmission.isSome:
+      let value = retransmission.get()
+      discard self.replyCredentials.purgeExpired()
+      if self.replyCredentials.get(value.credentialIdentifier).isNone:
+        session.removePendingSurbSupply(value.sequence)
+        debug "Discarding pending SURB supply without an active reply credential",
+          sessionId = session.sessionId, sequence = value.sequence
+        continue
+      await self.retransmitSurbSupply(session, value.sequence, value.encodedSurb)
+      continue
+
+    let probeWait = session.timeUntilSurbStatusProbe()
+    let statusProbeIsDue =
+      self.proactiveSurbReplenishmentEnabled and probeWait.isSome and
+      probeWait.get() <= ZeroDuration
+    if statusProbeIsDue:
+      await self.sendSurbStatusProbe(session)
+      session.noteReverseActivity(self.surbStatusProbeInterval)
+      continue
+
+    var waitTime = Opt.none(Duration)
+    session.earliestSurbSupplyRetransmission().withValue(deadline):
+      waitTime = Opt.some(
+        if deadline <= Moment.now():
+          ZeroDuration
+        else:
+          deadline - Moment.now()
+      )
+    if self.proactiveSurbReplenishmentEnabled:
+      probeWait.withValue(value):
+        if waitTime.isNone or value < waitTime.get():
+          waitTime = Opt.some(value)
+
+    waitTime.withValue(value):
+      if value <= ZeroDuration:
+        continue
+      discard await session.waitForSurbSupplyStateChange().withTimeout(value)
+      continue
+    await session.waitForSurbSupplyStateChange()
+
+proc startSurbSupplier(
+    self: MixTransport, session: TransportSession
+) {.gcsafe, raises: [].} =
+  let task = self.runSurbSupplier(session)
+  if not task.finished:
+    session.setSurbSupplierTask(task)
 
 proc createConnectFrame(
     self: MixTransport, destination: PeerId, sessionId: PeerId

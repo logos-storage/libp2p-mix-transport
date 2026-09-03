@@ -40,6 +40,16 @@ suite "MixTransport lifecycle":
       defaultTransport.dataRetransmissionsEnabled
       not retransmissionsDisabled.dataRetransmissionsEnabled
 
+  test "proactive SURB replenishment is enabled by default and can be disabled":
+    let
+      mix = createMixProtocol()
+      defaultTransport = newMixTransport(mix)
+      pullOnlyTransport = newMixTransport(mix, enableProactiveSurbReplenishment = false)
+
+    check:
+      defaultTransport.proactiveSurbReplenishmentEnabled
+      not pullOnlyTransport.proactiveSurbReplenishmentEnabled
+
   test "start and stop own the Mix plug-in registrations":
     let
       mix = createMixProtocol()
