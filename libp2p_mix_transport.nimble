@@ -19,7 +19,7 @@ requires "results >= 0.5.0"
 
 import os, strutils
 
-let
+var
   nimc = getEnv("NIMC", "nim")
   flags = getEnv("NIMFLAGS", "")
   styleFlags = "--styleCheck:usages --styleCheck:error"
@@ -44,4 +44,5 @@ task example, "Build examples":
   buildExample("mix_ping_quic.nim")
 
 task node, "Build standalone node":
+  flags &= " -d:release"
   compile("tools/node/cli.nim", "tools/node/node")
