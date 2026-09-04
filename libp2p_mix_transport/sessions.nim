@@ -11,16 +11,12 @@ import libp2p/utils/opt
 import libp2p_mix
 import ./streams
 from ./wire import
-  MaxSessionIdBytes, MaxSurbSupplySequence, SurbSupplyAckBitmapBytes,
-  SurbSupplySequence, SurbSupplyWindow, StreamId
+  DefaultReplySurbRedundancy, MaxSessionIdBytes, MaxSurbSupplySequence,
+  SurbSupplyAckBitmapBytes, SurbSupplySequence, SurbSupplyWindow, StreamId
 
-const
-  DefaultReplySurbRedundancy* = 2
-  ReplyControlReserveBatches* = 2
-  ReplyControlReserveSurbs* = ReplyControlReserveBatches * DefaultReplySurbRedundancy
-  ReplyRefillLowWatermarkSurbs* = ReplyControlReserveSurbs
-  MinimumRecipientSurbCapacity* = ReplyControlReserveSurbs + DefaultReplySurbRedundancy
-  DefaultRecipientSurbCapacity* = 16
+const DefaultRecipientSurbCapacity* = 16
+
+export DefaultReplySurbRedundancy
 
 type
   SessionRole* {.pure.} = enum
@@ -62,15 +58,14 @@ type
     surbSupplyLimit: SurbSupplySequence
     replyCapacityStateChanged: AsyncEvent
     replySendLock: AsyncLock
-    nextRefillRequestAt: Opt[Moment]
     remoteSurbSupplyReceiveBase: SurbSupplySequence
     remoteSurbSupplyLimit: SurbSupplySequence
     nextSurbSupplySequence: Opt[SurbSupplySequence]
     pendingSurbSupply: Table[SurbSupplySequence, PendingSurbSupply]
-    surbSupplyRequested: bool
     surbSupplyStateChanged: AsyncEvent
     surbSupplierTask: Future[void].Raising([CancelledError])
     nextSurbStatusProbeAt: Opt[Moment]
+    unansweredSurbStatusProbes: int
     streams: Table[StreamId, TransportStream]
     nextOutboundStreamId: Opt[StreamId]
 
@@ -151,7 +146,6 @@ proc addInitiatorSession*(
     surbSupplyAcknowledgementBitmap: newSeq[byte](SurbSupplyAckBitmapBytes),
     replyCapacityStateChanged: newAsyncEvent(),
     replySendLock: newAsyncLock(),
-    nextRefillRequestAt: Opt.none(Moment),
     nextSurbSupplySequence: Opt.some(SurbSupplySequence(0)),
     pendingSurbSupply: initTable[SurbSupplySequence, PendingSurbSupply](),
     surbSupplyStateChanged: newAsyncEvent(),
@@ -183,7 +177,6 @@ proc addRecipientSession*(
     surbSupplyAcknowledgementBitmap: newSeq[byte](SurbSupplyAckBitmapBytes),
     replyCapacityStateChanged: newAsyncEvent(),
     replySendLock: newAsyncLock(),
-    nextRefillRequestAt: Opt.none(Moment),
     nextSurbSupplySequence: Opt.some(SurbSupplySequence(0)),
     pendingSurbSupply: initTable[SurbSupplySequence, PendingSurbSupply](),
     surbSupplyStateChanged: newAsyncEvent(),
@@ -213,8 +206,6 @@ proc addReceivedSurbs*(
   for surb in surbs.mitems:
     session.receivedSurbs.addLast(move(surb))
   if surbs.len > 0:
-    if session.receivedSurbs.len > ReplyRefillLowWatermarkSurbs:
-      session.nextRefillRequestAt = Opt.none(Moment)
     session.replyCapacityStateChanged.fire()
   ok()
 
@@ -235,16 +226,6 @@ proc takeReceivedSurbs*(
   if session.surbSupplyInitialized:
     session.surbSupplyLimit += SurbSupplySequence(count)
   ok(surbs)
-
-proc takeUnreservedSurbs*(
-    session: TransportSession, count: int
-): Result[seq[SURB], string] =
-  if count <= 0:
-    return err("SURB count must be positive")
-  if session.receivedSurbs.len < count or
-      session.receivedSurbs.len - count < ReplyControlReserveSurbs:
-    return err("session reply capacity is reserved for control traffic")
-  session.takeReceivedSurbs(count)
 
 func bitmapContains(bitmap: openArray[byte], offset: SurbSupplySequence): bool =
   let
@@ -315,8 +296,6 @@ proc acceptSurbSupply*(
     doAssert session.surbSupplyReceiveBase < SurbSupplySequence.high
     session.shiftSupplyBitmap()
     inc session.surbSupplyReceiveBase
-  if session.receivedSurbs.len > ReplyRefillLowWatermarkSurbs:
-    session.nextRefillRequestAt = Opt.none(Moment)
   session.replyCapacityStateChanged.fire()
   SurbSupplyDisposition.Accepted
 
@@ -338,30 +317,6 @@ proc releaseReplySend*(session: TransportSession) =
     session.replySendLock.release()
   except AsyncLockError as exc:
     raiseAssert "session reply-send lock was not held: " & exc.msg
-
-func refillRequestDue*(session: TransportSession, now: Moment = Moment.now()): bool =
-  if session.role != SessionRole.Recipient or
-      session.receivedSurbs.len > ReplyRefillLowWatermarkSurbs:
-    return false
-  let nextRefillRequestAt = session.nextRefillRequestAt.valueOr:
-    return true
-  nextRefillRequestAt <= now
-
-func timeUntilNextRefillRequest*(
-    session: TransportSession, now: Moment = Moment.now()
-): Duration =
-  let nextRefillRequestAt = session.nextRefillRequestAt.valueOr:
-    return ZeroDuration
-  if nextRefillRequestAt <= now:
-    ZeroDuration
-  else:
-    nextRefillRequestAt - now
-
-proc scheduleNextRefillRequest*(
-    session: TransportSession, delay: Duration, now: Moment = Moment.now()
-) =
-  doAssert delay > ZeroDuration, "refill request delay must be positive"
-  session.nextRefillRequestAt = Opt.some(now + delay)
 
 func availableSurbSupplySlots*(session: TransportSession): int =
   if session.role != SessionRole.Initiator:
@@ -405,6 +360,38 @@ proc registerSurbSupply*(
       inc sequence
       session.nextSurbSupplySequence = Opt.some(sequence)
   ok(firstSequence)
+
+proc registerInitialSurbSupply*(
+    session: TransportSession,
+    encodedSurbs: openArray[seq[byte]],
+    credentialIdentifiers: openArray[SURBIdentifier],
+): Result[SurbSupplySequence, string] =
+  if session.role != SessionRole.Initiator:
+    return err("only initiator sessions can supply SURBs")
+  if session.nextSurbSupplySequence != Opt.some(SurbSupplySequence(0)) or
+      session.pendingSurbSupply.len != 0:
+    return err("initial SURB supply is already registered")
+  if encodedSurbs.len == 0:
+    return err("initial SURB supply must not be empty")
+  if credentialIdentifiers.len != encodedSurbs.len:
+    return err("every supplied SURB must have a reply credential identifier")
+
+  var sequence = SurbSupplySequence(0)
+  for index, encodedSurb in encodedSurbs:
+    session.pendingSurbSupply[sequence] = PendingSurbSupply(
+      encodedSurb: encodedSurb,
+      credentialIdentifier: credentialIdentifiers[index],
+      nextRetransmissionAt: Opt.none(Moment),
+    )
+    inc sequence
+  session.nextSurbSupplySequence = Opt.some(sequence)
+  ok(SurbSupplySequence(0))
+
+proc removePendingSurbSupply*(
+    session: TransportSession, firstSequence: SurbSupplySequence, count: int
+) =
+  for offset in 0 ..< count:
+    session.pendingSurbSupply.del(firstSequence + SurbSupplySequence(offset))
 
 proc scheduleSurbSupplyRetransmission*(
     session: TransportSession,
@@ -513,17 +500,6 @@ proc applySurbSupplySnapshot*(
     session.surbSupplyStateChanged.fire()
   true
 
-proc requestSurbSupply*(session: TransportSession) =
-  if session.role == SessionRole.Initiator:
-    session.surbSupplyRequested = true
-    session.surbSupplyStateChanged.fire()
-
-func isSurbSupplyRequested*(session: TransportSession): bool =
-  session.surbSupplyRequested
-
-proc clearSurbSupplyRequest*(session: TransportSession) =
-  session.surbSupplyRequested = false
-
 proc clearSurbSupplyStateChanged*(session: TransportSession) =
   session.surbSupplyStateChanged.clear()
 
@@ -545,8 +521,20 @@ proc noteReverseActivity*(
     session: TransportSession, probeInterval: Duration, now: Moment = Moment.now()
 ) =
   doAssert probeInterval > ZeroDuration, "SURB status probe interval must be positive"
+  session.unansweredSurbStatusProbes = 0
   session.nextSurbStatusProbeAt = Opt.some(now + probeInterval)
   session.surbSupplyStateChanged.fire()
+
+proc recordSurbStatusProbeAttempt*(
+    session: TransportSession, retryInterval: Duration, now: Moment = Moment.now()
+) =
+  doAssert retryInterval > ZeroDuration,
+    "SURB status probe retry interval must be positive"
+  inc session.unansweredSurbStatusProbes
+  session.nextSurbStatusProbeAt = Opt.some(now + retryInterval)
+
+func unansweredSurbStatusProbeCount*(session: TransportSession): int =
+  session.unansweredSurbStatusProbes
 
 func timeUntilSurbStatusProbe*(
     session: TransportSession, now: Moment = Moment.now()
@@ -671,8 +659,8 @@ proc takeSessions*(store: SessionStore): seq[TransportSession] =
 proc newSessionStore*(
     recipientSurbCapacity = DefaultRecipientSurbCapacity
 ): SessionStore =
-  doAssert recipientSurbCapacity >= MinimumRecipientSurbCapacity,
-    "recipient SURB capacity must hold the control reserve and one reply batch"
+  doAssert recipientSurbCapacity >= DefaultReplySurbRedundancy,
+    "recipient SURB capacity must hold one reply redundancy batch"
   doAssert recipientSurbCapacity <= int(SurbSupplySequence.high),
     "recipient SURB capacity exceeds the supply credit space"
   SessionStore(

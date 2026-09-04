@@ -17,7 +17,7 @@ type
 
 const
   MixTransportCodec* = "/libp2p/mix-transport/1.0.0"
-  MixTransportVersion* = 1'u32
+  MixTransportVersion* = 2'u32
   MaxCodecBytes* = 255
   MaxStreamRejectionReasonBytes* = 255
   ReceiveWindowChunks* = 256
@@ -26,6 +26,7 @@ const
   SurbSupplyWindow* = 256
   SurbSupplyAckBitmapBytes* = SurbSupplyWindow div 8
   MaxSurbSupplyPerFrame* = 4
+  DefaultReplySurbRedundancy* = 2
   MaxSessionIdBytes* = 39
   MaxDataSequenceNumber* = SequenceNumber.high - 1
   MaxSurbSupplySequence* = SurbSupplySequence.high - 1
@@ -73,16 +74,14 @@ type
     StreamAck = 4
     Data = 5
     Ack = 6
-    RefillRequest = 7
-    Refill = 8
-    CloseStream = 9
-    ResetStream = 10
-    Disconnect = 11
-    ResetSession = 12
-    StreamReject = 13
-    SurbSupply = 14
-    SurbStatusProbe = 15
-    SurbStatus = 16
+    CloseStream = 7
+    ResetStream = 8
+    Disconnect = 9
+    ResetSession = 10
+    StreamReject = 11
+    SurbSupply = 12
+    SurbStatusProbe = 13
+    SurbStatus = 14
 
   MixTransportFrame* {.proto2.} = object
     version* {.fieldNumber: 1, required, pint.}: uint32
@@ -145,7 +144,7 @@ proc validateFrame(
     mayCarrySurbSupplyState =
       frame.kind in {
         FrameKind.ConnectAck, FrameKind.StreamAck, FrameKind.StreamReject,
-        FrameKind.Data, FrameKind.Ack, FrameKind.RefillRequest, FrameKind.SurbStatus,
+        FrameKind.Data, FrameKind.Ack, FrameKind.SurbStatus,
       }
 
   require frame.streamId.isSome == isStreamFrame,
@@ -164,8 +163,23 @@ proc validateFrame(
   require frame.acknowledgementBitmap.isNone or
     frame.acknowledgementBitmap.get().len == AckBitmapBytes,
     "acknowledgement bitmap has the wrong size"
-  require frame.firstSurbSequence.isSome == (frame.kind == FrameKind.SurbSupply),
-    "firstSurbSequence does not match the frame kind"
+  let carriesNumberedSurbSupply =
+    frame.kind == FrameKind.SurbSupply or (
+      frame.kind in {FrameKind.Connect, FrameKind.OpenStream} and
+      frame.surbs.len > DefaultReplySurbRedundancy
+    )
+  require frame.firstSurbSequence.isSome == carriesNumberedSurbSupply,
+    "firstSurbSequence does not match the supplied SURBs"
+  if carriesNumberedSurbSupply:
+    let suppliedSurbCount =
+      if frame.kind == FrameKind.SurbSupply:
+        frame.surbs.len
+      else:
+        frame.surbs.len - DefaultReplySurbRedundancy
+    require frame.firstSurbSequence.get() <= MaxSurbSupplySequence,
+      "SURB supply sequence space is exhausted"
+    require uint64(frame.firstSurbSequence.get()) + uint64(suppliedSurbCount - 1) <=
+      uint64(MaxSurbSupplySequence), "SURB supply sequence range is exhausted"
   require not carriesSurbSupplyState or mayCarrySurbSupplyState,
     "SURB supply state does not match the frame kind"
   require frame.surbSupplyReceiveBase.isSome == carriesSurbSupplyState and
@@ -181,11 +195,14 @@ proc validateFrame(
 
   case frame.kind
   of FrameKind.Connect:
-    require frame.surbs.len > 0, "connect must provide at least one SURB"
-  of FrameKind.ConnectAck, FrameKind.RefillRequest, FrameKind.SurbStatus:
+    require frame.surbs.len >= DefaultReplySurbRedundancy,
+      "connect must provide one reply redundancy batch"
+  of FrameKind.ConnectAck, FrameKind.SurbStatus:
     require carriesSurbSupplyState, "frame must provide SURB supply state"
   of FrameKind.OpenStream:
     require frame.codec.get().len > 0, "application codec must not be empty"
+    require frame.surbs.len >= DefaultReplySurbRedundancy,
+      "open stream must provide one reply redundancy batch"
   of FrameKind.Data:
     require frame.sequence.get() > 0, "data sequence must not be zero"
     require frame.sequence.get() <= MaxDataSequenceNumber,
@@ -193,15 +210,12 @@ proc validateFrame(
     require frame.payload.get().len > 0, "data payload must not be empty"
     require frame.payload.get().len <= MaxDataPayloadBytes, "data payload is too large"
   of FrameKind.SurbSupply:
-    require frame.firstSurbSequence.get() <= MaxSurbSupplySequence,
-      "SURB supply sequence space is exhausted"
     require frame.surbs.len > 0, "SURB supply must provide at least one SURB"
     require frame.surbs.len <= MaxSurbSupplyPerFrame,
       "SURB supply provides too many SURBs"
-    require uint64(frame.firstSurbSequence.get()) + uint64(frame.surbs.len - 1) <=
-      uint64(MaxSurbSupplySequence), "SURB supply sequence range is exhausted"
   of FrameKind.SurbStatusProbe:
-    require frame.surbs.len > 0, "SURB status probe must provide reply SURBs"
+    require frame.surbs.len >= DefaultReplySurbRedundancy,
+      "SURB status probe must provide one reply redundancy batch"
   else:
     discard
 

@@ -122,9 +122,9 @@ type RoundTripOutcome = object
   receivedRequest: seq[byte]
   receivedResponse: seq[byte]
 
-proc establishSessionAndStream(
-    enableProactiveSurbReplenishment = true
-): Future[RoundTripOutcome] {.async: (raises: [CancelledError, LPError]).} =
+proc establishSessionAndStream(): Future[RoundTripOutcome] {.
+    async: (raises: [CancelledError, LPError])
+.} =
   let
     nodes = createMixNodes(5)
     initiatorMix = nodes[0]
@@ -133,13 +133,11 @@ proc establishSessionAndStream(
       initiatorMix,
       connectTimeout = TestOperationTimeout,
       streamOpenTimeout = TestOperationTimeout,
-      enableProactiveSurbReplenishment = enableProactiveSurbReplenishment,
     )
     recipient = newMixTransport(
       recipientMix,
       connectTimeout = TestOperationTimeout,
       streamOpenTimeout = TestOperationTimeout,
-      enableProactiveSurbReplenishment = enableProactiveSurbReplenishment,
     )
 
   # StreamAck confirms that the recipient has a mounted handler for the
@@ -200,13 +198,12 @@ proc establishSessionAndStream(
   let recipientSession = recipient.sessions.get(session.sessionId).expect(
       "recipient did not retain the established session"
     )
-  if enableProactiveSurbReplenishment:
-    while recipientSession.receivedSurbCount < recipientSession.recipientSurbCapacity:
-      recipientSession.clearReplyCapacityStateChanged()
-      if recipientSession.receivedSurbCount < recipientSession.recipientSurbCapacity:
-        let supplyChanged = recipientSession.waitForReplyCapacityStateChange()
-        if not await supplyChanged.withTimeout(TestOperationTimeout):
-          raise newException(LPError, "proactive SURB supply did not fill its credit")
+  while recipientSession.receivedSurbCount < recipientSession.recipientSurbCapacity:
+    recipientSession.clearReplyCapacityStateChanged()
+    if recipientSession.receivedSurbCount < recipientSession.recipientSurbCapacity:
+      let supplyChanged = recipientSession.waitForReplyCapacityStateChange()
+      if not await supplyChanged.withTimeout(TestOperationTimeout):
+        raise newException(LPError, "SURB supplier did not fill its credit")
   let initialRecipientReplySurbs = recipientSession.receivedSurbCount
 
   # dial reuses the established session, sends OpenStream, and returns only
@@ -233,8 +230,8 @@ proc establishSessionAndStream(
   let receivedRequest = await receivedRequestFuture
 
   # The handler writes its response through the same virtual connection. On
-  # the recipient this consumes one temporary SURB redundancy batch; low reply capacity is replenished
-  # before return traffic is allowed to consume SURBs above the control reserve.
+  # the recipient this consumes one temporary SURB redundancy batch. The
+  # supply snapshot carried by that response grants credit for replacing it.
   let receivedResponseFuture = initiatorStream.readLp(1024)
   if not await receivedResponseFuture.withTimeout(TestOperationTimeout):
     raise newException(LPError, "initiator did not receive stream response")
@@ -299,7 +296,7 @@ suite "MixTransport session and stream handshakes":
       outcome.rejectionError == "requested protocol is not supported"
       outcome.initiatorStreamCount == 1
       outcome.recipientStreamCount == 1
-      outcome.recipientReplySurbs >= ReplyControlReserveSurbs
+      outcome.recipientReplySurbs <= DefaultRecipientSurbCapacity
       outcome.handlerPeerId == outcome.session.sessionId
       outcome.handlerCodec == TestCodec
       outcome.handlerReceivedStream
@@ -322,12 +319,6 @@ suite "MixTransport session and stream handshakes":
         )
         .expect("could not add recipient session")
 
-    session.addReceivedSurbs(newSeq[SURB](ReplyControlReserveSurbs)).expect(
-      "could not add bootstrap reply SURBs"
-    )
-    discard session.takeReceivedSurbs(DefaultReplySurbRedundancy).expect(
-        "could not form the ConnectAck redundancy batch"
-      )
     session.initializeSurbSupply().expect("could not initialize SURB supply")
     session.establish()
 
@@ -358,16 +349,5 @@ suite "MixTransport session and stream handshakes":
     )
 
     check:
-      session.receivedSurbCount == ReplyControlReserveSurbs
+      session.receivedSurbCount == 2
       session.surbSupplySnapshot().receiveBase == 1
-      session.refillRequestDue
-
-  test "recipient refill requests activate supply in pull-only mode":
-    let outcome =
-      waitFor establishSessionAndStream(enableProactiveSurbReplenishment = false)
-
-    check:
-      outcome.initialRecipientReplySurbs ==
-        DefaultConnectReplySurbs - DefaultReplySurbRedundancy
-      outcome.receivedRequest == TestRequest.toBytes()
-      outcome.receivedResponse == TestResponse.toBytes()
