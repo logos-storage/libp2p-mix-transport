@@ -68,12 +68,19 @@ suite "MixTransport wire format":
         sequence: Opt.some(MaxDataSequenceNumber),
         payload: Opt.some(newSeq[byte](MaxDataPayloadBytes)),
       )
+    var reverseIdentifiers = largestIdentifiers
+    reverseIdentifiers.surbSupplyReceiveBase = Opt.some(SurbSupplySequence(0))
+    reverseIdentifiers.surbSupplyAcknowledgementBitmap =
+      Opt.some(newSeq[byte](SurbSupplyAckBitmapBytes))
+    reverseIdentifiers.surbSupplyLimit = Opt.some(SurbSupplySequence(16))
 
     check:
       sessionId.len == MaxSessionIdBytes
       smallIdentifiers.encode().expect("small identifiers did not encode").len ==
+        largestIdentifiers.encode().expect("largest identifiers did not encode").len
+      largestIdentifiers.encode().expect("largest identifiers did not encode").len <
         MaxTransportFrameBytes
-      largestIdentifiers.encode().expect("largest identifiers did not encode").len ==
+      reverseIdentifiers.encode().expect("reverse identifiers did not encode").len ==
         MaxTransportFrameBytes
 
     var oversized = largestIdentifiers
@@ -106,13 +113,13 @@ suite "MixTransport wire format":
     wrongSize.acknowledgementBitmap = Opt.some(newSeq[byte](AckBitmapBytes - 1))
     check wrongSize.encode().isErr
 
-  test "refill frame preserves grouped SURBs":
+  test "numbered supply frame preserves individual SURBs":
     let frame = MixTransportFrame(
       version: MixTransportVersion,
       sessionId: randomSessionId(),
-      kind: FrameKind.Refill,
-      refillRequestId: Opt.some(RefillRequestId(42)),
-      surbGroups: @[SurbGroup(surbs: @[newSeq[byte](SurbSize)])],
+      kind: FrameKind.SurbSupply,
+      firstSurbSequence: Opt.some(SurbSupplySequence(42)),
+      surbs: @[newSeq[byte](SurbSize), newSeq[byte](SurbSize)],
     )
 
     let decoded = MixTransportFrame
@@ -120,21 +127,66 @@ suite "MixTransport wire format":
       .expect("decode failed")
 
     check:
-      decoded.refillRequestId == frame.refillRequestId
-      decoded.surbGroups == frame.surbGroups
+      decoded.firstSurbSequence == frame.firstSurbSequence
+      decoded.surbs == frame.surbs
 
-  test "SURB groups use the canonical Mix serialization boundary":
-    let
-      original = @[testSurb(1), testSurb(2)]
-      group = SurbGroup.init(original).expect("could not encode SURB group")
-      decoded = group.decodeSurbs().expect("could not decode SURB group")
+  test "Connect uses all Sphinx payload space available for reply and bootstrap SURBs":
+    var frame = MixTransportFrame(
+      version: MixTransportVersion,
+      sessionId: randomSessionId(),
+      kind: FrameKind.Connect,
+      firstSurbSequence: Opt.some(SurbSupplySequence(0)),
+      surbs: newSeq[seq[byte]](5),
+    )
+    for surb in frame.surbs.mitems:
+      surb = newSeq[byte](SurbSize)
+
+    check frame.encode().isOk
+    frame.surbs.add(newSeq[byte](SurbSize))
+    check frame.encode().isErr
+
+  test "SURB supply state is an absolute fixed-size snapshot":
+    let frame = MixTransportFrame(
+      version: MixTransportVersion,
+      sessionId: randomSessionId(),
+      kind: FrameKind.SurbStatus,
+      surbSupplyReceiveBase: Opt.some(SurbSupplySequence(12)),
+      surbSupplyAcknowledgementBitmap: Opt.some(newSeq[byte](SurbSupplyAckBitmapBytes)),
+      surbSupplyLimit: Opt.some(SurbSupplySequence(28)),
+    )
+
+    let decoded = MixTransportFrame
+      .decode(frame.encode().expect("encode failed"))
+      .expect("decode failed")
 
     check:
-      decoded.len == original.len
-      decoded[0].serializeSurb() == original[0].serializeSurb()
-      decoded[1].serializeSurb() == original[1].serializeSurb()
-      SurbGroup.init(newSeq[SURB]()).isErr
-      SurbGroup(surbs: @[@[0'u8]]).decodeSurbs().isErr
+      decoded.surbSupplyReceiveBase == frame.surbSupplyReceiveBase
+      decoded.surbSupplyAcknowledgementBitmap == frame.surbSupplyAcknowledgementBitmap
+      decoded.surbSupplyLimit == frame.surbSupplyLimit
+
+    var incomplete = frame
+    incomplete.surbSupplyLimit = Opt.none(SurbSupplySequence)
+    var wrongBitmap = frame
+    wrongBitmap.surbSupplyAcknowledgementBitmap =
+      Opt.some(newSeq[byte](SurbSupplyAckBitmapBytes - 1))
+    check:
+      incomplete.encode().isErr
+      wrongBitmap.encode().isErr
+
+  test "each SURB uses the canonical Mix serialization boundary":
+    let
+      original = @[testSurb(1), testSurb(2)]
+      firstEncoded = original[0].serializeSurb()
+      secondEncoded = original[1].serializeSurb()
+      firstDecoded =
+        firstEncoded.deserializeSurb().expect("could not decode first SURB")
+      secondDecoded =
+        secondEncoded.deserializeSurb().expect("could not decode second SURB")
+
+    check:
+      firstDecoded.serializeSurb() == firstEncoded
+      secondDecoded.serializeSurb() == secondEncoded
+      @[0'u8].deserializeSurb().isErr
 
   test "frame fields must agree with their declared kind - e.g. ConnectAck should not include payload":
     let frame = MixTransportFrame(
@@ -146,7 +198,7 @@ suite "MixTransport wire format":
 
     check frame.encode().isErr
 
-  test "open stream does not require an attached SURB group":
+  test "open stream requires reply SURBs":
     let frame = MixTransportFrame(
       version: MixTransportVersion,
       sessionId: randomSessionId(),
@@ -155,7 +207,13 @@ suite "MixTransport wire format":
       codec: Opt.some("/example/1.0.0"),
     )
 
-    check frame.encode().isOk
+    check frame.encode().isErr
+
+    var withReplySurbs = frame
+    withReplySurbs.surbs = newSeq[seq[byte]](DefaultReplySurbRedundancy)
+    for surb in withReplySurbs.surbs.mitems:
+      surb = newSeq[byte](SurbSize)
+    check withReplySurbs.encode().isOk
 
   test "stream rejection identifies the stream it refuses":
     let frame = MixTransportFrame(

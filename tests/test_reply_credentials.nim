@@ -67,44 +67,46 @@ proc replyMessage(payload: seq[byte]): Message =
   )
 
 suite "MixTransport reply credentials":
-  test "the first successful reply consumes the complete redundancy group":
+  test "consuming one reply credential leaves other credentials active":
     let
       rng = newRng()
       store = ReplyCredentialStore.new()
       first = createReply(rng).credential
       second = createReply(rng).credential
-      group = store.addGroup(randomSessionId(rng), [first, second]).expect(
-          "could not add credential group"
-        )
+      sessionId = randomSessionId(rng)
 
-    # The original sender indexes both credentials while either redundant
-    # reply can still become the first valid one to arrive.
+    store.add(sessionId, [first, second]).expect("could not add reply credentials")
+
+    # Supplying SURBs registers their credentials independently. A redundancy
+    # batch is formed later by the recipient and is unknown to this store.
     check:
       store.len == 2
       store.get(first.identifier).isSome
       store.get(second.identifier).isSome
 
-    store.consume(group)
+    store.consume(first)
 
     check:
-      store.len == 0
-      store.retiredLen == 2
+      store.len == 1
+      store.retiredLen == 1
       store.get(first.identifier).isNone
-      store.get(second.identifier).isNone
+      store.get(second.identifier).isSome
       store.isRetiredIdentifier(first.identifier)
-      store.isRetiredIdentifier(second.identifier)
+      not store.isRetiredIdentifier(second.identifier)
 
     # Reusing an identifier while its tombstone is active would cause the raw
-    # reply handler to mistake the new reply for a late redundant packet.
-    check store.addGroup(randomSessionId(rng), [first]).isErr
+    # reply handler to mistake a new reply for a repeated one.
+    check store.add(randomSessionId(rng), [first]).isErr
 
-    # A late redundant reply may try to consume the group again.
-    store.consume(group)
+    # Consuming the same credential again is harmless and does not affect an
+    # independently registered credential.
+    store.consume(first)
     check:
-      store.len == 0
-      store.retiredLen == 2
+      store.len == 1
+      store.retiredLen == 1
+      store.get(second.identifier).isSome
 
-  test "capacity rejects a new group without evicting in-flight credentials":
+  test "capacity rejects new credentials without evicting active credentials":
     let
       rng = newRng()
       store = ReplyCredentialStore.new(maxCredentials = 2)
@@ -113,8 +115,8 @@ suite "MixTransport reply credentials":
       second = createReply(rng).credential
       rejected = createReply(rng).credential
 
-    check store.addGroup(sessionId, [first, second]).isOk
-    check store.addGroup(sessionId, [rejected]).isErr
+    check store.add(sessionId, [first, second]).isOk
+    check store.add(sessionId, [rejected]).isErr
     check:
       store.len == 2
       store.get(first.identifier).isSome
@@ -130,12 +132,12 @@ suite "MixTransport reply credentials":
       removed = createReply(rng).credential
       retained = createReply(rng).credential
 
-    discard store.addGroup(removedSessionId, [removed]).expect(
-        "could not add credentials for removed session"
-      )
-    discard store.addGroup(retainedSessionId, [retained]).expect(
-        "could not add credentials for retained session"
-      )
+    store.add(removedSessionId, [removed]).expect(
+      "could not add credentials for removed session"
+    )
+    store.add(retainedSessionId, [retained]).expect(
+      "could not add credentials for retained session"
+    )
 
     check store.removeSession(removedSessionId) == 1
     check:
@@ -152,15 +154,16 @@ suite "MixTransport reply credentials":
       first = createReply(rng).credential
       second = createReply(rng).credential
       createdAt = Moment.now()
-      group = store.addGroup(randomSessionId(rng), [first, second], createdAt).expect(
-          "could not add credential group"
-        )
+      sessionId = randomSessionId(rng)
 
-    store.consume(group, createdAt)
+    store.add(sessionId, [first, second], createdAt).expect(
+      "could not add reply credentials"
+    )
+    store.consume([first, second], createdAt)
 
     # The bound keeps only one tombstone. Which identifier remains depends on
     # hash-table iteration order, but either retained entry still suppresses a
-    # late redundant reply until the original credential group expires.
+    # repeated reply until the original credential expires.
     check:
       store.len == 0
       store.retiredLen == 1
@@ -183,9 +186,9 @@ suite "MixTransport reply credentials":
       credential = createReply(rng).credential
       createdAt = Moment.now()
 
-    discard store.addGroup(randomSessionId(rng), [credential], createdAt).expect(
-        "could not add credential group"
-      )
+    store.add(randomSessionId(rng), [credential], createdAt).expect(
+      "could not add reply credential"
+    )
 
     check:
       store.get(credential.identifier, createdAt).isSome
@@ -209,7 +212,7 @@ suite "MixTransport reply credentials":
       recovered.isNone
       store.len == 0
 
-  test "a valid reply is recovered and consumes its redundancy group":
+  test "each valid redundant reply consumes only its matching credential":
     let
       rng = newRng()
       store = ReplyCredentialStore.new()
@@ -218,9 +221,9 @@ suite "MixTransport reply credentials":
       second = createReply(rng)
       payload = @[1'u8, 2, 3]
 
-    discard store.addGroup(sessionId, [first.credential, second.credential]).expect(
-        "could not add credential group"
-      )
+    store.add(sessionId, [first.credential, second.credential]).expect(
+      "could not add reply credentials"
+    )
 
     # The recipient replies through the first public SURB. The original
     # sender recovers the payload with its matching private credential.
@@ -232,9 +235,21 @@ suite "MixTransport reply credentials":
     check:
       recovered.sessionId == sessionId
       recovered.payload == payload
+      store.len == 1
+      store.get(first.credential.identifier).isNone
+      store.get(second.credential.identifier).isSome
+
+    # Transport frame semantics suppress the second logical delivery after it
+    # is recovered. The credential store still processes each SURB separately.
+    let redundant = store
+      .recoverReply(second.rawReply(replyMessage(payload)))
+      .expect("could not recover redundant reply")
+      .get()
+    check:
+      redundant.payload == payload
       store.len == 0
 
-  test "invalid Sphinx recovery keeps the redundancy group available":
+  test "invalid Sphinx recovery keeps the matching credential available":
     let
       rng = newRng()
       store = ReplyCredentialStore.new()
@@ -242,9 +257,9 @@ suite "MixTransport reply credentials":
       first = createReply(rng)
       second = createReply(rng)
 
-    discard store.addGroup(sessionId, [first.credential, second.credential]).expect(
-        "could not add credential group"
-      )
+    store.add(sessionId, [first.credential, second.credential]).expect(
+      "could not add reply credentials"
+    )
 
     let invalid = RawSurbReply(
       identifier: first.credential.identifier,
@@ -252,13 +267,14 @@ suite "MixTransport reply credentials":
     )
 
     # Cryptographic recovery failed before decoding payload.
-    # Keep both credentials because the second redundant reply may be valid.
+    # Keep the matching credential because a later packet using the same SURB
+    # may be valid. The other credential remains independent as well.
     check store.recoverReply(invalid).isErr
     check:
       store.get(first.credential.identifier).isSome
       store.get(second.credential.identifier).isSome
 
-  test "an invalid Mix payload consumes the redundancy group":
+  test "an invalid Mix payload consumes only the matching credential":
     let
       rng = newRng()
       store = ReplyCredentialStore.new()
@@ -266,14 +282,18 @@ suite "MixTransport reply credentials":
       first = createReply(rng)
       second = createReply(rng)
 
-    discard store.addGroup(sessionId, [first.credential, second.credential]).expect(
-        "could not add credential group"
-      )
+    store.add(sessionId, [first.credential, second.credential]).expect(
+      "could not add reply credentials"
+    )
 
     let invalidMessage = @(uint16(DataSize + 1).toBytesBE()) & newSeq[byte](DataSize)
 
     # Sphinx recovery succeeds, but the recipient supplied a malformed Mix
-    # payload. Every redundant reply carries those same bytes, so the whole
-    # reply opportunity is consumed.
+    # payload. This SURB cannot produce a different plaintext later, so its
+    # credential is consumed. The store does not know which other SURBs the
+    # recipient selected for the same temporary redundancy batch.
     check store.recoverReply(first.rawReply(invalidMessage)).isErr
-    check store.len == 0
+    check:
+      store.len == 1
+      store.get(first.credential.identifier).isNone
+      store.get(second.credential.identifier).isSome

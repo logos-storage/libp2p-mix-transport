@@ -10,16 +10,16 @@ import libp2p/peerid
 import libp2p/utils/opt
 import libp2p_mix
 import ./streams
-from ./wire import MaxSessionIdBytes, RefillRequestId, StreamId
+from ./wire import
+  DefaultReplySurbRedundancy, MaxSessionIdBytes, MaxSurbSupplySequence,
+  SurbSupplyAckBitmapBytes, SurbSupplySequence, SurbSupplyWindow, StreamId
 
 logScope:
   topics = "mix-transport sessions"
 
-const
-  ReplyControlReserveGroups* = 2
-  ReplyRefillLowWatermarkGroups* = ReplyControlReserveGroups
-  DefaultRefillResponseLifetime* = 30.minutes
-  DefaultMaxOutstandingRefillRequests* = 1_024
+const DefaultRecipientSurbCapacity* = 16
+
+export DefaultReplySurbRedundancy
 
 type
   SessionRole* {.pure.} = enum
@@ -31,28 +31,51 @@ type
     Established
     Closed
 
+  SurbSupplyDisposition* {.pure.} = enum
+    Accepted
+    Duplicate
+    OutsideWindow
+    AtCapacity
+
+  SurbSupplySnapshot* = object
+    receiveBase*: SurbSupplySequence
+    acknowledgementBitmap*: seq[byte]
+    supplyLimit*: SurbSupplySequence
+
+  PendingSurbSupply = object
+    encodedSurb: seq[byte]
+    credentialIdentifier: SURBIdentifier
+    nextRetransmissionAt: Opt[Moment]
+
   TransportSession* = ref object
     sessionId: PeerId
     destination: Opt[PeerId]
     role: SessionRole
     state: SessionState
     established: AsyncEvent
-    receivedSurbGroups: Deque[seq[SURB]]
+    receivedSurbs: Deque[SURB]
+    recipientSurbCapacity: int
+    surbSupplyInitialized: bool
+    surbSupplyReceiveBase: SurbSupplySequence
+    surbSupplyAcknowledgementBitmap: seq[byte]
+    surbSupplyLimit: SurbSupplySequence
     replyCapacityStateChanged: AsyncEvent
     replySendLock: AsyncLock
-    nextRefillRequestAt: Opt[Moment]
-    outstandingRefillRequests: Table[RefillRequestId, Moment]
-    nextRefillRequestId: Opt[RefillRequestId]
-    refillResponseLifetime: Duration
-    maxOutstandingRefillRequests: int
+    remoteSurbSupplyReceiveBase: SurbSupplySequence
+    remoteSurbSupplyLimit: SurbSupplySequence
+    nextSurbSupplySequence: Opt[SurbSupplySequence]
+    pendingSurbSupply: Table[SurbSupplySequence, PendingSurbSupply]
+    surbSupplyStateChanged: AsyncEvent
+    surbSupplierTask: Future[void].Raising([CancelledError])
+    nextSurbStatusProbeAt: Opt[Moment]
+    unansweredSurbStatusProbes: int
     streams: Table[StreamId, TransportStream]
     nextOutboundStreamId: Opt[StreamId]
 
   SessionStore* = ref object
     bySessionId: Table[PeerId, TransportSession]
     byDestination: Table[PeerId, TransportSession]
-    refillResponseLifetime: Duration
-    maxOutstandingRefillRequests: int
+    recipientSurbCapacity: int
 
 func sessionId*(session: TransportSession): PeerId =
   session.sessionId
@@ -66,8 +89,17 @@ func role*(session: TransportSession): SessionRole =
 func state*(session: TransportSession): SessionState =
   session.state
 
-func receivedSurbGroupCount*(session: TransportSession): int =
-  session.receivedSurbGroups.len
+func receivedSurbCount*(session: TransportSession): int =
+  session.receivedSurbs.len
+
+func recipientSurbCapacity*(session: TransportSession): int =
+  session.recipientSurbCapacity
+
+func pendingSurbSupplyCount*(session: TransportSession): int =
+  session.pendingSurbSupply.len
+
+func remoteSurbSupplyLimit*(session: TransportSession): SurbSupplySequence =
+  session.remoteSurbSupplyLimit
 
 func streamCount*(session: TransportSession): int =
   session.streams.len
@@ -112,14 +144,14 @@ proc addInitiatorSession*(
     role: SessionRole.Initiator,
     state: SessionState.Pending,
     established: newAsyncEvent(),
-    receivedSurbGroups: initDeque[seq[SURB]](),
+    receivedSurbs: initDeque[SURB](),
+    recipientSurbCapacity: store.recipientSurbCapacity,
+    surbSupplyAcknowledgementBitmap: newSeq[byte](SurbSupplyAckBitmapBytes),
     replyCapacityStateChanged: newAsyncEvent(),
     replySendLock: newAsyncLock(),
-    nextRefillRequestAt: Opt.none(Moment),
-    outstandingRefillRequests: initTable[RefillRequestId, Moment](),
-    nextRefillRequestId: Opt.some(RefillRequestId(1)),
-    refillResponseLifetime: store.refillResponseLifetime,
-    maxOutstandingRefillRequests: store.maxOutstandingRefillRequests,
+    nextSurbSupplySequence: Opt.some(SurbSupplySequence(0)),
+    pendingSurbSupply: initTable[SurbSupplySequence, PendingSurbSupply](),
+    surbSupplyStateChanged: newAsyncEvent(),
     streams: initTable[StreamId, TransportStream](),
     nextOutboundStreamId: Opt.some(StreamId(1)),
   )
@@ -143,14 +175,14 @@ proc addRecipientSession*(
     role: SessionRole.Recipient,
     state: SessionState.Pending,
     established: newAsyncEvent(),
-    receivedSurbGroups: initDeque[seq[SURB]](),
+    receivedSurbs: initDeque[SURB](),
+    recipientSurbCapacity: store.recipientSurbCapacity,
+    surbSupplyAcknowledgementBitmap: newSeq[byte](SurbSupplyAckBitmapBytes),
     replyCapacityStateChanged: newAsyncEvent(),
     replySendLock: newAsyncLock(),
-    nextRefillRequestAt: Opt.none(Moment),
-    outstandingRefillRequests: initTable[RefillRequestId, Moment](),
-    nextRefillRequestId: Opt.some(RefillRequestId(1)),
-    refillResponseLifetime: store.refillResponseLifetime,
-    maxOutstandingRefillRequests: store.maxOutstandingRefillRequests,
+    nextSurbSupplySequence: Opt.some(SurbSupplySequence(0)),
+    pendingSurbSupply: initTable[SurbSupplySequence, PendingSurbSupply](),
+    surbSupplyStateChanged: newAsyncEvent(),
     streams: initTable[StreamId, TransportStream](),
     nextOutboundStreamId: Opt.some(StreamId(2)),
   )
@@ -167,32 +199,109 @@ proc waitUntilEstablished*(
 ): Future[void] {.async: (raw: true, raises: [CancelledError]).} =
   session.established.wait()
 
-proc addReceivedSurbGroups*(
-    session: TransportSession, groups: sink seq[seq[SURB]]
+proc addReceivedSurbs*(
+    session: TransportSession, surbs: sink seq[SURB]
 ): Result[void, string] =
   if session.role != SessionRole.Recipient:
-    return err("only recipient sessions can store received SURB groups")
-  for group in groups:
-    if group.len == 0:
-      return err("received SURB groups must not be empty")
+    return err("only recipient sessions can store received SURBs")
+  if surbs.len > session.recipientSurbCapacity - session.receivedSurbs.len:
+    return err("recipient SURB capacity would be exceeded")
 
-  for group in groups.mitems:
-    session.receivedSurbGroups.addLast(move(group))
-  if groups.len > 0:
-    if session.receivedSurbGroups.len > ReplyRefillLowWatermarkGroups:
-      session.nextRefillRequestAt = Opt.none(Moment)
+  for surb in surbs.mitems:
+    session.receivedSurbs.addLast(move(surb))
+  if surbs.len > 0:
     session.replyCapacityStateChanged.fire()
   ok()
 
-proc takeReceivedSurbGroup*(session: TransportSession): Result[seq[SURB], string] =
-  if session.receivedSurbGroups.len == 0:
-    return err("session has no received SURB groups")
-  ok(session.receivedSurbGroups.popFirst())
+proc takeReceivedSurbs*(
+    session: TransportSession, count: int
+): Result[seq[SURB], string] =
+  if count <= 0:
+    return err("SURB count must be positive")
+  if session.receivedSurbs.len < count:
+    return err("session does not have enough received SURBs")
+  if session.surbSupplyInitialized and
+      uint64(session.surbSupplyLimit) + uint64(count) > uint64(SurbSupplySequence.high):
+    return err("SURB supply credit space is exhausted")
 
-proc takeUnreservedSurbGroup*(session: TransportSession): Result[seq[SURB], string] =
-  if session.receivedSurbGroups.len <= ReplyControlReserveGroups:
-    return err("session reply capacity is reserved for control traffic")
-  ok(session.receivedSurbGroups.popFirst())
+  var surbs = newSeqOfCap[SURB](count)
+  for _ in 0 ..< count:
+    surbs.add(session.receivedSurbs.popFirst())
+  if session.surbSupplyInitialized:
+    session.surbSupplyLimit += SurbSupplySequence(count)
+  ok(surbs)
+
+func bitmapContains(bitmap: openArray[byte], offset: SurbSupplySequence): bool =
+  let
+    byteIndex = int(offset div 8)
+    bitIndex = int(offset mod 8)
+  (bitmap[byteIndex] and (1'u8 shl bitIndex)) != 0
+
+proc setBitmapBit(bitmap: var seq[byte], offset: SurbSupplySequence) =
+  let
+    byteIndex = int(offset div 8)
+    bitIndex = int(offset mod 8)
+  bitmap[byteIndex] = bitmap[byteIndex] or (1'u8 shl bitIndex)
+
+proc shiftSupplyBitmap(session: TransportSession) =
+  for index in 0 ..< session.surbSupplyAcknowledgementBitmap.len:
+    let carry =
+      if index + 1 < session.surbSupplyAcknowledgementBitmap.len:
+        (session.surbSupplyAcknowledgementBitmap[index + 1] and 1'u8) shl 7
+      else:
+        0'u8
+    session.surbSupplyAcknowledgementBitmap[index] =
+      (session.surbSupplyAcknowledgementBitmap[index] shr 1) or carry
+
+proc initializeSurbSupply*(session: TransportSession): Result[void, string] =
+  if session.role != SessionRole.Recipient:
+    return err("only recipient sessions advertise SURB supply state")
+  if session.surbSupplyInitialized:
+    return err("SURB supply state is already initialized")
+  if session.receivedSurbs.len > session.recipientSurbCapacity:
+    return err("recipient SURB capacity is already exceeded")
+
+  session.surbSupplyLimit =
+    SurbSupplySequence(session.recipientSurbCapacity - session.receivedSurbs.len)
+  session.surbSupplyInitialized = true
+  ok()
+
+proc surbSupplySnapshot*(session: TransportSession): SurbSupplySnapshot =
+  doAssert session.role == SessionRole.Recipient
+  doAssert session.surbSupplyInitialized
+  SurbSupplySnapshot(
+    receiveBase: session.surbSupplyReceiveBase,
+    acknowledgementBitmap: session.surbSupplyAcknowledgementBitmap,
+    supplyLimit: session.surbSupplyLimit,
+  )
+
+proc acceptSurbSupply*(
+    session: TransportSession, sequence: SurbSupplySequence, surb: sink SURB
+): SurbSupplyDisposition =
+  doAssert session.role == SessionRole.Recipient
+  doAssert session.surbSupplyInitialized
+
+  if sequence < session.surbSupplyReceiveBase:
+    return SurbSupplyDisposition.Duplicate
+  if sequence >= session.surbSupplyLimit:
+    return SurbSupplyDisposition.OutsideWindow
+
+  let offset = sequence - session.surbSupplyReceiveBase
+  if offset >= SurbSupplySequence(SurbSupplyWindow):
+    return SurbSupplyDisposition.OutsideWindow
+  if session.surbSupplyAcknowledgementBitmap.bitmapContains(offset):
+    return SurbSupplyDisposition.Duplicate
+  if session.receivedSurbs.len >= session.recipientSurbCapacity:
+    return SurbSupplyDisposition.AtCapacity
+
+  session.receivedSurbs.addLast(move(surb))
+  session.surbSupplyAcknowledgementBitmap.setBitmapBit(offset)
+  while session.surbSupplyAcknowledgementBitmap.bitmapContains(0):
+    doAssert session.surbSupplyReceiveBase < SurbSupplySequence.high
+    session.shiftSupplyBitmap()
+    inc session.surbSupplyReceiveBase
+  session.replyCapacityStateChanged.fire()
+  SurbSupplyDisposition.Accepted
 
 proc clearReplyCapacityStateChanged*(session: TransportSession) =
   session.replyCapacityStateChanged.clear()
@@ -213,94 +322,235 @@ proc releaseReplySend*(session: TransportSession) =
   except AsyncLockError as exc:
     raiseAssert "session reply-send lock was not held: " & exc.msg
 
-func refillRequestDue*(session: TransportSession, now: Moment = Moment.now()): bool =
-  if session.role != SessionRole.Recipient or
-      session.receivedSurbGroups.len > ReplyRefillLowWatermarkGroups:
-    return false
-  let nextRefillRequestAt = session.nextRefillRequestAt.valueOr:
-    return true
-  nextRefillRequestAt <= now
+func availableSurbSupplySlots*(session: TransportSession): int =
+  if session.role != SessionRole.Initiator:
+    return 0
+  let nextSequence = session.nextSurbSupplySequence.valueOr:
+    return 0
+  let upperBound = min(
+    uint64(session.remoteSurbSupplyLimit),
+    uint64(session.remoteSurbSupplyReceiveBase) + uint64(SurbSupplyWindow),
+  )
+  if uint64(nextSequence) >= upperBound:
+    return 0
+  int(upperBound - uint64(nextSequence))
 
-func timeUntilNextRefillRequest*(
-    session: TransportSession, now: Moment = Moment.now()
-): Duration =
-  let nextRefillRequestAt = session.nextRefillRequestAt.valueOr:
-    return ZeroDuration
-  if nextRefillRequestAt <= now:
-    ZeroDuration
-  else:
-    nextRefillRequestAt - now
-
-proc scheduleNextRefillRequest*(
-    session: TransportSession, delay: Duration, now: Moment = Moment.now()
-) =
-  doAssert delay > ZeroDuration, "refill request delay must be positive"
-  session.nextRefillRequestAt = Opt.some(now + delay)
-
-func outstandingRefillRequestCount*(session: TransportSession): int =
-  session.outstandingRefillRequests.len
-
-proc purgeExpiredRefillRequests*(
-    session: TransportSession, now: Moment = Moment.now()
-): int =
-  var expired: seq[RefillRequestId]
-  for refillRequestId, expiresAt in session.outstandingRefillRequests:
-    if expiresAt <= now:
-      expired.add(refillRequestId)
-  for refillRequestId in expired:
-    session.outstandingRefillRequests.del(refillRequestId)
-  expired.len
-
-proc registerRefillRequest*(
-    session: TransportSession, now: Moment = Moment.now()
-): Result[RefillRequestId, string] =
-  if session.role != SessionRole.Recipient:
-    return err("only recipient sessions can request SURB refills")
-  if session.receivedSurbGroups.len > ReplyRefillLowWatermarkGroups:
-    return err("session does not need a SURB refill")
-
-  discard session.purgeExpiredRefillRequests(now)
-  if session.outstandingRefillRequests.len >= session.maxOutstandingRefillRequests:
-    var
-      found = false
-      oldestRequestId: RefillRequestId
-      oldestDeadline: Moment
-    for refillRequestId, expiresAt in session.outstandingRefillRequests:
-      if not found or expiresAt < oldestDeadline:
-        found = true
-        oldestRequestId = refillRequestId
-        oldestDeadline = expiresAt
-    doAssert found, "a full refill request table must contain an entry"
-    session.outstandingRefillRequests.del(oldestRequestId)
-
-  let refillRequestId = session.nextRefillRequestId.valueOr:
-    return err("refill request identifier space is exhausted")
-  session.nextRefillRequestId =
-    if refillRequestId == RefillRequestId.high:
-      Opt.none(RefillRequestId)
-    else:
-      Opt.some(refillRequestId + 1)
-  session.outstandingRefillRequests[refillRequestId] =
-    now + session.refillResponseLifetime
-  ok(refillRequestId)
-
-proc cancelRefillRequest*(session: TransportSession, refillRequestId: RefillRequestId) =
-  session.outstandingRefillRequests.del(refillRequestId)
-  session.nextRefillRequestAt = Opt.none(Moment)
-  session.replyCapacityStateChanged.fire()
-
-proc acceptRefillResponse*(
+proc registerSurbSupply*(
     session: TransportSession,
-    refillRequestId: RefillRequestId,
+    encodedSurbs: openArray[seq[byte]],
+    credentialIdentifiers: openArray[SURBIdentifier],
+): Result[SurbSupplySequence, string] =
+  if session.role != SessionRole.Initiator:
+    return err("only initiator sessions can supply SURBs")
+  if encodedSurbs.len == 0:
+    return err("SURB supply must not be empty")
+  if credentialIdentifiers.len != encodedSurbs.len:
+    return err("every supplied SURB must have a reply credential identifier")
+  if encodedSurbs.len > session.availableSurbSupplySlots:
+    return err("remote SURB supply credit is exhausted")
+
+  let firstSequence = session.nextSurbSupplySequence.valueOr:
+    return err("SURB supply sequence space is exhausted")
+  var sequence = firstSequence
+  for index, encodedSurb in encodedSurbs:
+    session.pendingSurbSupply[sequence] = PendingSurbSupply(
+      encodedSurb: encodedSurb,
+      credentialIdentifier: credentialIdentifiers[index],
+      nextRetransmissionAt: Opt.none(Moment),
+    )
+    if sequence == MaxSurbSupplySequence:
+      session.nextSurbSupplySequence = Opt.none(SurbSupplySequence)
+    else:
+      inc sequence
+      session.nextSurbSupplySequence = Opt.some(sequence)
+  ok(firstSequence)
+
+proc registerInitialSurbSupply*(
+    session: TransportSession,
+    encodedSurbs: openArray[seq[byte]],
+    credentialIdentifiers: openArray[SURBIdentifier],
+): Result[SurbSupplySequence, string] =
+  if session.role != SessionRole.Initiator:
+    return err("only initiator sessions can supply SURBs")
+  if session.nextSurbSupplySequence != Opt.some(SurbSupplySequence(0)) or
+      session.pendingSurbSupply.len != 0:
+    return err("initial SURB supply is already registered")
+  if encodedSurbs.len == 0:
+    return err("initial SURB supply must not be empty")
+  if credentialIdentifiers.len != encodedSurbs.len:
+    return err("every supplied SURB must have a reply credential identifier")
+
+  var sequence = SurbSupplySequence(0)
+  for index, encodedSurb in encodedSurbs:
+    session.pendingSurbSupply[sequence] = PendingSurbSupply(
+      encodedSurb: encodedSurb,
+      credentialIdentifier: credentialIdentifiers[index],
+      nextRetransmissionAt: Opt.none(Moment),
+    )
+    inc sequence
+  session.nextSurbSupplySequence = Opt.some(sequence)
+  ok(SurbSupplySequence(0))
+
+proc removePendingSurbSupply*(
+    session: TransportSession, firstSequence: SurbSupplySequence, count: int
+) =
+  for offset in 0 ..< count:
+    session.pendingSurbSupply.del(firstSequence + SurbSupplySequence(offset))
+
+proc scheduleSurbSupplyRetransmission*(
+    session: TransportSession,
+    firstSequence: SurbSupplySequence,
+    count: int,
+    delay: Duration,
     now: Moment = Moment.now(),
+) =
+  doAssert delay > ZeroDuration, "SURB supply retransmission delay must be positive"
+  for offset in 0 ..< count:
+    let sequence = firstSequence + SurbSupplySequence(offset)
+    session.pendingSurbSupply.withValue(sequence, pending):
+      pending.nextRetransmissionAt = Opt.some(now + delay)
+  session.surbSupplyStateChanged.fire()
+
+proc takeDueSurbSupplyRetransmission*(
+    session: TransportSession, now: Moment = Moment.now()
+): Opt[
+    tuple[
+      sequence: SurbSupplySequence,
+      encodedSurb: seq[byte],
+      credentialIdentifier: SURBIdentifier,
+    ]
+] =
+  var
+    selectedSequence = Opt.none(SurbSupplySequence)
+    selectedDeadline = Opt.none(Moment)
+
+  for sequence, pending in session.pendingSurbSupply:
+    pending.nextRetransmissionAt.withValue(deadline):
+      if deadline > now:
+        continue
+      if selectedDeadline.isNone or deadline < selectedDeadline.get() or
+          (deadline == selectedDeadline.get() and sequence < selectedSequence.get()):
+        selectedSequence = Opt.some(sequence)
+        selectedDeadline = Opt.some(deadline)
+
+  let sequence = selectedSequence.valueOr:
+    return Opt.none(
+      tuple[
+        sequence: SurbSupplySequence,
+        encodedSurb: seq[byte],
+        credentialIdentifier: SURBIdentifier,
+      ]
+    )
+  session.pendingSurbSupply.withValue(sequence, pending):
+    pending.nextRetransmissionAt = Opt.none(Moment)
+    return Opt.some(
+      (
+        sequence: sequence,
+        encodedSurb: pending.encodedSurb,
+        credentialIdentifier: pending.credentialIdentifier,
+      )
+    )
+  Opt.none(
+    tuple[
+      sequence: SurbSupplySequence,
+      encodedSurb: seq[byte],
+      credentialIdentifier: SURBIdentifier,
+    ]
+  )
+
+proc removePendingSurbSupply*(session: TransportSession, sequence: SurbSupplySequence) =
+  session.pendingSurbSupply.del(sequence)
+
+func earliestSurbSupplyRetransmission*(session: TransportSession): Opt[Moment] =
+  var earliest = Opt.none(Moment)
+  for pending in session.pendingSurbSupply.values:
+    pending.nextRetransmissionAt.withValue(deadline):
+      if earliest.isNone or deadline < earliest.get():
+        earliest = Opt.some(deadline)
+  earliest
+
+proc applySurbSupplySnapshot*(
+    session: TransportSession, snapshot: SurbSupplySnapshot
 ): bool =
-  discard session.purgeExpiredRefillRequests(now)
-  if not session.outstandingRefillRequests.hasKey(refillRequestId):
+  if session.role != SessionRole.Initiator or
+      snapshot.acknowledgementBitmap.len != SurbSupplyAckBitmapBytes or
+      snapshot.supplyLimit < snapshot.receiveBase:
     return false
-  session.outstandingRefillRequests.del(refillRequestId)
-  session.nextRefillRequestAt = Opt.none(Moment)
-  session.replyCapacityStateChanged.fire()
+
+  let nextSequence = session.nextSurbSupplySequence.get(SurbSupplySequence.high)
+  if snapshot.receiveBase > nextSequence:
+    return false
+
+  var acknowledged: seq[SurbSupplySequence]
+  for sequence in session.pendingSurbSupply.keys:
+    if sequence < snapshot.receiveBase:
+      acknowledged.add(sequence)
+    else:
+      let offset = sequence - snapshot.receiveBase
+      if offset < SurbSupplySequence(SurbSupplyWindow) and
+          snapshot.acknowledgementBitmap.bitmapContains(offset):
+        acknowledged.add(sequence)
+  for sequence in acknowledged:
+    session.pendingSurbSupply.del(sequence)
+
+  let changed =
+    acknowledged.len > 0 or snapshot.receiveBase > session.remoteSurbSupplyReceiveBase or
+    snapshot.supplyLimit > session.remoteSurbSupplyLimit
+  session.remoteSurbSupplyReceiveBase =
+    max(session.remoteSurbSupplyReceiveBase, snapshot.receiveBase)
+  session.remoteSurbSupplyLimit =
+    max(session.remoteSurbSupplyLimit, snapshot.supplyLimit)
+  if changed:
+    session.surbSupplyStateChanged.fire()
   true
+
+proc clearSurbSupplyStateChanged*(session: TransportSession) =
+  session.surbSupplyStateChanged.clear()
+
+proc waitForSurbSupplyStateChange*(
+    session: TransportSession
+): Future[void] {.async: (raw: true, raises: [CancelledError]).} =
+  session.surbSupplyStateChanged.wait()
+
+proc setSurbSupplierTask*(
+    session: TransportSession, task: Future[void].Raising([CancelledError])
+) =
+  doAssert session.surbSupplierTask.isNil, "SURB supplier task is already set"
+  session.surbSupplierTask = task
+
+proc clearSurbSupplierTask*(session: TransportSession) =
+  session.surbSupplierTask = nil
+
+proc noteReverseActivity*(
+    session: TransportSession, probeInterval: Duration, now: Moment = Moment.now()
+) =
+  doAssert probeInterval > ZeroDuration, "SURB status probe interval must be positive"
+  session.unansweredSurbStatusProbes = 0
+  session.nextSurbStatusProbeAt = Opt.some(now + probeInterval)
+  session.surbSupplyStateChanged.fire()
+
+proc recordSurbStatusProbeAttempt*(
+    session: TransportSession, retryInterval: Duration, now: Moment = Moment.now()
+) =
+  doAssert retryInterval > ZeroDuration,
+    "SURB status probe retry interval must be positive"
+  inc session.unansweredSurbStatusProbes
+  session.nextSurbStatusProbeAt = Opt.some(now + retryInterval)
+
+func unansweredSurbStatusProbeCount*(session: TransportSession): int =
+  session.unansweredSurbStatusProbes
+
+func timeUntilSurbStatusProbe*(
+    session: TransportSession, now: Moment = Moment.now()
+): Opt[Duration] =
+  session.nextSurbStatusProbeAt.withValue(deadline):
+    return Opt.some(
+      if deadline <= now:
+        ZeroDuration
+      else:
+        deadline - now
+    )
+  Opt.none(Duration)
 
 func isValidInboundStreamId(session: TransportSession, streamId: StreamId): bool =
   if streamId == 0:
@@ -379,6 +629,12 @@ proc takeStreams*(session: TransportSession): seq[TransportStream] =
 proc shutdown*(session: TransportSession): Future[void] {.async: (raises: []).} =
   session.state = SessionState.Closed
   session.established.fire()
+  session.replyCapacityStateChanged.fire()
+  session.surbSupplyStateChanged.fire()
+  let surbSupplierTask = session.surbSupplierTask
+  session.surbSupplierTask = nil
+  if not surbSupplierTask.isNil:
+    await noCancel surbSupplierTask.cancelAndWait()
   let streams = session.takeStreams()
   var shutdownTasks = newSeqOfCap[Future[void].Raising([])](streams.len)
   for stream in streams:
@@ -408,18 +664,16 @@ proc takeSessions*(store: SessionStore): seq[TransportSession] =
   store.clear()
 
 proc newSessionStore*(
-    refillResponseLifetime = DefaultRefillResponseLifetime,
-    maxOutstandingRefillRequests = DefaultMaxOutstandingRefillRequests,
+    recipientSurbCapacity = DefaultRecipientSurbCapacity
 ): SessionStore =
-  doAssert refillResponseLifetime > ZeroDuration,
-    "refill response lifetime must be positive"
-  doAssert maxOutstandingRefillRequests > 0,
-    "maximum outstanding refill requests must be positive"
+  doAssert recipientSurbCapacity >= DefaultReplySurbRedundancy,
+    "recipient SURB capacity must hold one reply redundancy batch"
+  doAssert recipientSurbCapacity <= int(SurbSupplySequence.high),
+    "recipient SURB capacity exceeds the supply credit space"
   SessionStore(
     bySessionId: initTable[PeerId, TransportSession](),
     byDestination: initTable[PeerId, TransportSession](),
-    refillResponseLifetime: refillResponseLifetime,
-    maxOutstandingRefillRequests: maxOutstandingRefillRequests,
+    recipientSurbCapacity: recipientSurbCapacity,
   )
 
 {.pop.}

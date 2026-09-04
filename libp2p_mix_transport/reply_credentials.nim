@@ -15,14 +15,10 @@ const
   DefaultMaxRetiredReplyIdentifiers* = 100_000
 
 type
-  ReplyCredentialGroup* = ref object
-    sessionId: PeerId
-    identifiers: HashSet[SURBIdentifier]
-    expiresAt: Moment
-
   StoredReplyCredential* = object
     credential*: ReplyCredential
-    group*: ReplyCredentialGroup
+    sessionId*: PeerId
+    expiresAt*: Moment
 
   RecoveredReply* = object
     sessionId*: PeerId
@@ -41,18 +37,12 @@ func len*(store: ReplyCredentialStore): int =
 func retiredLen*(store: ReplyCredentialStore): int =
   store.retiredIdentifiers.len
 
-func sessionId*(group: ReplyCredentialGroup): PeerId =
-  group.sessionId
-
-func expiresAt*(group: ReplyCredentialGroup): Moment =
-  group.expiresAt
-
 proc purgeExpired*(store: ReplyCredentialStore, now: Moment = Moment.now()): int =
   var
     expiredCredentials: seq[SURBIdentifier]
     expiredRetiredIdentifiers: seq[SURBIdentifier]
   for identifier, stored in store.credentials:
-    if stored.group.expiresAt <= now:
+    if stored.expiresAt <= now:
       expiredCredentials.add(identifier)
   for identifier, expiresAt in store.retiredIdentifiers:
     if expiresAt <= now:
@@ -98,14 +88,14 @@ func isRetiredIdentifier*(
     return false
   store.retiredIdentifiers.getOrDefault(identifier) > now
 
-proc addGroup*(
+proc add*(
     store: ReplyCredentialStore,
     sessionId: PeerId,
     credentials: openArray[ReplyCredential],
     now: Moment = Moment.now(),
-): Result[ReplyCredentialGroup, string] =
+): Result[void, string] =
   if credentials.len == 0:
-    return err("reply credential groups must not be empty")
+    return err("reply credentials must not be empty")
 
   discard store.purgeExpired(now)
   if credentials.len > store.maxCredentials - store.credentials.len:
@@ -121,33 +111,43 @@ proc addGroup*(
       return err("reply credential identifier is already registered")
     identifiers.incl(identifier)
 
-  let group = ReplyCredentialGroup(
-    sessionId: sessionId, identifiers: identifiers, expiresAt: now + store.ttl
-  )
   for credential in credentials:
-    store.credentials[credential.identifier] =
-      StoredReplyCredential(credential: credential, group: group)
-  ok(group)
+    store.credentials[credential.identifier] = StoredReplyCredential(
+      credential: credential, sessionId: sessionId, expiresAt: now + store.ttl
+    )
+  ok()
 
 proc get*(
     store: ReplyCredentialStore, identifier: SURBIdentifier, now: Moment = Moment.now()
 ): Opt[StoredReplyCredential] =
   store.credentials.withValue(identifier, stored):
-    if stored.group.expiresAt > now:
+    if stored.expiresAt > now:
       return Opt.some(stored[])
   Opt.none(StoredReplyCredential)
 
 proc consume*(
-    store: ReplyCredentialStore, group: ReplyCredentialGroup, now: Moment = Moment.now()
+    store: ReplyCredentialStore, identifier: SURBIdentifier, now: Moment = Moment.now()
 ) =
-  if group.isNil:
+  discard store.purgeExpired(now)
+  if not store.credentials.hasKey(identifier):
     return
 
-  discard store.purgeExpired(now)
-  for identifier in group.identifiers:
-    store.credentials.del(identifier)
-    store.rememberRetiredIdentifier(identifier, group.expiresAt, now)
-  group.identifiers.clear()
+  let expiresAt = store.credentials.getOrDefault(identifier).expiresAt
+  store.credentials.del(identifier)
+  store.rememberRetiredIdentifier(identifier, expiresAt, now)
+
+proc consume*(
+    store: ReplyCredentialStore, credential: ReplyCredential, now: Moment = Moment.now()
+) =
+  store.consume(credential.identifier, now)
+
+proc consume*(
+    store: ReplyCredentialStore,
+    credentials: openArray[ReplyCredential],
+    now: Moment = Moment.now(),
+) =
+  for credential in credentials:
+    store.consume(credential, now)
 
 proc removeSession*(store: ReplyCredentialStore, sessionId: PeerId): int =
   let now = Moment.now()
@@ -155,8 +155,8 @@ proc removeSession*(store: ReplyCredentialStore, sessionId: PeerId): int =
 
   var removed: seq[tuple[identifier: SURBIdentifier, expiresAt: Moment]]
   for identifier, stored in store.credentials:
-    if stored.group.sessionId == sessionId:
-      removed.add((identifier, stored.group.expiresAt))
+    if stored.sessionId == sessionId:
+      removed.add((identifier, stored.expiresAt))
 
   for (identifier, expiresAt) in removed:
     store.credentials.del(identifier)
@@ -171,11 +171,11 @@ proc recoverReply*(
 
   let payload = recoverReply(stored.credential, reply).valueOr:
     if error.kind == ReplyRecoveryErrorKind.PayloadDecodingFailed:
-      store.consume(stored.group)
+      store.consume(reply.identifier)
     return err(error)
 
-  store.consume(stored.group)
-  ok(Opt.some(RecoveredReply(sessionId: stored.group.sessionId, payload: payload)))
+  store.consume(reply.identifier)
+  ok(Opt.some(RecoveredReply(sessionId: stored.sessionId, payload: payload)))
 
 proc clear*(store: ReplyCredentialStore) =
   store.credentials.clear()
