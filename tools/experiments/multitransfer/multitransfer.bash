@@ -13,6 +13,8 @@ export TR_BASE
 
 # shellcheck source=../harness/harness.bash
 source "${SCRIPT_DIR}/../../harness/harness.bash"
+# shellcheck source=../harness/harness.bash
+source "${SCRIPT_DIR}/../../harness/emu-profiles.bash"
 
 # How many nodes should the network have?
 N_NODES=${1:-40}
@@ -30,6 +32,15 @@ tr_field mix "${USE_MIX}"
 # What delay strategy?
 MIX_STRATEGY=${6:-default}
 tr_field strategy "${MIX_STRATEGY}"
+# Emulator profile?
+EMU_PROFILE=${7:-none}
+tr_field emulator "${EMU_PROFILE}"
+
+if [ "${EMU_PROFILE}" != "none" ]; then
+  #shellcheck disable=SC2046
+  emu_set_params $(emu_profile "${EMU_PROFILE}")
+  emu_enter
+fi
 
 echoerr "Running multitransfer experiment with:"
 echoerr "  Nodes: ${N_NODES}"
@@ -38,6 +49,7 @@ echoerr "  Concurrent: ${N_CONCURRENT}"
 echoerr "  File size: ${N_BYTES}"
 echoerr "  Use mix: ${USE_MIX}"
 echoerr "  Mix delay strategy: ${MIX_STRATEGY}"
+echoerr "  Emulator profile: ${EMU_PROFILE}"
 
 _running=()
 _remaining="${N_TRANSFERS}"
