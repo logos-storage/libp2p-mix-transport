@@ -130,11 +130,26 @@ suite "MixTransport wire format":
       decoded.firstSurbSequence == frame.firstSurbSequence
       decoded.surbs == frame.surbs
 
+  test "Connect uses all Sphinx payload space available for reply and bootstrap SURBs":
+    var frame = MixTransportFrame(
+      version: MixTransportVersion,
+      sessionId: randomSessionId(),
+      kind: FrameKind.Connect,
+      firstSurbSequence: Opt.some(SurbSupplySequence(0)),
+      surbs: newSeq[seq[byte]](5),
+    )
+    for surb in frame.surbs.mitems:
+      surb = newSeq[byte](SurbSize)
+
+    check frame.encode().isOk
+    frame.surbs.add(newSeq[byte](SurbSize))
+    check frame.encode().isErr
+
   test "SURB supply state is an absolute fixed-size snapshot":
     let frame = MixTransportFrame(
       version: MixTransportVersion,
       sessionId: randomSessionId(),
-      kind: FrameKind.RefillRequest,
+      kind: FrameKind.SurbStatus,
       surbSupplyReceiveBase: Opt.some(SurbSupplySequence(12)),
       surbSupplyAcknowledgementBitmap: Opt.some(newSeq[byte](SurbSupplyAckBitmapBytes)),
       surbSupplyLimit: Opt.some(SurbSupplySequence(28)),
@@ -183,7 +198,7 @@ suite "MixTransport wire format":
 
     check frame.encode().isErr
 
-  test "open stream does not require attached SURBs":
+  test "open stream requires reply SURBs":
     let frame = MixTransportFrame(
       version: MixTransportVersion,
       sessionId: randomSessionId(),
@@ -192,7 +207,13 @@ suite "MixTransport wire format":
       codec: Opt.some("/example/1.0.0"),
     )
 
-    check frame.encode().isOk
+    check frame.encode().isErr
+
+    var withReplySurbs = frame
+    withReplySurbs.surbs = newSeq[seq[byte]](DefaultReplySurbRedundancy)
+    for surb in withReplySurbs.surbs.mitems:
+      surb = newSeq[byte](SurbSize)
+    check withReplySurbs.encode().isOk
 
   test "stream rejection identifies the stream it refuses":
     let frame = MixTransportFrame(

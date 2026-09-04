@@ -79,19 +79,13 @@ suite "MixTransport sessions":
           "could not add recipient session"
         )
 
-    session.addReceivedSurbs(newSeq[SURB](ReplyControlReserveSurbs)).expect(
-      "could not add bootstrap SURBs"
-    )
-    discard session.takeReceivedSurbs(DefaultReplySurbRedundancy).expect(
-        "could not form the ConnectAck redundancy batch"
-      )
     session.initializeSurbSupply().expect("could not initialize SURB supply")
 
     let initialSnapshot = session.surbSupplySnapshot()
     check:
-      session.receivedSurbCount == 2
+      session.receivedSurbCount == 0
       initialSnapshot.receiveBase == 0
-      initialSnapshot.supplyLimit == 4
+      initialSnapshot.supplyLimit == 6
 
     check session.acceptSurbSupply(1, SURB()) == SurbSupplyDisposition.Accepted
     check session.acceptSurbSupply(1, SURB()) == SurbSupplyDisposition.Duplicate
@@ -100,16 +94,18 @@ suite "MixTransport sessions":
     check session.surbSupplySnapshot().receiveBase == 2
     check session.acceptSurbSupply(3, SURB()) == SurbSupplyDisposition.Accepted
     check session.acceptSurbSupply(2, SURB()) == SurbSupplyDisposition.Accepted
+    check session.acceptSurbSupply(5, SURB()) == SurbSupplyDisposition.Accepted
+    check session.acceptSurbSupply(4, SURB()) == SurbSupplyDisposition.Accepted
     check:
       session.receivedSurbCount == 6
-      session.surbSupplySnapshot().receiveBase == 4
-      session.acceptSurbSupply(4, SURB()) == SurbSupplyDisposition.OutsideWindow
+      session.surbSupplySnapshot().receiveBase == 6
+      session.acceptSurbSupply(6, SURB()) == SurbSupplyDisposition.OutsideWindow
 
     # Consuming two stored SURBs grants exactly two new absolute supply slots.
     discard session.takeReceivedSurbs(2).expect("could not consume received SURBs")
-    check session.surbSupplySnapshot().supplyLimit == 6
-    check session.acceptSurbSupply(4, SURB()) == SurbSupplyDisposition.Accepted
-    check session.acceptSurbSupply(5, SURB()) == SurbSupplyDisposition.Accepted
+    check session.surbSupplySnapshot().supplyLimit == 8
+    check session.acceptSurbSupply(6, SURB()) == SurbSupplyDisposition.Accepted
+    check session.acceptSurbSupply(7, SURB()) == SurbSupplyDisposition.Accepted
     check session.receivedSurbCount == session.recipientSurbCapacity
 
   test "initiator applies absolute supply acknowledgements and credit":
@@ -150,10 +146,57 @@ suite "MixTransport sessions":
       session.remoteSurbSupplyLimit == 6
       session.availableSurbSupplySlots == 2
 
-    session.requestSurbSupply()
-    check session.isSurbSupplyRequested
-    session.clearSurbSupplyRequest()
-    check not session.isSurbSupplyRequested
+  test "Connect bootstrap supply begins the numbered sequence space":
+    let
+      rng = newRng()
+      session = newSessionStore()
+        .addInitiatorSession(randomPeerId(rng), randomPeerId(rng))
+        .expect("could not add initiator session")
+      encodedSurbs = @[newSeq[byte](1), newSeq[byte](1), newSeq[byte](1)]
+      identifiers = newSeq[SURBIdentifier](encodedSurbs.len)
+
+    check session.registerInitialSurbSupply(encodedSurbs, identifiers).expect(
+      "could not register bootstrap SURBs"
+    ) == 0
+    check:
+      session.pendingSurbSupplyCount == 3
+      session.availableSurbSupplySlots == 0
+
+    # ConnectAck reports that all three bootstrap SURBs arrived and grants
+    # credit for filling the rest of the recipient's sixteen-entry queue.
+    check session.applySurbSupplySnapshot(
+      SurbSupplySnapshot(
+        receiveBase: 3,
+        acknowledgementBitmap: newSeq[byte](SurbSupplyAckBitmapBytes),
+        supplyLimit: DefaultRecipientSurbCapacity,
+      )
+    )
+    check:
+      session.pendingSurbSupplyCount == 0
+      session.availableSurbSupplySlots == DefaultRecipientSurbCapacity - 3
+
+  test "reverse activity resets unanswered status probe attempts":
+    let
+      rng = newRng()
+      session = newSessionStore()
+        .addInitiatorSession(randomPeerId(rng), randomPeerId(rng))
+        .expect("could not add initiator session")
+      now = Moment.now()
+
+    session.noteReverseActivity(30.seconds, now)
+    check:
+      session.unansweredSurbStatusProbeCount == 0
+      session.timeUntilSurbStatusProbe(now) == Opt.some(30.seconds)
+
+    session.recordSurbStatusProbeAttempt(5.seconds, now + 30.seconds)
+    check:
+      session.unansweredSurbStatusProbeCount == 1
+      session.timeUntilSurbStatusProbe(now + 30.seconds) == Opt.some(5.seconds)
+
+    session.noteReverseActivity(30.seconds, now + 31.seconds)
+    check:
+      session.unansweredSurbStatusProbeCount == 0
+      session.timeUntilSurbStatusProbe(now + 31.seconds) == Opt.some(30.seconds)
 
   test "unacknowledged SURB supply retains its credential association":
     let
