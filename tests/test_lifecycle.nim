@@ -41,6 +41,26 @@ suite "MixTransport lifecycle":
       defaultTransport.dataRetransmissionsEnabled
       not retransmissionsDisabled.dataRetransmissionsEnabled
 
+  test "status probe recovery has bounded configurable attempts":
+    let
+      mix = createMixProtocol()
+      defaultTransport = MixTransport.newMixTransport(mix)
+      configuredTransport = MixTransport.newMixTransport(
+        mix,
+        reverseActivityTimeout = 1.minutes,
+        surbStatusProbeRetryInterval = 5.seconds,
+        maxSurbStatusProbeAttempts = 5,
+      )
+
+    check:
+      defaultTransport.reverseActivityTimeout == DefaultReverseActivityTimeout
+      defaultTransport.surbStatusProbeRetryInterval ==
+        DefaultSurbStatusProbeRetryInterval
+      defaultTransport.maxSurbStatusProbeAttempts == DefaultMaxSurbStatusProbeAttempts
+      configuredTransport.reverseActivityTimeout == 1.minutes
+      configuredTransport.surbStatusProbeRetryInterval == 5.seconds
+      configuredTransport.maxSurbStatusProbeAttempts == 5
+
   test "start and stop own the Mix plug-in registrations":
     let
       mix = createMixProtocol()
