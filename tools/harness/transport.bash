@@ -3,18 +3,9 @@
 # Simple harness for running transport experiments.
 set -euo pipefail
 
-LIB_SRC=${LIB_SRC:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
-
-# shellcheck source=config.bash
-source "$LIB_SRC/config.bash"
-# shellcheck source=utils.bash
-source "$LIB_SRC/utils.bash"
-
 require_binary "$TR_NODE_BINARY"
 
 MIX_PATH_LENGTH=3
-_base_api_port=8000
-_base_listen_port=9000
 
 TR_TRANSFER_LOGS="${TR_LOGS_FOLDER}/transfers"
 TR_MEASUREMENTS="${TR_BASE}/${TR_RUN_ID}-transfer-times.csv"
@@ -29,6 +20,11 @@ tr_field() {
   TR_FIELDS["$1"]="$2"
 }
 
+_tr_node_ip() {
+  local node_index=$1
+  echo "127.0.0.$((1 + node_index))"
+}
+
 _tr_timeformat() {
   local reply=$1 source_node=$2 dest_node=$3 size=$4 ts
   timestamp ts
@@ -40,7 +36,7 @@ _tr_urls() {
   local -n urls_ref=$1
   local idx
   for idx in "${!_node_pids[@]}"; do
-    urls_ref+=("http://127.0.0.1:$((_base_api_port + idx))")
+    urls_ref+=("http://$(_tr_node_ip "$idx"):$TR_API_PORT")
   done
 }
 
@@ -51,19 +47,17 @@ _node_ready() {
 
 tr_status() {
   local node_index=$1
-  local api_port=$((_base_api_port + node_index))
-  curl -fsS "http://127.0.0.1:$api_port/status" 2> /dev/null | jq .
+  curl -fsS "http://$(_tr_node_ip "$node_index"):$TR_API_PORT/status" 2> /dev/null | jq .
 }
 
 tr_start_node() {
   local node_index=$1
-  local api_port=$((_base_api_port + node_index))
-  local listen_port=$((_base_listen_port + node_index))
   shift
   local args=("$@")
   args+=(
-    "--api-port=$api_port"
-    "--listen-port=$listen_port"
+    "--api-port=$TR_API_PORT"
+    "--listen-port=$TR_LISTEN_PORT"
+    "--listen-ip=$(_tr_node_ip "${node_index}")"
     "--log-level=$TR_LOG_LEVEL"
   )
 
@@ -98,23 +92,26 @@ tr_start_network() {
 
 tr_transfer_regular() {
   local source_node=$1 dest_node=$2 size=$3
-  local source_api_port=$((_base_api_port + source_node))
-  local dest_listen_port=$((_base_listen_port + dest_node))
   local label="${source_node} -> ${dest_node}"
   local logfile="${TR_TRANSFER_LOGS}/regular-${source_node}-${dest_node}-${RANDOM}.log"
+  local src_ip dest_ip
+  src_ip=$(_tr_node_ip "$source_node")
+  dest_ip=$(_tr_node_ip "$dest_node")
 
   _tr_timeformat TIMEFORMAT "$source_node" "$dest_node" "$size"
 
   echo_log "Starting transfer." "$label" "$logfile"
   { time with_log "$label" "$logfile" \
-      curl -fsS -X POST "http://127.0.0.1:$source_api_port/request" \
+      curl -fsS -X POST "http://${src_ip}:${TR_API_PORT}/request" \
         -H "Content-Type: application/json" \
-        -d '{"address": "/ip4/127.0.0.1/tcp/'"$dest_listen_port/"'", "size": '"$size"'}' ; } 2>> "${TR_MEASUREMENTS}"
+        -d '{"address": "/ip4/'"${dest_ip}/tcp/$TR_LISTEN_PORT/"'", "size": '"$size"'}' ; } \
+          2>> "${TR_MEASUREMENTS}"
 }
 
 tr_transfer_mix() {
   local source_node=$1 dest_node=$2 size=$3
-  local source_api_port=$((_base_api_port + source_node))
+  local src_ip
+  src_ip=$(_tr_node_ip "$source_node")
   local dest_peer_id
   dest_peer_id=$(tr_peer_id "$dest_node")
   local label="${source_node} -> ${dest_node}"
@@ -133,9 +130,9 @@ tr_transfer_mix() {
 
   echo_log "Starting mix transfer ($source_node -> $dest_node)." "$label" "$logfile"
   { time with_log "$label" "$logfile" \
-      curl --fail-with-body --no-progress-meter -X POST "http://127.0.0.1:$source_api_port/request" \
+      curl --fail-with-body --no-progress-meter -X POST "http://${src_ip}:${TR_API_PORT}/request" \
         -H "Content-Type: application/json" \
-        -d '{"peerId": "'"$dest_peer_id"'", "size": '"$size"'}' ; } 2>> "${TR_MEASUREMENTS}"
+        -d '{"peerId": "'"${dest_peer_id}"'", "size": '"${size}"'}' ; } 2>> "${TR_MEASUREMENTS}"
 }
 
 tr_kill_node() {
