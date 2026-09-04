@@ -11,9 +11,9 @@ SCRIPT_DIR=${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
 TR_BASE=$(realpath "${SCRIPT_DIR}/output")
 export TR_BASE
 
-# shellcheck source=../harness/harness.bash
+# shellcheck source=../../harness/harness.bash
 source "${SCRIPT_DIR}/../../harness/harness.bash"
-# shellcheck source=../harness/harness.bash
+# shellcheck source=../../harness/harness.bash
 source "${SCRIPT_DIR}/../../harness/emu-profiles.bash"
 
 # How many nodes should the network have?

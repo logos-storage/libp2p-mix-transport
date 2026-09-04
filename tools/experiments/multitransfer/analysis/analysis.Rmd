@@ -7,9 +7,17 @@ output:
 
 ```{r setup, include=FALSE}
 library(tidyverse)
+data_path <- "../output"
+```
 
-# FIXME experiment data should probably be within the `multitransfer` dir.
-data_path <- "../outputs"
+```{r}
+NETWORK_ORDER <- c(
+  'none',
+  'wired',
+  'wired-lossy',
+  'hi-delay-jittery',
+  'hi-delay-jittery-lossy'
+)
 ```
 
 ```{r}
@@ -18,15 +26,17 @@ transfers <- read_csv(
 ) |>
   mutate(
     wallclock = as.numeric(wallclock),
-    concurrent = as.factor(concurrent)
+    concurrent = factor(concurrent, levels = sort(unique(concurrent))),
+    emulator = factor(emulator, levels = NETWORK_ORDER)
   ) |>
   filter(!is.na(wallclock))
 ```
 
 ```{r}
 means <- transfers |> 
-  group_by(netsize, concurrent, strategy) |>
+  group_by(netsize, concurrent, strategy, emulator) |>
   summarise(wallclock = median(wallclock, na.rm = TRUE), .groups = "drop")
+means
 ```
 
 ```{r}
@@ -47,4 +57,31 @@ ggplot(transfers,
   theme(
     strip.text = ggtext::element_markdown()
   )
+```
+
+
+```{r}
+options(ark.plot.width = 10)
+options(ark.plot.height = 6)
+
+ggplot(transfers, 
+  aes(x = emulator, y = wallclock, group = emulator, fill = emulator)) + 
+  geom_point(col = scales::alpha("black", 0.1)) + 
+  geom_violin() +
+  facet_wrap(strategy ~ netsize, labeller = labeller(
+    strategy = function(x) paste0("Delay strategy: **", x, "**"),
+    netsize = function(x) paste0("Network size: **", x, "**")
+  )) +
+  ylab("transfer time (s)") +
+  xlab("") + 
+  theme_minimal() +
+  guides(fill = "none") + 
+  theme(
+    strip.text = ggtext::element_markdown()
+  )
+```
+
+
+```{r}
+means
 ```

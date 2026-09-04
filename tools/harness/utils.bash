@@ -71,3 +71,26 @@ with_log() {
   local label="$1" logfile="$2" cmd=("${@:3}")
   "${cmd[@]}" 2>&1 | label "$label" | tee -a "$logfile" 2>&1
 }
+
+start_sudo_keepalive() {
+  if [[ -v _sudo_keepalive_pid ]]; then
+    echoerr "sudo keepalive already started"
+    return 0
+  fi
+
+  echoerr "start sudo keepalive"
+  sudo -v
+  while sudo -n true 2> /dev/null; do
+    sleep 30
+    echoerr "refresh sudo"
+  done &
+  _sudo_keepalive_pid=$!
+}
+
+stop_sudo_keepalive() {
+  if [[ -v _sudo_keepalive_pid ]]; then
+    echoerr "stop sudo keepalive"
+    kill $_sudo_keepalive_pid 2> /dev/null || true
+    unset _sudo_keepalive_pid
+  fi
+}
