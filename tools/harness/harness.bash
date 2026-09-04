@@ -26,6 +26,7 @@ reload() {
 
 cleanup() {
   tr_kill_nodes
+  stop_sudo_keepalive
 }
 
 _sourced=1
