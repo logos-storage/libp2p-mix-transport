@@ -4,7 +4,7 @@
 
 import std/[deques, tables]
 
-import chronos
+import chronicles, chronos
 import results
 import libp2p/peerid
 import libp2p/utils/opt
@@ -13,6 +13,9 @@ import ./streams
 from ./wire import
   DefaultReplySurbRedundancy, MaxSessionIdBytes, MaxSurbSupplySequence,
   SurbSupplyAckBitmapBytes, SurbSupplySequence, SurbSupplyWindow, StreamId
+
+logScope:
+  topics = "mix-transport sessions"
 
 const DefaultRecipientSurbCapacity* = 16
 
@@ -187,6 +190,7 @@ proc addRecipientSession*(
   ok(session)
 
 proc establish*(session: TransportSession) =
+  trace "session established successfully", sessionId = session.sessionId, role = session.role
   session.state = SessionState.Established
   session.established.fire()
 
@@ -640,6 +644,9 @@ proc shutdown*(session: TransportSession): Future[void] {.async: (raises: []).} 
 proc remove*(store: SessionStore, sessionId: PeerId): Opt[TransportSession] =
   let session = store.get(sessionId).valueOr:
     return Opt.none(TransportSession)
+
+  trace "removing session", sessionId = session.sessionId,
+    role = session.role, state = session.state
 
   store.bySessionId.del(sessionId)
   session.destination.withValue(destination):

@@ -19,13 +19,16 @@ requires "results >= 0.5.0"
 
 import os, strutils
 
-let
+var
   nimc = getEnv("NIMC", "nim")
   flags = getEnv("NIMFLAGS", "")
   styleFlags = "--styleCheck:usages --styleCheck:error"
 
 proc compile(filename: string) =
   exec nimc & " c " & styleFlags & " " & flags & " " & filename
+
+proc compile(filename: string, output: string) =
+  exec nimc & " c " & styleFlags & " " & flags & " -o:" & output & " " & filename
 
 proc buildExample(filename: string) =
   compile("examples/" & filename)
@@ -39,3 +42,7 @@ task test, "Run tests":
 task example, "Build examples":
   buildExample("mix_ping_tcp.nim")
   buildExample("mix_ping_quic.nim")
+
+task node, "Build standalone node":
+  flags &= " -d:release"
+  compile("tools/node/cli.nim", "tools/node/node")

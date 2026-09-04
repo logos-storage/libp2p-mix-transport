@@ -33,8 +33,9 @@ suite "MixTransport lifecycle":
   test "Data retransmissions are enabled by default and can be disabled":
     let
       mix = createMixProtocol()
-      defaultTransport = newMixTransport(mix)
-      retransmissionsDisabled = newMixTransport(mix, enableDataRetransmissions = false)
+      defaultTransport = MixTransport.newMixTransport(mix)
+      retransmissionsDisabled = MixTransport.newMixTransport(mix,
+        enableDataRetransmissions = false)
 
     check:
       defaultTransport.dataRetransmissionsEnabled
@@ -43,8 +44,8 @@ suite "MixTransport lifecycle":
   test "status probe recovery has bounded configurable attempts":
     let
       mix = createMixProtocol()
-      defaultTransport = newMixTransport(mix)
-      configuredTransport = newMixTransport(
+      defaultTransport = MixTransport.newMixTransport(mix)
+      configuredTransport = MixTransport.newMixTransport(
         mix,
         reverseActivityTimeout = 1.minutes,
         surbStatusProbeRetryInterval = 5.seconds,
@@ -63,8 +64,8 @@ suite "MixTransport lifecycle":
   test "start and stop own the Mix plug-in registrations":
     let
       mix = createMixProtocol()
-      first = newMixTransport(mix)
-      second = newMixTransport(mix)
+      first = MixTransport.newMixTransport(mix)
+      second = MixTransport.newMixTransport(mix)
 
     # The first transport acquires both Mix plug-in registrations.
     check waitFor(first.start()).isOk
@@ -87,7 +88,7 @@ suite "MixTransport lifecycle":
   test "failed start rolls back the service registration":
     let
       mix = createMixProtocol()
-      transport = newMixTransport(mix)
+      transport = MixTransport.newMixTransport(mix)
 
     # Occupy the raw SURB reply handler slot. Transport startup will register
     # its service handler first and then fail to register its SURB handler.
@@ -107,6 +108,6 @@ suite "MixTransport lifecycle":
     # failed startup rolled its already-registered service handler back.
     mix.unregisterRawSurbReplyHandler()
 
-    let replacement = newMixTransport(mix)
+    let replacement = MixTransport.newMixTransport(mix)
     check waitFor(replacement.start()).isOk
     waitFor(replacement.stop())

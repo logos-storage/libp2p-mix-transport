@@ -4,7 +4,7 @@
 
 import std/tables
 
-import chronos, results
+import chronicles, chronos, results
 import libp2p/peerid
 import libp2p/stream/bufferstream
 import libp2p/utils/future
@@ -13,6 +13,9 @@ import libp2p/utils/opt
 from ./wire import
   AckBitmapBytes, MaxDataSequenceNumber, MaxInflightChunks, ReceiveWindowChunks,
   SequenceNumber, StreamId
+
+logScope:
+  scope = "mix-transport streams"
 
 type
   StreamWriteHandler* = proc(data: sink seq[byte]): Future[void] {.
@@ -204,7 +207,9 @@ proc waitForOutboundCapacity*(
     if stream.canReserveOutbound:
       return
     stream.sendStateChanged.clear()
+    trace "awaiting for outbound capacity", sessionId = stream.sessionId
     await stream.sendStateChanged.wait()
+  trace "stream has outbound capacity", sessionId = stream.sessionId
 
 proc reserveOutbound*(
     stream: TransportStream, payload: seq[byte]
@@ -311,6 +316,8 @@ proc setWriteHandler*(stream: TransportStream, handler: StreamWriteHandler) =
   stream.writeHandler = handler
 
 proc establish*(stream: TransportStream) =
+  trace "stream established successfully", streamId = stream.streamId,
+    sessionId = stream.sessionId, direction = stream.direction
   stream.state = StreamState.Established
   stream.resolved.fire()
 
@@ -347,6 +354,7 @@ proc cancelAndWaitForStreamTasks*(
 proc shutdown*(stream: TransportStream): Future[void] {.async: (raises: []).} =
   # Keep a local reference because a cancelled handler clears the field while
   # completing its own cleanup.
+  trace "shutting down stream", sessionId = stream.sessionId, streamId = stream.streamId
   let handlerTask = stream.handlerTask
   await stream.close()
   await stream.cancelAndWaitForStreamTasks()

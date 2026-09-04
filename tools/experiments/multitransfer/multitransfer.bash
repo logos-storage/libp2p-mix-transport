@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+#
+# Transfers multiple files concurrently over pairs of nodes in an
+# arbitrarily sized network.
+#
+# multitransfer.bash <n_nodes> <n_transfers> <concurrent> <filesize_bytes> <use_mix>
+set -euo pipefail
+SCRIPT_DIR=${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
+
+# Data goes into ./output
+TR_BASE=$(realpath "${SCRIPT_DIR}/output")
+export TR_BASE
+
+# shellcheck source=../../harness/harness.bash
+source "${SCRIPT_DIR}/../../harness/harness.bash"
+# shellcheck source=../../harness/harness.bash
+source "${SCRIPT_DIR}/../../harness/emu-profiles.bash"
+
+# How many nodes should the network have?
+N_NODES=${1:-40}
+tr_field netsize "${N_NODES}"
+# How many transfers we want to run?
+N_TRANSFERS=${2:-50}
+# How many to run concurrently?
+N_CONCURRENT=${3:-5}
+tr_field concurrent "${N_CONCURRENT}"
+# What file size?
+N_BYTES=${4:-1048576}
+# Use mix?
+USE_MIX=${5:-true}
+tr_field mix "${USE_MIX}"
+# What delay strategy?
+MIX_STRATEGY=${6:-default}
+tr_field strategy "${MIX_STRATEGY}"
+# Emulator profile?
+EMU_PROFILE=${7:-none}
+tr_field emulator "${EMU_PROFILE}"
+
+if [ "${EMU_PROFILE}" != "none" ]; then
+  #shellcheck disable=SC2046
+  emu_set_params $(emu_profile "${EMU_PROFILE}")
+  emu_enter
+fi
+
+echoerr "Running multitransfer experiment with:"
+echoerr "  Nodes: ${N_NODES}"
+echoerr "  Transfers: ${N_TRANSFERS}"
+echoerr "  Concurrent: ${N_CONCURRENT}"
+echoerr "  File size: ${N_BYTES}"
+echoerr "  Use mix: ${USE_MIX}"
+echoerr "  Mix delay strategy: ${MIX_STRATEGY}"
+echoerr "  Emulator profile: ${EMU_PROFILE}"
+
+_running=()
+_remaining="${N_TRANSFERS}"
+
+tr_kill_nodes
+tr_init
+tr_start_network "${N_NODES}" "--mix-config=${MIX_STRATEGY}"
+
+poll_transfers() {
+  echoerr "Running transfer PIDs: ${_running[*]}"
+  if [ ${#_running[@]} -gt 0 ]; then
+    # Blocks till a transfer exits.
+    wait -n "${_running[@]}"
+    # We don't know from `wait`` what's the PID of the
+    # process that quit, so check all of them and update
+    # the running process array.
+    for pid in "${_running[@]}"; do
+      if ! kill -0 "$pid" 2>/dev/null; then
+        array_remove _running "$pid"
+        # bash treats arithmetic expressions as errors when
+        # they evaluate to 0, so we use `|| true` or the script
+        # crashes (!!!)
+        ((--_remaining)) || true
+        echoerr "-> ${_remaining}/${N_TRANSFERS} remaining"
+      fi
+    done
+  else
+    # Nothing to wait on, just sleeps a bit.
+    sleep 0.5
+  fi
+}
+
+if [ "$USE_MIX" = true ]; then
+    _tr_transfer=tr_transfer_mix
+else
+    _tr_transfer=tr_transfer_regular
+fi
+
+while [ "${_remaining}" -gt 0 ]; do
+    _to_launch=$((N_CONCURRENT - ${#_running[@]}))
+    _max_launch=$((_remaining - ${#_running[@]}))
+    _to_launch=$(( _to_launch < _max_launch ? _to_launch : _max_launch ))
+    if [ $_to_launch -gt 0 ]; then
+        echoerr "${#_running[@]}/${N_CONCURRENT} transfers running, starting ${_to_launch} more"
+        for _ in $(seq 1 $_to_launch); do
+            mapfile -t _pair < <(shuf -i "${MIX_PATH_LENGTH}"-$((N_NODES - 1)) -n 2 | sort -nr)
+            _src=${_pair[0]}
+            _dst=${_pair[1]}
+            $_tr_transfer "${_src}" "${_dst}" "${N_BYTES}" &
+            _running+=($!)
+        done
+    fi
+    poll_transfers
+done
+
+echoerr "Done."
