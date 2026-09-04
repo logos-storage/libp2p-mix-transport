@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  NIMBLE_FLAGS: "-y"
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.10"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve Mix revision
+        id: mix-revision
+        run: |
+          revision="$(git ls-remote \
+            https://github.com/logos-co/nim-libp2p-mix.git \
+            refs/heads/feat/mix-transport | cut -f1)"
+          test -n "$revision"
+          echo "Mix revision: $revision"
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Nimble dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.nimble/pkgcache
+            nimbledeps/bin
+            nimbledeps/pkgs2
+            nimbledeps/nimbledata2.json
+          key: nimble-${{ runner.os }}-2.2.10-${{ steps.mix-revision.outputs.revision }}-${{ hashFiles('libp2p_mix_transport.nimble') }}
+          restore-keys: |
+            nimble-${{ runner.os }}-2.2.10-${{ steps.mix-revision.outputs.revision }}-
+
+      - name: Install dependencies
+        run: |
+          nim --version
+          nimble --version
+          make setup NIMBLE_FLAGS="$NIMBLE_FLAGS"
+
+      - name: Test
+        run: make test NIMBLE_FLAGS="$NIMBLE_FLAGS"
+
+      - name: Build examples
+        run: make example NIMBLE_FLAGS="$NIMBLE_FLAGS"

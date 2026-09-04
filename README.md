@@ -1,6 +1,61 @@
-# storage transport over libp2p MIX protocol
+# libp2p Mix transport
 
-TBD...
+`libp2p_mix_transport` provides a generic byte-stream transport over the libp2p
+Mix protocol. It is under active development.
+
+## Building
+
+The project requires Nim 2.2.4 or newer, Nimble and Git. From a fresh clone:
+
+```bash
+make setup NIMBLE_FLAGS="-y"
+make test
+make example
+```
+
+`make setup` installs dependencies in the repository-local `nimbledeps/`
+directory and generates `nimble.paths`. It uses the currently selected system
+compiler instead of allowing Nimble to install another Nim version. If
+Choosenim is available, the Makefile resolves its selected underlying compiler;
+otherwise it uses `nim` from `PATH`. Set `NIMBLE_NIM` explicitly to override
+that selection.
+
+`NIMBLE_FLAGS` is passed through to Nimble. For example, omit `-y` for an
+interactive setup or use a different dependency solver when troubleshooting:
+
+```bash
+make setup NIMBLE_FLAGS="--solver:legacy"
+```
+
+`NIMFLAGS` is consumed by the test and example tasks:
+
+```bash
+make test NIMFLAGS="-d:release"
+```
+
+The main development commands are:
+
+```bash
+make test     # run the test suite
+make example  # compile the TCP and QUIC examples
+make format   # format tracked Nim files with nph
+make clean    # remove generated dependencies and build output
+```
+
+`make format` expects `nph` to be installed and available in `PATH`.
+
+The two current demos exercise Mix over TCP and QUIC and can also be run
+directly after setup:
+
+```bash
+nim c -r examples/mix_ping_tcp.nim
+nim c -r examples/mix_ping_quic.nim
+```
+
+They are retained while the transport is being built, but they do not yet
+demonstrate the transport API. A transport-specific example will later model a
+realistic bidirectional protocol with separate streams, similar to the stream
+arrangement used by block exchange.
 
 ## Docs
 
@@ -62,24 +117,6 @@ $$
 > If you are reading this on GitHub you already see that GitHub Markdown rendering is absolutly not sufficient...
 
 
-## Quick Start
-
-Prerequisites:
-
-- Nim 2.0 or newer
-- Nimble
-- Git
-
-From a fresh clone:
-
-```bash
-nimble setup -l
-nim c -r mix_ping_tcp.nim
-```
-
-`nimble setup -l` enables project-local dependency mode, installs dependencies
-under `nimbledeps/`, and generates `nimble.paths` and `nimble.develop`.
-
 ## Local Files
 
 The repository uses `config.nims` to keep Nim build output in the local
@@ -91,19 +128,60 @@ These files and directories are local artifacts and should not be committed:
 - `nimble.paths`
 - `nimble.develop`
 - `nimcache/`
-- `mix_ping_tcp`
-- `mix_ping_quic`
+- `examples/mix_ping_tcp`
+- `examples/mix_ping_quic`
+
+## Dependency Cache Troubleshooting
+
+The Mix dependency currently follows a mutable Git branch. Nimble can keep using an older checkout from its global `pkgcache` after that branch advances, even when the project-local `nimbledeps/` directory is rebuilt.
+
+First inspect the cached Mix checkouts:
+
+```bash
+nimble_dir="${NIMBLE_DIR:-$HOME/.nimble}"
+find "$nimble_dir/pkgcache" -mindepth 1 -maxdepth 1 -type d -name '*nimlibp2pmix*' -print
+```
+
+When the stale directory has been identified, remove that exact directory manually and rebuild the local dependencies:
+
+```bash
+rm -rf "$nimble_dir/pkgcache/<verified-mix-cache-directory>"
+make clean
+make setup NIMBLE_FLAGS="-y"
+```
+
+Do not pass an unresolved wildcard to `rm`. Inspect the paths first and remove only the intended checkout.
+
+If selective cleanup is insufficient, completely reset Nimble's downloaded package and resolver state before retrying:
+
+```bash
+rm -rf "$nimble_dir/pkgcache" "$nimble_dir/pkgs2" "$nimble_dir/buildtemp"
+rm -f "$nimble_dir/nimbledata2.json" \
+  "$nimble_dir/packages_official.json" "$nimble_dir/packages_temp.json"
+make clean
+make setup NIMBLE_FLAGS="-y"
+```
+
+This is destructive global cleanup. It affects other projects, removes globally installed package sources, and can leave launchers in `$nimble_dir/bin` that need to be reinstalled.
+
+For a less destructive metadata-only retry, use:
+
+```bash
+make clean-all
+make setup NIMBLE_FLAGS="-y"
+```
+
+`clean-nimble-cache` removes only the cached package registry and SAT tag index. It does not remove downloaded package checkouts. `clean-nimbledeps` removes only this project's `nimbledeps/`, `nimble.paths`, and `nimble.develop`.
 
 ## Clean Rebuild
 
 To verify the project can be rebuilt from committed files:
 
 ```bash
-rm -rf nimbledeps nimble.paths nimble.develop nimcache \
-  mix_ping_tcp mix_ping_quic
-nimble setup -l
-nim c -r mix_ping_tcp.nim
-nim c -r mix_ping_quic.nim
+make clean
+make setup NIMBLE_FLAGS="-y"
+make test
+make example
 ```
 
 If `nimble setup -l` reports that it cannot determine the VCS revision, make at
