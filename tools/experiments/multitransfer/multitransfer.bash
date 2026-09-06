@@ -7,8 +7,8 @@
 set -euo pipefail
 SCRIPT_DIR=${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
 
-# Data goes into ./output
-TR_BASE=$(realpath "${SCRIPT_DIR}/output")
+# Data goes into ./output (unless overridden).
+TR_BASE=${TR_BASE:-$(realpath "${SCRIPT_DIR}/output")}
 export TR_BASE
 
 # shellcheck source=../../harness/harness.bash
