@@ -46,3 +46,7 @@ task example, "Build examples":
 task node, "Build standalone node":
   flags &= " -d:release"
   compile("tools/node/cli.nim", "tools/node/node")
+
+task debugNode, "Build standalone node for protocol debugging":
+  flags &= " -d:release -d:enable_mix_benchmarks -d:chronicles_sinks=json"
+  compile("tools/node/cli.nim", "tools/node/node-debug")
