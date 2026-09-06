@@ -95,7 +95,7 @@ emu_enter() {
   fi
 
   sudo ip netns exec "${MIX_NS}" sudo -u "$(id -un)" -H \
-    env _emu_inside=1 "${cmd[@]}" || result=$?
+    env _emu_inside=1 "${TR_ENV[@]}" "${cmd[@]}" || result=$?
 
   emu_teardown || true
   # Need to exit or the script will execute twice.
