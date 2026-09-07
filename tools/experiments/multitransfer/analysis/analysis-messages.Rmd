@@ -48,10 +48,16 @@ logs <- read_experiment(
   "push_unconstrained"
 ) |> bind_rows(
   read_experiment(
-    "../output/20260907114743-1301/logs/",
+    "../output/push-pull-unconstrained/logs/",
     "push_pull_unconstrained"
   )
+) |> bind_rows(
+  read_experiment(
+    "../output/new-push-pull-unconstrained/logs/",
+    "new_push_pull_unconstrained"
+  )
 )
+
 ```
 
 ## Counts
@@ -97,7 +103,7 @@ plotly::ggplotly(ggplot(logs |>
 ```{r}
 # This is one awful transform. Splitting the table into stream and connection
 # would probably do wonders.
-latencies <- logs_push |>
+latencies <- logs |>
   filter(kind %in% c("Connect", "ConnectAck", "OpenStream", "StreamAck")) |> 
   dplyr::select(experiment, sessionId, streamId, kind, direction, ts) |>
   group_by(experiment, sessionId, streamId, kind, direction) |>
@@ -164,5 +170,6 @@ ggplot(latencies) +
   xlab('time') +
   theme_minimal() +
   labs(col = 'reply at end') +
-  big_fonts(15)
+  big_fonts(15) +
+  facet_wrap(. ~ experiment, scale = 'free_x')
 ```
