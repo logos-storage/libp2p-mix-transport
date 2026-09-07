@@ -5,28 +5,32 @@ LIB_SRC=${LIB_SRC:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
 
 _netem_params=()
 
-MIX_NS="mixtests"
-ARGV=("$@")
+_MIX_NS="mixtests"
+_ARGV=("$@")
 
 _emu_tc() {
-  sudo ip netns exec "${MIX_NS}" tc "$@"
+  sudo ip netns exec "${_MIX_NS}" tc "$@"
 }
 
+## Sets netem parameters. E.g.:
+##   emu_set_parameters delay 10ms 2ms distribution normal loss 0.1% rate 100mbit
+##
+## MUST be called before emu_enter or parameters will not be set.
 emu_set_params() {
   _netem_params=("$@")
 }
 
-emu_is_inside() {
+_emu_is_inside() {
   [[ -v _emu_inside ]]
 }
 
-emu_setup() {
+_emu_setup() {
   echoerr "Setting up emulation environment"
-  sudo ip netns add "${MIX_NS}"
+  sudo ip netns add "${_MIX_NS}"
 
   # Brings up the namespace's loopback interface (by default it's down),
   # and sets the MTU to 1500 (by default it's 65536):
-  sudo ip -n "${MIX_NS}" link set dev lo up mtu 1500
+  sudo ip -n "${_MIX_NS}" link set dev lo up mtu 1500
 
   # We want to apply netem to the libp2p connections, but we don't
   # want to apply it to API calls as that would make our lives miserable :-)
@@ -35,8 +39,9 @@ emu_setup() {
 
   # Sets PRIO as root qdisc with 2 classes (bands 0 and 1). Band 0 will be
   # unshaped, Band 1 will get netem. In the absence of filters, PRIO will classify
-  # packets based on the priomap, which maps the value of the IP TOS field to a band.
-  # We set a priomap that maps everything to band 1 (netem).
+  # packets based on the priomap, which maps each of the 16 possible values
+  # of the 4-bit IP TOS field to a band. We set a priomap that maps everything to
+  # band 1 (netem).
   _emu_tc qdisc add dev lo root handle 1:0 prio bands 2 \
     priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1
 
@@ -55,11 +60,12 @@ emu_setup() {
 }
 
 ## Enters the emulation environment. Can be used both from an interactive shell or as a command.
-## When run as part of an experiment, should be the first command to be called.
+## When run as part of an experiment, should be amongst the first commands to be called, and right
+## after emu_set_params.
 # shellcheck disable=SC2120
 emu_enter() {
-  if emu_is_inside; then
-    echoerr "Inside $MIX_NS namespace."
+  if _emu_is_inside; then
+    echoerr "Inside $_MIX_NS namespace."
     return 0
   fi
 
@@ -73,7 +79,7 @@ emu_enter() {
   echoerr "Entering emulation environment."
   echoerr "WARNING: this requires 'sudo'"
 
-  if ! emu_setup; then
+  if ! _emu_setup; then
     emu_teardown || true
     return 1
   fi
@@ -89,12 +95,12 @@ emu_enter() {
       cmd=(bash -i)
     # Otherwise, we'll relaunch the current script within the environment.
     else
-      cmd=(bash "$0" "${ARGV[@]}")
+      cmd=(bash "$0" "${_ARGV[@]}")
       reexec=1
     fi
   fi
 
-  sudo ip netns exec "${MIX_NS}" sudo -u "$(id -un)" -H \
+  sudo ip netns exec "${_MIX_NS}" sudo -u "$(id -un)" -H \
     env _emu_inside=1 "${TR_ENV[@]}" "${cmd[@]}" || result=$?
 
   emu_teardown || true
@@ -107,5 +113,5 @@ emu_enter() {
 
 emu_teardown() {
   echoerr "Tearing down emulation environment"
-  sudo ip netns del "${MIX_NS}" || true
+  sudo ip netns del "${_MIX_NS}" || true
 }
