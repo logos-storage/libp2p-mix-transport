@@ -2,7 +2,7 @@
 
 {.used.}
 
-import std/unittest
+import std/[sequtils, unittest]
 
 import chronos
 import results
@@ -174,6 +174,46 @@ suite "MixTransport sessions":
     check:
       session.pendingSurbSupplyCount == 0
       session.availableSurbSupplySlots == DefaultRecipientSurbCapacity - 3
+      session.estimatedRemoteSurbInventory == 3
+
+    let suppliedCount = session.availableSurbSupplySlots
+    check session.registerSurbSupply(
+      newSeqWith(suppliedCount, newSeq[byte](1)), newSeq[SURBIdentifier](suppliedCount)
+    ).isOk
+    check:
+      session.availableSurbSupplySlots == 0
+      session.estimatedRemoteSurbInventory == DefaultRecipientSurbCapacity
+
+    # Consuming two SURBs advances the remote supply limit by two. The
+    # initiator consequently estimates that fourteen entries remain, counting
+    # any allocated replacement SURBs as part of the projected inventory.
+    check session.applySurbSupplySnapshot(
+      SurbSupplySnapshot(
+        receiveBase: SurbSupplySequence(DefaultRecipientSurbCapacity),
+        acknowledgementBitmap: newSeq[byte](SurbSupplyAckBitmapBytes),
+        supplyLimit: SurbSupplySequence(DefaultRecipientSurbCapacity + 2),
+      )
+    )
+    check:
+      session.availableSurbSupplySlots == 2
+      session.estimatedRemoteSurbInventory == DefaultRecipientSurbCapacity - 2
+      not session.isSurbReplenishmentDue(DefaultSurbReplenishmentLowWatermark)
+
+    # Once the projected inventory reaches the low watermark, the supplier
+    # starts a replenishment cycle and retains it until all newly advertised
+    # capacity has been allocated.
+    check session.applySurbSupplySnapshot(
+      SurbSupplySnapshot(
+        receiveBase: SurbSupplySequence(DefaultRecipientSurbCapacity),
+        acknowledgementBitmap: newSeq[byte](SurbSupplyAckBitmapBytes),
+        supplyLimit:
+          SurbSupplySequence(DefaultRecipientSurbCapacity + MaxSurbSupplyPerFrame),
+      )
+    )
+    check:
+      session.availableSurbSupplySlots == MaxSurbSupplyPerFrame
+      session.estimatedRemoteSurbInventory == DefaultSurbReplenishmentLowWatermark
+      session.isSurbReplenishmentDue(DefaultSurbReplenishmentLowWatermark)
 
   test "reverse activity resets unanswered status probe attempts":
     let

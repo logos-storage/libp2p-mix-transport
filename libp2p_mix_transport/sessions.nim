@@ -53,6 +53,8 @@ type
     role: SessionRole
     state: SessionState
     established: AsyncEvent
+    closedEvent: AsyncEvent
+    remoteDisconnectRequested: bool
     receivedSurbs: Deque[SURB]
     recipientSurbCapacity: int
     surbSupplyInitialized: bool
@@ -61,6 +63,7 @@ type
     surbSupplyLimit: SurbSupplySequence
     replyCapacityStateChanged: AsyncEvent
     replySendLock: AsyncLock
+    remoteSurbCapacity: int
     remoteSurbSupplyReceiveBase: SurbSupplySequence
     remoteSurbSupplyLimit: SurbSupplySequence
     nextSurbSupplySequence: Opt[SurbSupplySequence]
@@ -104,6 +107,9 @@ func remoteSurbSupplyLimit*(session: TransportSession): SurbSupplySequence =
 func streamCount*(session: TransportSession): int =
   session.streams.len
 
+func remoteDisconnectRequested*(session: TransportSession): bool =
+  session.remoteDisconnectRequested
+
 func peerId*(session: TransportSession): PeerId =
   ## Identity exposed to consumers of this transport. The initiator knows the
   ## real destination; the recipient knows only the session pseudonym.
@@ -144,6 +150,7 @@ proc addInitiatorSession*(
     role: SessionRole.Initiator,
     state: SessionState.Pending,
     established: newAsyncEvent(),
+    closedEvent: newAsyncEvent(),
     receivedSurbs: initDeque[SURB](),
     recipientSurbCapacity: store.recipientSurbCapacity,
     surbSupplyAcknowledgementBitmap: newSeq[byte](SurbSupplyAckBitmapBytes),
@@ -175,6 +182,7 @@ proc addRecipientSession*(
     role: SessionRole.Recipient,
     state: SessionState.Pending,
     established: newAsyncEvent(),
+    closedEvent: newAsyncEvent(),
     receivedSurbs: initDeque[SURB](),
     recipientSurbCapacity: store.recipientSurbCapacity,
     surbSupplyAcknowledgementBitmap: newSeq[byte](SurbSupplyAckBitmapBytes),
@@ -198,6 +206,18 @@ proc waitUntilEstablished*(
     session: TransportSession
 ): Future[void] {.async: (raw: true, raises: [CancelledError]).} =
   session.established.wait()
+
+proc waitUntilClosed*(
+    session: TransportSession
+): Future[void] {.async: (raw: true, raises: [CancelledError]).} =
+  session.closedEvent.wait()
+
+proc requestRemoteDisconnect*(session: TransportSession) =
+  session.remoteDisconnectRequested = true
+
+proc receiveRemoteReset*(session: TransportSession) =
+  for stream in session.streams.values:
+    stream.receiveRemoteReset()
 
 proc addReceivedSurbs*(
     session: TransportSession, surbs: sink seq[SURB]
@@ -334,6 +354,18 @@ func availableSurbSupplySlots*(session: TransportSession): int =
   if uint64(nextSequence) >= upperBound:
     return 0
   int(upperBound - uint64(nextSequence))
+
+func estimatedRemoteSurbInventory*(session: TransportSession): int =
+  ## Estimate how many SURBs the recipient has or will have after all numbered
+  ## supply already allocated by the initiator arrives. Supply retransmission
+  ## is responsible for allocated SURBs that have not arrived yet.
+  if session.role != SessionRole.Initiator or session.remoteSurbCapacity == 0:
+    return 0
+  max(0, session.remoteSurbCapacity - session.availableSurbSupplySlots)
+
+func isSurbReplenishmentDue*(session: TransportSession, lowWatermark: int): bool =
+  session.availableSurbSupplySlots > 0 and
+    session.estimatedRemoteSurbInventory <= lowWatermark
 
 proc registerSurbSupply*(
     session: TransportSession,
@@ -480,6 +512,9 @@ proc applySurbSupplySnapshot*(
   let nextSequence = session.nextSurbSupplySequence.get(SurbSupplySequence.high)
   if snapshot.receiveBase > nextSequence:
     return false
+
+  if session.remoteSurbCapacity == 0:
+    session.remoteSurbCapacity = int(snapshot.supplyLimit)
 
   var acknowledged: seq[SurbSupplySequence]
   for sequence in session.pendingSurbSupply.keys:
@@ -638,8 +673,10 @@ proc shutdown*(session: TransportSession): Future[void] {.async: (raises: []).} 
   let streams = session.takeStreams()
   var shutdownTasks = newSeqOfCap[Future[void].Raising([])](streams.len)
   for stream in streams:
+    stream.suppressRemoteTeardown()
     shutdownTasks.add(stream.shutdown())
   await noCancel shutdownTasks.allFutures()
+  session.closedEvent.fire()
 
 proc remove*(store: SessionStore, sessionId: PeerId): Opt[TransportSession] =
   let session = store.get(sessionId).valueOr:
