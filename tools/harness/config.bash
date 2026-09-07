@@ -9,9 +9,10 @@ set | grep "^TR_" --color=never
 # Stuff you might want to change:
 TR_NODE_BINARY=${TR_NODE_BINARY:-$(realpath "${LIB_SRC}/../node/node")}
 TR_BASE=${TR_BASE:-$(realpath "${LIB_SRC}/../../experiment-output")}
-TR_LOG_LEVEL="INFO"
+TR_LOG_LEVEL=${TR_LOG_LEVEL:-"INFO"}
 # Use for debugging:
-# TR_LOG_LEVEL="INFO;trace:mix_transport,transport"
+#   TR_LOG_LEVEL="INFO;trace:mix-transport"
+#   TR_LOG_LEVEL="INFO;trace:mix-transport-messages"
 TR_API_PORT=${TR_API_PORT:-8000}
 TR_LISTEN_PORT=${TR_LISTEN_PORT:-9000}
 
@@ -26,8 +27,8 @@ while IFS= read -r line; do
   name=$(echo "$line" | grep -o '^[^=]*')
   if [[ "$name" != "TR_ENV" ]]; then
     export "${name?}"
-    TR_ENV+=("${line}")
-    echoerr "  ${line}"
+    TR_ENV+=("${name}=${!name}")
+    echoerr "  ${name}=${!name}"
   fi
 done < <(set | grep '^TR_')
 

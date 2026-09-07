@@ -35,7 +35,7 @@ proc updateLogLevel*(logLevel: string) {.raises: [ValueError].} =
   except ValueError:
     raise (ref ValueError)(
       msg:
-        "Please specify one of: trace, debug, " & "info, notice, warn, error or fatal"
+        "Please specify one of: trace, debug, " & "info, notice, warn, error or fatal (but not " & directives[0] & ")"
     )
 
   if directives.len > 1:
