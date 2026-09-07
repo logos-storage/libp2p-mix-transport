@@ -16,11 +16,6 @@ type MsgDir = enum
   Inbound = "in"
   Outbound = "out"
 
-# Chronicles splices property expressions *after* the runtime topic check, so
-# everything below must stay inside the `trace` statement. Hoisting any of it
-# into a `let` in the template body makes it run on every frame even when the
-# topic is off - which, for the payload digest, is a SHA-256 per frame.
-
 template payloadDigest(frame: MixTransportFrame): string =
   if frame.payload.isSome:
     toHex(sha256.digest(frame.payload.get()).data)
@@ -33,7 +28,7 @@ template uint32def(value: Opt[uint32]): string =
   else:
     ""
 
-template traceMsg(dir: MsgDir, frame: MixTransportFrame, surbKey: string = "") =
+proc traceMsg(dir: MsgDir, frame: MixTransportFrame, surbKey: string = "") =
   trace "msgtrace",
     direction = $dir,
     sessionId = frame.sessionId.shortLog,
@@ -47,10 +42,10 @@ template traceMsg(dir: MsgDir, frame: MixTransportFrame, surbKey: string = "") =
     rejectionReason = frame.rejectionReason.valueOr(""),
     surb = surbKey
 
-template traceMsg(dir: MsgDir, reply: RawSurbReply) =
+proc traceMsg(dir: MsgDir, reply: RawSurbReply) =
   # TODO figure out how to extract the key from this
   #   and trace it as we do with outbound SURB messages.
-  trace "msgtrace", dir = $dir, kind = "RawSurbReply"
+  trace "msgtrace", direction = $dir, kind = "RawSurbReply"
 
 template traceOutbound*(frame: MixTransportFrame) =
   traceMsg(Outbound, frame)
