@@ -11,7 +11,7 @@ import libp2p/stream/connection
 import libp2p/utils/opt
 import libp2p_mix
 from libp2p_mix/serialization import SurbSize
-import ./[reply_credentials, sessions, streams, wire]
+import ./[reply_credentials, sessions, streams, trace, wire]
 
 logScope:
   topics = "mix-transport transport"
@@ -111,6 +111,8 @@ proc handleReplyFrame(
     sessionId = frame.sessionId
     kind = frame.kind
 
+  traceInbound(frame)
+
   let session = self.sessions.get(frame.sessionId).valueOr:
     trace "discard reply frame - unknown session"
     return
@@ -163,6 +165,7 @@ method sendWithSurbRedundancyBatch(
   for surb in surbs.mitems:
     # Each SURB is consumed once, but every redundant packet needs the same
     # payload. Passing payload without move lets Nim copy it for each send.
+    traceOutbound(surb, payload)
     if (await self.mix.sendWithSurb(move(surb), payload)).isOk:
       sent = true
 
@@ -192,6 +195,8 @@ proc sendStreamFrame(
   of SessionRole.Initiator:
     let payload = frame.encode().valueOr:
       return err("could not encode " & $frame.kind & " frame: " & error)
+
+    traceOutbound(frame)
     let destination = session.destination.valueOr:
       return err("initiator session has no destination")
     (
@@ -200,6 +205,7 @@ proc sendStreamFrame(
       )
     ).isOkOr:
       return err("could not send " & $frame.kind & " frame: " & error)
+
   of SessionRole.Recipient:
     await session.acquireReplySend()
     defer:
@@ -611,6 +617,8 @@ proc handleDelivery(
     error "failed to decode mix transport frame", error = error
     return
 
+  traceInbound(frame)
+
   trace "handling request transport frame",
     frameKind = frame.kind, sessionId = frame.sessionId
   case frame.kind
@@ -632,6 +640,8 @@ proc handleDelivery(
 proc handleRawSurbReply(
     self: MixTransport, reply: RawSurbReply
 ): Future[RawSurbReplyDisposition] {.async: (raises: [CancelledError]).} =
+
+  traceInbound(reply)
   if self.replyCredentials.isRetiredIdentifier(reply.identifier):
     return RawSurbReplyDisposition.Handled
 
@@ -902,6 +912,7 @@ proc connectInternal(
   let payload = frame.encode().valueOr:
     return err("could not encode Connect frame: " & error)
 
+  traceOutbound(frame)
   (
     await self.mix.send(
       MixDestination.exitNode(destination), MixTransportCodec, payload
@@ -1076,6 +1087,7 @@ proc dial*(
     firstSupplySequence = Opt.some(firstSequence)
     frame.firstSurbSequence = firstSupplySequence
 
+  traceOutbound(frame)
   let payload = frame.encode().valueOr:
     return err("could not encode OpenStream frame: " & error)
   (
@@ -1084,6 +1096,7 @@ proc dial*(
     )
   ).isOkOr:
     return err("could not send OpenStream frame: " & error)
+
   keepReplyCredentials = true
   firstSupplySequence.withValue(sequence):
     session.scheduleSurbSupplyRetransmission(
