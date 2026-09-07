@@ -242,6 +242,32 @@ suite "MixTransport wire format":
       streamId: Opt.some(StreamId(5)),
     ).encode().isOk
 
+  test "graceful stream close carries the sender's final Data sequence":
+    let frame = MixTransportFrame(
+      version: MixTransportVersion,
+      sessionId: randomSessionId(),
+      kind: FrameKind.CloseStream,
+      streamId: Opt.some(StreamId(3)),
+      finalSequence: Opt.some(SequenceNumber(17)),
+    )
+
+    let decoded = MixTransportFrame
+      .decode(frame.encode().expect("encode failed"))
+      .expect("decode failed")
+
+    check:
+      decoded.kind == FrameKind.CloseStream
+      decoded.streamId == frame.streamId
+      decoded.finalSequence == frame.finalSequence
+
+    var missingFinalSequence = frame
+    missingFinalSequence.finalSequence = Opt.none(SequenceNumber)
+    var unexpectedFinalSequence = frame
+    unexpectedFinalSequence.kind = FrameKind.ResetStream
+    check:
+      missingFinalSequence.encode().isErr
+      unexpectedFinalSequence.encode().isErr
+
   test "unsupported versions and oversized frames are rejected":
     let unsupported = MixTransportFrame(
       version: MixTransportVersion + 1,

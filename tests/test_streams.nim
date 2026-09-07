@@ -318,3 +318,47 @@ suite "MixTransport streams":
       streamTask.cancelled()
       handlerTask.cancelled()
       waitingForResolution.finished
+
+  test "graceful remote close waits for every preceding Data sequence":
+    let
+      rng = newRng()
+      store = newSessionStore()
+      session = store.addRecipientSession(randomPeerId(rng)).expect(
+          "could not add recipient session"
+        )
+    session.establish()
+    let stream =
+      session.addInboundStream(1, "/test/1").expect("could not add inbound stream")
+
+    check not stream.receiveRemoteClose(2).expect("could not record remote close")
+    check stream.receiveData(2, @[2'u8]) == InboundDataDisposition.Accepted
+    check stream.receiveData(1, @[1'u8]) == InboundDataDisposition.Accepted
+
+    let first = stream.takeNextInbound().expect("first Data was not available")
+    stream.advanceReceiveWindow(first.sequence)
+    check not stream.remoteCloseReady
+
+    let second = stream.takeNextInbound().expect("second Data was not available")
+    stream.advanceReceiveWindow(second.sequence)
+    check stream.remoteCloseReady
+
+  test "remote reset wakes readers with LPStreamResetError":
+    let
+      rng = newRng()
+      store = newSessionStore()
+      session = store.addRecipientSession(randomPeerId(rng)).expect(
+          "could not add recipient session"
+        )
+    session.establish()
+    let stream =
+      session.addInboundStream(1, "/test/1").expect("could not add inbound stream")
+
+    var value: byte
+    let pendingRead = stream.readOnce(addr value, 1)
+    check not pendingRead.finished
+
+    stream.receiveRemoteReset()
+    waitFor stream.close()
+
+    expect LPStreamResetError:
+      discard waitFor pendingRead

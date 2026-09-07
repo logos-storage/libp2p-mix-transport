@@ -19,6 +19,10 @@ type
     async: (raises: [CancelledError, LPStreamError])
   .}
 
+  StreamTeardownHandler* = proc(
+    reset: bool, finalSequence: SequenceNumber
+  ): Future[void] {.async: (raises: []).}
+
   InboundDataDisposition* {.pure.} = enum
     Accepted
     Duplicate
@@ -52,6 +56,10 @@ type
     handlerTask: Future[void].Raising([CancelledError])
     streamTasks: seq[Future[void].Raising([CancelledError])]
     writeHandler: StreamWriteHandler
+    teardownHandler: StreamTeardownHandler
+    suppressRemoteTeardown: bool
+    remoteReset: bool
+    remoteCloseFinalSequence: Opt[SequenceNumber]
     writeLock: AsyncLock
     nextOutboundSequence: SequenceNumber
     remoteReceiveBase: SequenceNumber
@@ -93,6 +101,13 @@ func pendingOutboundCount*(stream: TransportStream): int =
 
 func nextOutboundSequence*(stream: TransportStream): SequenceNumber =
   stream.nextOutboundSequence
+
+func finalOutboundSequence*(stream: TransportStream): SequenceNumber =
+  stream.nextOutboundSequence - 1
+
+func remoteCloseReady*(stream: TransportStream): bool =
+  stream.remoteCloseFinalSequence.isSome and
+    stream.receiveBase > stream.remoteCloseFinalSequence.get()
 
 func remoteReceiveLimit*(stream: TransportStream): SequenceNumber =
   let window = SequenceNumber(ReceiveWindowChunks)
@@ -152,6 +167,9 @@ proc receiveData*(
     stream: TransportStream, sequence: SequenceNumber, payload: sink seq[byte]
 ): InboundDataDisposition =
   if sequence > MaxDataSequenceNumber:
+    return InboundDataDisposition.OutsideWindow
+  if stream.remoteCloseFinalSequence.isSome and
+      sequence > stream.remoteCloseFinalSequence.get():
     return InboundDataDisposition.OutsideWindow
   if sequence < stream.receiveBase:
     stream.fireShouldSendAckEvent()
@@ -310,6 +328,29 @@ proc setWriteHandler*(stream: TransportStream, handler: StreamWriteHandler) =
   doAssert not handler.isNil
   stream.writeHandler = handler
 
+proc setTeardownHandler*(stream: TransportStream, handler: StreamTeardownHandler) =
+  doAssert stream.teardownHandler.isNil
+  doAssert not handler.isNil
+  stream.teardownHandler = handler
+
+proc suppressRemoteTeardown*(stream: TransportStream) =
+  stream.suppressRemoteTeardown = true
+
+proc receiveRemoteClose*(
+    stream: TransportStream, finalSequence: SequenceNumber
+): Result[bool, string] =
+  if stream.remoteCloseFinalSequence.isSome and
+      stream.remoteCloseFinalSequence.get() != finalSequence:
+    return err("remote close changed the final sequence")
+  if finalSequence + 1 < stream.receiveBase:
+    return err("remote close precedes already delivered Data")
+  stream.remoteCloseFinalSequence = Opt.some(finalSequence)
+  ok(stream.remoteCloseReady)
+
+proc receiveRemoteReset*(stream: TransportStream) =
+  stream.remoteReset = true
+  stream.suppressRemoteTeardown()
+
 proc establish*(stream: TransportStream) =
   stream.state = StreamState.Established
   stream.resolved.fire()
@@ -368,21 +409,43 @@ method write*(
       raiseAssert "stream write lock was not held: " & exc.msg
   await stream.writeHandler(move(msg))
 
+method readOnce*(
+    stream: TransportStream, pbytes: pointer, nbytes: int
+): Future[int] {.async: (raises: [CancelledError, LPStreamError]).} =
+  # BufferStream represents every close as EOF. Preserve libp2p's stronger
+  # contract by exposing a remote ResetStream as LPStreamResetError to direct
+  # readers and to readExactly/readLine/readLp, which all build on readOnce.
+  if stream.remoteReset:
+    raise newLPStreamResetError()
+  let bytesRead = await procCall BufferStream(stream).readOnce(pbytes, nbytes)
+  if stream.remoteReset:
+    raise newLPStreamResetError()
+  bytesRead
+
 method getWrapped*(stream: TransportStream): Connection =
   nil
 
-method closeImpl*(
-    stream: TransportStream
-): Future[void] {.async: (raises: [], raw: true).} =
+proc closeTransportStream(
+    stream: TransportStream, reset: bool
+): Future[void] {.async: (raises: []).} =
   stream.dataAvailable.fire()
   stream.shouldSendAck.fire()
   stream.sendStateChanged.fire()
   stream.retransmissionStateChanged.fire()
   stream.resolved.fire()
   stream.streamTasks.cancelSoon()
+  await procCall BufferStream(stream).closeImpl()
+
+  if not stream.suppressRemoteTeardown and not stream.teardownHandler.isNil:
+    await stream.teardownHandler(reset, stream.finalOutboundSequence)
   if not stream.handlerTask.isNil:
     stream.handlerTask.cancelSoon()
-  procCall BufferStream(stream).closeImpl()
+
+method closeImpl*(stream: TransportStream): Future[void] {.async: (raises: []).} =
+  await stream.closeTransportStream(reset = false)
+
+method resetImpl*(stream: TransportStream): Future[void] {.async: (raises: []).} =
+  await stream.closeTransportStream(reset = true)
 
 proc newTransportStream*(
     sessionId: PeerId,

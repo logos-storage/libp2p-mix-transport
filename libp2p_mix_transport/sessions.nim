@@ -50,6 +50,8 @@ type
     role: SessionRole
     state: SessionState
     established: AsyncEvent
+    closedEvent: AsyncEvent
+    remoteDisconnectRequested: bool
     receivedSurbs: Deque[SURB]
     recipientSurbCapacity: int
     surbSupplyInitialized: bool
@@ -101,6 +103,9 @@ func remoteSurbSupplyLimit*(session: TransportSession): SurbSupplySequence =
 func streamCount*(session: TransportSession): int =
   session.streams.len
 
+func remoteDisconnectRequested*(session: TransportSession): bool =
+  session.remoteDisconnectRequested
+
 func peerId*(session: TransportSession): PeerId =
   ## Identity exposed to consumers of this transport. The initiator knows the
   ## real destination; the recipient knows only the session pseudonym.
@@ -141,6 +146,7 @@ proc addInitiatorSession*(
     role: SessionRole.Initiator,
     state: SessionState.Pending,
     established: newAsyncEvent(),
+    closedEvent: newAsyncEvent(),
     receivedSurbs: initDeque[SURB](),
     recipientSurbCapacity: store.recipientSurbCapacity,
     surbSupplyAcknowledgementBitmap: newSeq[byte](SurbSupplyAckBitmapBytes),
@@ -172,6 +178,7 @@ proc addRecipientSession*(
     role: SessionRole.Recipient,
     state: SessionState.Pending,
     established: newAsyncEvent(),
+    closedEvent: newAsyncEvent(),
     receivedSurbs: initDeque[SURB](),
     recipientSurbCapacity: store.recipientSurbCapacity,
     surbSupplyAcknowledgementBitmap: newSeq[byte](SurbSupplyAckBitmapBytes),
@@ -194,6 +201,18 @@ proc waitUntilEstablished*(
     session: TransportSession
 ): Future[void] {.async: (raw: true, raises: [CancelledError]).} =
   session.established.wait()
+
+proc waitUntilClosed*(
+    session: TransportSession
+): Future[void] {.async: (raw: true, raises: [CancelledError]).} =
+  session.closedEvent.wait()
+
+proc requestRemoteDisconnect*(session: TransportSession) =
+  session.remoteDisconnectRequested = true
+
+proc receiveRemoteReset*(session: TransportSession) =
+  for stream in session.streams.values:
+    stream.receiveRemoteReset()
 
 proc addReceivedSurbs*(
     session: TransportSession, surbs: sink seq[SURB]
@@ -634,8 +653,10 @@ proc shutdown*(session: TransportSession): Future[void] {.async: (raises: []).} 
   let streams = session.takeStreams()
   var shutdownTasks = newSeqOfCap[Future[void].Raising([])](streams.len)
   for stream in streams:
+    stream.suppressRemoteTeardown()
     shutdownTasks.add(stream.shutdown())
   await noCancel shutdownTasks.allFutures()
+  session.closedEvent.fire()
 
 proc remove*(store: SessionStore, sessionId: PeerId): Opt[TransportSession] =
   let session = store.get(sessionId).valueOr:
