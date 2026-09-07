@@ -25,8 +25,10 @@ const
   MaxInflightChunks* = 64
   SurbSupplyWindow* = 256
   SurbSupplyAckBitmapBytes* = SurbSupplyWindow div 8
-  MaxSurbSupplyPerFrame* = 4
   DefaultReplySurbRedundancy* = 2
+  MaxConnectSurbs* = 5
+  MaxOpenStreamSurbs* = 4
+  MaxSurbSupplyPerFrame* = 5
   MaxSessionIdBytes* = 39
   MaxDataSequenceNumber* = SequenceNumber.high - 1
   MaxSurbSupplySequence* = SurbSupplySequence.high - 1
@@ -201,12 +203,14 @@ proc validateFrame(
   of FrameKind.Connect:
     require frame.surbs.len >= DefaultReplySurbRedundancy,
       "connect must provide one reply redundancy batch"
+    require frame.surbs.len <= MaxConnectSurbs, "connect provides too many SURBs"
   of FrameKind.ConnectAck, FrameKind.SurbStatus:
     require carriesSurbSupplyState, "frame must provide SURB supply state"
   of FrameKind.OpenStream:
     require frame.codec.get().len > 0, "application codec must not be empty"
     require frame.surbs.len >= DefaultReplySurbRedundancy,
       "open stream must provide one reply redundancy batch"
+    require frame.surbs.len <= MaxOpenStreamSurbs, "open stream provides too many SURBs"
   of FrameKind.Data:
     require frame.sequence.get() > 0, "data sequence must not be zero"
     require frame.sequence.get() <= MaxDataSequenceNumber,
