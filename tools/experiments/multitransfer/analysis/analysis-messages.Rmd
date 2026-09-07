@@ -1,0 +1,168 @@
+---
+title: Message Analysis
+output: 
+  html_document:
+    code_folding: show
+---
+
+```{r}
+library(jsonlite)
+library(tidyverse)
+library(playaxr)
+library(plotly)
+```
+
+
+```{r}
+read_msg_log <- function(fname) {
+  print(glue::glue("Read file {fname}"))
+  pipe(glue::glue("grep 'mix-transport-messages' {fname}")) |> 
+    stream_in() |> 
+    as_tibble() |>
+    mutate(
+      across(everything(), ~ if_else(. == "", NA, .)),
+      node = as.integer(str_match(basename(fname), "^node-([0-9]+)\\.log$")[, 2])
+    )
+}
+
+read_experiment <- function(folder, label) {
+  lapply(
+    list.files(
+      folder, 
+      pattern = "*.log", 
+      full.names = TRUE
+    ), 
+    read_msg_log
+  ) |> 
+    bind_rows() |>
+    mutate(
+      ts = as.POSIXct(ts),
+      experiment = label
+    )
+}
+```
+
+```{r}
+logs <- read_experiment(
+  "../output/push-unconstrained/logs/",
+  "push_unconstrained"
+) |> bind_rows(
+  read_experiment(
+    "../output/20260907114743-1301/logs/",
+    "push_pull_unconstrained"
+  )
+)
+```
+
+## Counts
+
+```{r}
+options(ark.plot.width = 10)
+options(ark.plot.height = 6)
+
+ggplot(logs |>
+  group_by(experiment, kind, direction) |>
+  count()) + 
+  geom_bar(
+    aes(x = kind, y = n, fill = direction), position = "dodge2", stat = "identity"
+  ) + 
+  scale_y_abbrv() +
+  ylab('messages (count)') +
+  xlab('message type') + 
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  big_fonts(15) + 
+  facet_wrap(. ~ experiment)
+```
+
+```{r}
+options(ark.plot.width = 10)
+options(ark.plot.height = 6)
+
+plotly::ggplotly(ggplot(logs |>
+  mutate(time = as.POSIXct(trunc.POSIXt(ts, units = 'secs'))) |>
+  filter(direction == 'out') |>
+  group_by(experiment, kind, time) |>
+  count()) +
+  geom_point(aes(x = time, y = n, col = kind)) +
+  ylab('messages (count)') +
+  xlab('time') +
+  theme_minimal() +
+  big_fonts(15) +
+  facet_wrap(. ~ experiment, scale = 'free_x'))
+```
+
+## Latency
+
+```{r}
+# This is one awful transform. Splitting the table into stream and connection
+# would probably do wonders.
+latencies <- logs_push |>
+  filter(kind %in% c("Connect", "ConnectAck", "OpenStream", "StreamAck")) |> 
+  dplyr::select(experiment, sessionId, streamId, kind, direction, ts) |>
+  group_by(experiment, sessionId, streamId, kind, direction) |>
+  slice_min(ts, with_ties = FALSE) |>
+  ungroup() |> 
+  pivot_wider(names_from = c(kind, direction), values_from = ts) |>
+  mutate(
+    connect.latency = Connect_in - Connect_out,
+    connect.time = Connect_out,
+    connect.is_received = !is.na(Connect_in),
+    connect_ack.latency = ConnectAck_in - ConnectAck_out,
+    connect_ack.time = ConnectAck_out,
+    connect_ack.is_received = !is.na(ConnectAck_in),
+    open_stream.latency = OpenStream_in - OpenStream_out,
+    open_stream.time = OpenStream_out,
+    open_stream.is_received = !is.na(OpenStream_in),
+    stream_ack.latency = StreamAck_in - StreamAck_out,
+    stream_ack.time = StreamAck_out,
+    stream_ack.is_received = !is.na(StreamAck_in)
+  ) |>
+  dplyr::select(-c(
+    Connect_out,
+    Connect_in,
+    ConnectAck_out,
+    ConnectAck_in,
+    OpenStream_out,
+    OpenStream_in,
+    StreamAck_out,
+    StreamAck_in
+  )) |>
+  pivot_longer(
+    ends_with("latency"),
+    names_to="latency.type",
+    values_to="latency"
+  ) |>
+  filter(!is.na(latency)) |>
+  pivot_longer(
+    ends_with("time"),
+    names_to="time.type",
+    values_to="time"
+  ) |>
+  filter(!is.na(time)) |>
+  pivot_longer(
+    ends_with("is_received"),
+    names_to="is_received.type",
+    values_to="is_received"
+  ) |>
+  mutate(
+    message_type = stringr::str_split_i(latency.type, "\\.", i = 1)
+  ) |>
+  filter(
+    stringr::str_split_i(is_received.type, "\\.", i = 1) == message_type
+  ) |>
+  dplyr::select(-latency.type, -time.type, -is_received.type) 
+```
+
+
+```{r}
+ggplot(latencies) + 
+  geom_point(
+    aes(x = time, y = latency)
+  ) + 
+  ylab('latency (seconds)') +
+  xlab('time') +
+  theme_minimal() +
+  labs(col = 'reply at end') +
+  big_fonts(15)
+```
