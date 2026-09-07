@@ -1087,9 +1087,10 @@ proc dial*(
     firstSupplySequence = Opt.some(firstSequence)
     frame.firstSurbSequence = firstSupplySequence
 
-  traceOutbound(frame)
   let payload = frame.encode().valueOr:
     return err("could not encode OpenStream frame: " & error)
+
+  traceOutbound(frame)
   (
     await self.mix.send(
       MixDestination.exitNode(destination), MixTransportCodec, payload
