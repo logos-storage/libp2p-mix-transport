@@ -64,6 +64,10 @@ proc handleAcknowledgement(
   self: MixTransport, frame: MixTransportFrame
 ) {.gcsafe, raises: [].}
 
+proc handleTeardownFrame(
+  self: MixTransport, frame: MixTransportFrame
+): Future[void] {.async: (raises: [CancelledError]).}
+
 proc startSurbSupplier(
   self: MixTransport, session: TransportSession
 ) {.gcsafe, raises: [].}
@@ -139,6 +143,9 @@ proc handleReplyFrame(
     self.handleAcknowledgement(frame)
   of FrameKind.SurbStatus:
     discard
+  of FrameKind.CloseStream, FrameKind.ResetStream, FrameKind.Disconnect,
+      FrameKind.ResetSession:
+    await self.handleTeardownFrame(frame)
   else:
     discard
 
@@ -198,6 +205,38 @@ proc sendStreamFrame(
       return err("could not send " & $frame.kind & " frame: " & error)
   ok()
 
+proc sendTeardownFrame(
+    self: MixTransport, session: TransportSession, frame: MixTransportFrame
+): Future[bool] {.async: (raises: []).} =
+  # Teardown is best effort. In particular, a recipient must not wait forever
+  # for reply SURBs merely to report that its local stream has already closed.
+  case session.role
+  of SessionRole.Initiator:
+    let payload = frame.encode().valueOr:
+      return false
+    let destination = session.destination.valueOr:
+      return false
+    return (
+      await noCancel self.mix.send(
+        MixDestination.exitNode(destination), MixTransportCodec, payload
+      )
+    ).isOk
+  of SessionRole.Recipient:
+    if session.receivedSurbCount < DefaultReplySurbRedundancy:
+      return false
+    await noCancel session.acquireReplySend()
+    defer:
+      session.releaseReplySend()
+    if session.receivedSurbCount < DefaultReplySurbRedundancy:
+      return false
+    var replyBatch = session.takeReceivedSurbs(DefaultReplySurbRedundancy).valueOr:
+      return false
+    var replyFrame = frame
+    session.attachSurbSupplySnapshot(replyFrame)
+    let payload = replyFrame.encode().valueOr:
+      return false
+    return (await noCancel self.sendWithSurbRedundancyBatch(replyBatch, payload)).isOk
+
 proc writeStream(
     self: MixTransport,
     session: TransportSession,
@@ -232,7 +271,25 @@ proc writeStream(
     offset += chunkLength
     stream.activity = true
 
-proc runInboundDelivery(stream: TransportStream) {.async: (raises: [CancelledError]).} =
+proc finishRemoteSession(
+    self: MixTransport, session: TransportSession
+): Future[void] {.async: (raises: []).} =
+  discard self.sessions.remove(session.sessionId)
+  discard self.replyCredentials.removeSession(session.sessionId)
+  await session.shutdown()
+
+proc finishRemoteStream(
+    self: MixTransport, session: TransportSession, stream: TransportStream
+): Future[void] {.async: (raises: []).} =
+  stream.suppressRemoteTeardown()
+  discard session.removeStream(stream.streamId)
+  await stream.close()
+  if session.remoteDisconnectRequested and session.streamCount == 0:
+    await self.finishRemoteSession(session)
+
+proc runInboundDelivery(
+    self: MixTransport, session: TransportSession, stream: TransportStream
+) {.async: (raises: [CancelledError]).} =
   while not stream.closed:
     stream.clearInboundDataAvailable()
     while true:
@@ -243,6 +300,9 @@ proc runInboundDelivery(stream: TransportStream) {.async: (raises: [CancelledErr
       except LPStreamError:
         return
       stream.advanceReceiveWindow(inbound.sequence)
+      if stream.remoteCloseReady:
+        await noCancel self.finishRemoteStream(session, stream)
+        return
     await stream.waitForInboundData()
 
 proc runAcknowledgements(
@@ -308,7 +368,27 @@ proc configureStream(
   ): Future[void] {.async: (raw: true, raises: [CancelledError, LPStreamError]).} =
     self.writeStream(session, stream, move(data))
   stream.setWriteHandler(writeHandler)
-  stream.trackStreamTask(runInboundDelivery(stream))
+  let teardownHandler: StreamTeardownHandler = proc(
+      reset: bool, finalSequence: SequenceNumber
+  ): Future[void] {.async: (raises: []).} =
+    let frame = MixTransportFrame(
+      version: MixTransportVersion,
+      sessionId: session.sessionId,
+      kind: if reset: FrameKind.ResetStream else: FrameKind.CloseStream,
+      streamId: Opt.some(stream.streamId),
+      finalSequence:
+        if reset:
+          Opt.none(SequenceNumber)
+        else:
+          Opt.some(finalSequence),
+    )
+    discard await self.sendTeardownFrame(session, frame)
+    await stream.cancelAndWaitForStreamTasks()
+    discard session.removeStream(stream.streamId)
+    if session.remoteDisconnectRequested and session.streamCount == 0:
+      await self.finishRemoteSession(session)
+  stream.setTeardownHandler(teardownHandler)
+  stream.trackStreamTask(runInboundDelivery(self, session, stream))
   stream.trackStreamTask(runAcknowledgements(self, session, stream))
   if self.dataRetransmissionsEnabled:
     stream.trackStreamTask(runRetransmissions(self, session, stream))
@@ -356,6 +436,42 @@ proc handleAcknowledgement(
   discard stream.applyAcknowledgement(
     frame.receiveBase.get(), frame.acknowledgementBitmap.get()
   )
+
+proc handleTeardownFrame(
+    self: MixTransport, frame: MixTransportFrame
+): Future[void] {.async: (raises: [CancelledError]).} =
+  let session = self.sessions.get(frame.sessionId).valueOr:
+    debug "Dropping teardown frame for unknown session",
+      sessionId = frame.sessionId, frameKind = frame.kind
+    return
+
+  case frame.kind
+  of FrameKind.CloseStream, FrameKind.ResetStream:
+    let stream = session.getStream(frame.streamId.get()).valueOr:
+      debug "Dropping teardown frame for unknown stream",
+        sessionId = frame.sessionId,
+        streamId = frame.streamId.get(),
+        frameKind = frame.kind
+      return
+    if frame.kind == FrameKind.ResetStream:
+      stream.receiveRemoteReset()
+      await noCancel self.finishRemoteStream(session, stream)
+      return
+    let ready = stream.receiveRemoteClose(frame.finalSequence.get()).valueOr:
+      debug "Dropping invalid CloseStream frame",
+        sessionId = frame.sessionId, streamId = frame.streamId.get(), error
+      return
+    if ready:
+      await noCancel self.finishRemoteStream(session, stream)
+  of FrameKind.Disconnect:
+    session.requestRemoteDisconnect()
+    if session.streamCount == 0:
+      await noCancel self.finishRemoteSession(session)
+  of FrameKind.ResetSession:
+    session.receiveRemoteReset()
+    await noCancel self.finishRemoteSession(session)
+  else:
+    discard
 
 proc handleSurbSupply(
     self: MixTransport, frame: MixTransportFrame
@@ -587,6 +703,9 @@ proc handleDelivery(
     self.handleSurbSupply(frame)
   of FrameKind.SurbStatusProbe:
     await self.handleSurbStatusProbe(frame)
+  of FrameKind.CloseStream, FrameKind.ResetStream, FrameKind.Disconnect,
+      FrameKind.ResetSession:
+    await self.handleTeardownFrame(frame)
   else:
     discard
 
@@ -972,6 +1091,46 @@ proc dial*(
   keepStream = true
   ok(stream)
 
+proc disconnect*(
+    self: MixTransport, session: TransportSession
+): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
+  if not self.started:
+    return err("MixTransport is not started")
+  if self.sessions.get(session.sessionId).get(nil) != session:
+    return err("session is not registered by this transport")
+  if session.state != SessionState.Established:
+    return err("session is not established")
+  if session.streamCount != 0:
+    return err("cannot disconnect a session while it has active streams")
+
+  let frame = MixTransportFrame(
+    version: MixTransportVersion,
+    sessionId: session.sessionId,
+    kind: FrameKind.Disconnect,
+  )
+  if not await self.sendTeardownFrame(session, frame):
+    return err("could not send Disconnect frame")
+
+  discard self.sessions.remove(session.sessionId)
+  discard self.replyCredentials.removeSession(session.sessionId)
+  await noCancel session.shutdown()
+  ok()
+
+proc resetSession*(
+    self: MixTransport, session: TransportSession
+): Future[void] {.async: (raises: []).} =
+  if self.sessions.get(session.sessionId).get(nil) != session:
+    return
+  let frame = MixTransportFrame(
+    version: MixTransportVersion,
+    sessionId: session.sessionId,
+    kind: FrameKind.ResetSession,
+  )
+  discard await self.sendTeardownFrame(session, frame)
+  discard self.sessions.remove(session.sessionId)
+  discard self.replyCredentials.removeSession(session.sessionId)
+  await session.shutdown()
+
 proc start*(
     self: MixTransport
 ): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
@@ -1002,9 +1161,17 @@ proc stop*(self: MixTransport): Future[void] {.async: (raises: [CancelledError])
   if not self.started:
     return
 
+  let sessions = self.sessions.takeSessions()
+  for session in sessions:
+    let frame = MixTransportFrame(
+      version: MixTransportVersion,
+      sessionId: session.sessionId,
+      kind: FrameKind.ResetSession,
+    )
+    discard await self.sendTeardownFrame(session, frame)
+
   self.mix.unregisterRawSurbReplyHandler()
   self.mix.unregisterMixDeliveryHandler(MixTransportCodec)
-  let sessions = self.sessions.takeSessions()
   var shutdownTasks = newSeqOfCap[Future[void].Raising([])](sessions.len)
   for session in sessions:
     shutdownTasks.add(session.shutdown())

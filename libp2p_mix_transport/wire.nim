@@ -17,7 +17,7 @@ type
 
 const
   MixTransportCodec* = "/libp2p/mix-transport/1.0.0"
-  MixTransportVersion* = 2'u32
+  MixTransportVersion* = 3'u32
   MaxCodecBytes* = 255
   MaxStreamRejectionReasonBytes* = 255
   ReceiveWindowChunks* = 256
@@ -99,6 +99,7 @@ type
     surbSupplyLimit* {.fieldNumber: 13, fixed.}: Opt[SurbSupplySequence]
     surbs* {.fieldNumber: 14.}: seq[seq[byte]]
     rejectionReason* {.fieldNumber: 15.}: Opt[string]
+    finalSequence* {.fieldNumber: 16, fixed.}: Opt[SequenceNumber]
 
 template require(condition: bool, message: string): untyped =
   if not condition:
@@ -144,7 +145,8 @@ proc validateFrame(
     mayCarrySurbSupplyState =
       frame.kind in {
         FrameKind.ConnectAck, FrameKind.StreamAck, FrameKind.StreamReject,
-        FrameKind.Data, FrameKind.Ack, FrameKind.SurbStatus,
+        FrameKind.Data, FrameKind.Ack, FrameKind.CloseStream, FrameKind.ResetStream,
+        FrameKind.Disconnect, FrameKind.ResetSession, FrameKind.SurbStatus,
       }
 
   require frame.streamId.isSome == isStreamFrame,
@@ -192,6 +194,8 @@ proc validateFrame(
   require frame.surbs.len == 0 or carriesSurbs, "SURBs do not match the frame kind"
   require frame.rejectionReason.isNone or frame.kind == FrameKind.StreamReject,
     "rejectionReason does not match the frame kind"
+  require frame.finalSequence.isSome == (frame.kind == FrameKind.CloseStream),
+    "finalSequence does not match the frame kind"
 
   case frame.kind
   of FrameKind.Connect:
@@ -209,6 +213,9 @@ proc validateFrame(
       "data sequence space is exhausted"
     require frame.payload.get().len > 0, "data payload must not be empty"
     require frame.payload.get().len <= MaxDataPayloadBytes, "data payload is too large"
+  of FrameKind.CloseStream:
+    require frame.finalSequence.get() <= MaxDataSequenceNumber,
+      "final stream sequence space is exhausted"
   of FrameKind.SurbSupply:
     require frame.surbs.len > 0, "SURB supply must provide at least one SURB"
     require frame.surbs.len <= MaxSurbSupplyPerFrame,
