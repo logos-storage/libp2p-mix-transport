@@ -43,6 +43,7 @@ read_experiment <- function(folder, label) {
 ```
 
 ```{r}
+# You will need to set those paths and labels manually.
 logs <- read_experiment(
   "../output/push-unconstrained/logs/",
   "push_unconstrained"
@@ -85,7 +86,7 @@ ggplot(logs |>
 options(ark.plot.width = 10)
 options(ark.plot.height = 6)
 
-plotly::ggplotly(ggplot(logs |>
+ggplot(logs |>
   mutate(time = as.POSIXct(trunc.POSIXt(ts, units = 'secs'))) |>
   filter(direction == 'out') |>
   group_by(experiment, kind, time) |>
@@ -95,7 +96,7 @@ plotly::ggplotly(ggplot(logs |>
   xlab('time') +
   theme_minimal() +
   big_fonts(15) +
-  facet_wrap(. ~ experiment, scale = 'free_x'))
+  facet_wrap(. ~ experiment, scale = 'free_x')
 ```
 
 ## Latency
