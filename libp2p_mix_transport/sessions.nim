@@ -60,6 +60,7 @@ type
     surbSupplyLimit: SurbSupplySequence
     replyCapacityStateChanged: AsyncEvent
     replySendLock: AsyncLock
+    remoteSurbCapacity: int
     remoteSurbSupplyReceiveBase: SurbSupplySequence
     remoteSurbSupplyLimit: SurbSupplySequence
     nextSurbSupplySequence: Opt[SurbSupplySequence]
@@ -350,6 +351,18 @@ func availableSurbSupplySlots*(session: TransportSession): int =
     return 0
   int(upperBound - uint64(nextSequence))
 
+func estimatedRemoteSurbInventory*(session: TransportSession): int =
+  ## Estimate how many SURBs the recipient has or will have after all numbered
+  ## supply already allocated by the initiator arrives. Supply retransmission
+  ## is responsible for allocated SURBs that have not arrived yet.
+  if session.role != SessionRole.Initiator or session.remoteSurbCapacity == 0:
+    return 0
+  max(0, session.remoteSurbCapacity - session.availableSurbSupplySlots)
+
+func isSurbReplenishmentDue*(session: TransportSession, lowWatermark: int): bool =
+  session.availableSurbSupplySlots > 0 and
+    session.estimatedRemoteSurbInventory <= lowWatermark
+
 proc registerSurbSupply*(
     session: TransportSession,
     encodedSurbs: openArray[seq[byte]],
@@ -495,6 +508,9 @@ proc applySurbSupplySnapshot*(
   let nextSequence = session.nextSurbSupplySequence.get(SurbSupplySequence.high)
   if snapshot.receiveBase > nextSequence:
     return false
+
+  if session.remoteSurbCapacity == 0:
+    session.remoteSurbCapacity = int(snapshot.supplyLimit)
 
   var acknowledged: seq[SurbSupplySequence]
   for sequence in session.pendingSurbSupply.keys:
