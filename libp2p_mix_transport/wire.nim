@@ -17,7 +17,7 @@ type
 
 const
   MixTransportCodec* = "/libp2p/mix-transport/1.0.0"
-  MixTransportVersion* = 2'u32
+  MixTransportVersion* = 3'u32
   MaxCodecBytes* = 255
   MaxStreamRejectionReasonBytes* = 255
   ReceiveWindowChunks* = 256
@@ -25,8 +25,10 @@ const
   MaxInflightChunks* = 64
   SurbSupplyWindow* = 256
   SurbSupplyAckBitmapBytes* = SurbSupplyWindow div 8
-  MaxSurbSupplyPerFrame* = 4
   DefaultReplySurbRedundancy* = 2
+  MaxConnectSurbs* = 5
+  MaxOpenStreamSurbs* = 4
+  MaxSurbSupplyPerFrame* = 5
   MaxSessionIdBytes* = 39
   MaxDataSequenceNumber* = SequenceNumber.high - 1
   MaxSurbSupplySequence* = SurbSupplySequence.high - 1
@@ -99,6 +101,7 @@ type
     surbSupplyLimit* {.fieldNumber: 13, fixed.}: Opt[SurbSupplySequence]
     surbs* {.fieldNumber: 14.}: seq[seq[byte]]
     rejectionReason* {.fieldNumber: 15.}: Opt[string]
+    finalSequence* {.fieldNumber: 16, fixed.}: Opt[SequenceNumber]
 
 template require(condition: bool, message: string): untyped =
   if not condition:
@@ -144,7 +147,8 @@ proc validateFrame(
     mayCarrySurbSupplyState =
       frame.kind in {
         FrameKind.ConnectAck, FrameKind.StreamAck, FrameKind.StreamReject,
-        FrameKind.Data, FrameKind.Ack, FrameKind.SurbStatus,
+        FrameKind.Data, FrameKind.Ack, FrameKind.CloseStream, FrameKind.ResetStream,
+        FrameKind.Disconnect, FrameKind.ResetSession, FrameKind.SurbStatus,
       }
 
   require frame.streamId.isSome == isStreamFrame,
@@ -192,23 +196,30 @@ proc validateFrame(
   require frame.surbs.len == 0 or carriesSurbs, "SURBs do not match the frame kind"
   require frame.rejectionReason.isNone or frame.kind == FrameKind.StreamReject,
     "rejectionReason does not match the frame kind"
+  require frame.finalSequence.isSome == (frame.kind == FrameKind.CloseStream),
+    "finalSequence does not match the frame kind"
 
   case frame.kind
   of FrameKind.Connect:
     require frame.surbs.len >= DefaultReplySurbRedundancy,
       "connect must provide one reply redundancy batch"
+    require frame.surbs.len <= MaxConnectSurbs, "connect provides too many SURBs"
   of FrameKind.ConnectAck, FrameKind.SurbStatus:
     require carriesSurbSupplyState, "frame must provide SURB supply state"
   of FrameKind.OpenStream:
     require frame.codec.get().len > 0, "application codec must not be empty"
     require frame.surbs.len >= DefaultReplySurbRedundancy,
       "open stream must provide one reply redundancy batch"
+    require frame.surbs.len <= MaxOpenStreamSurbs, "open stream provides too many SURBs"
   of FrameKind.Data:
     require frame.sequence.get() > 0, "data sequence must not be zero"
     require frame.sequence.get() <= MaxDataSequenceNumber,
       "data sequence space is exhausted"
     require frame.payload.get().len > 0, "data payload must not be empty"
     require frame.payload.get().len <= MaxDataPayloadBytes, "data payload is too large"
+  of FrameKind.CloseStream:
+    require frame.finalSequence.get() <= MaxDataSequenceNumber,
+      "final stream sequence space is exhausted"
   of FrameKind.SurbSupply:
     require frame.surbs.len > 0, "SURB supply must provide at least one SURB"
     require frame.surbs.len <= MaxSurbSupplyPerFrame,

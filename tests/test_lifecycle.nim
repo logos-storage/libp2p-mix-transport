@@ -61,6 +61,19 @@ suite "MixTransport lifecycle":
       configuredTransport.surbStatusProbeRetryInterval == 5.seconds
       configuredTransport.maxSurbStatusProbeAttempts == 5
 
+  test "SURB replenishment uses a configurable low watermark":
+    let
+      mix = createMixProtocol()
+      defaultTransport = MixTransport.newMixTransport(mix)
+      configuredTransport = MixTransport.newMixTransport(mix, surbReplenishmentLowWatermark = 4)
+
+    check:
+      DefaultSurbReplenishmentLowWatermark ==
+        DefaultRecipientSurbCapacity - MaxSurbSupplyPerFrame
+      defaultTransport.surbReplenishmentLowWatermark ==
+        DefaultSurbReplenishmentLowWatermark
+      configuredTransport.surbReplenishmentLowWatermark == 4
+
   test "start and stop own the Mix plug-in registrations":
     let
       mix = createMixProtocol()

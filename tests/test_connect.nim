@@ -299,10 +299,26 @@ proc establishSessionAndStream(
   # These futures must've been completed
   let invocation = await invocationFuture
 
+  # Closing the initiating connection emits CloseStream. The recipient waits
+  # until every Data sequence named by that frame has entered its BufferStream,
+  # then closes the connection passed to the protocol handler.
+  await initiatorStream.close()
+  let recipientStreamClosed = recipientStream.join()
+  if not await recipientStreamClosed.withTimeout(TestOperationTimeout):
+    raise newException(LPError, "recipient did not process CloseStream")
+
+  # Once the final stream has closed, Disconnect removes the long-lived
+  # pseudonymous session on both endpoints.
+  let establishedSessionState = session.state
+  (await initiator.disconnect(session)).expect("could not disconnect session")
+  let recipientSessionClosed = recipientSession.waitUntilClosed()
+  if not await recipientSessionClosed.withTimeout(TestOperationTimeout):
+    raise newException(LPError, "recipient did not process Disconnect")
+
   RoundTripOutcome(
     destination: destination,
     session: session,
-    establishedSessionState: session.state,
+    establishedSessionState: establishedSessionState,
     reused: reused,
     initiatorStream: initiatorStream,
     recipientStream: recipientStream,
@@ -344,8 +360,8 @@ suite "MixTransport session and stream handshakes":
       outcome.recipientStream.state == StreamState.Established
       outcome.initialRecipientReplySurbs == DefaultRecipientSurbCapacity
       outcome.rejectionError == "requested protocol is not supported"
-      outcome.initiatorStreamCount == 1
-      outcome.recipientStreamCount == 1
+      outcome.initiatorStreamCount == 0
+      outcome.recipientStreamCount == 0
       outcome.recipientReplySurbs <= DefaultRecipientSurbCapacity
       outcome.handlerPeerId == outcome.session.sessionId
       outcome.handlerCodec == TestCodec
@@ -542,3 +558,45 @@ suite "connect behavior under multiple callers":
         transport.connectAttempts.len == 0
 
     waitFor asyncTest()
+
+  test "ResetSession closes every stream as a remote reset":
+    let
+      mix = createMixNodes(1)[0]
+      transport = MixTransport.newMixTransport(mix)
+      session = transport.sessions
+        .addRecipientSession(
+          PeerId.random(mix.rng).expect("could not generate session identifier")
+        )
+        .expect("could not add recipient session")
+    session.establish()
+    let stream =
+      session.addInboundStream(1, TestCodec).expect("could not add inbound stream")
+    stream.establish()
+
+    (waitFor transport.start()).expect("could not start transport")
+    defer:
+      waitFor transport.stop()
+
+    var value: byte
+    let pendingRead = stream.readOnce(addr value, 1)
+    check not pendingRead.finished
+
+    let frame = MixTransportFrame(
+      version: MixTransportVersion,
+      sessionId: session.sessionId,
+      kind: FrameKind.ResetSession,
+    )
+    waitFor mix.deliveryHandlers[MixTransportCodec](
+      MixDelivery(
+        service: MixTransportCodec,
+        payload: frame.encode().expect("could not encode ResetSession"),
+      )
+    )
+
+    check:
+      session.state == SessionState.Closed
+      session.streamCount == 0
+      transport.sessions.get(session.sessionId).isNone
+      stream.closed
+    expect LPStreamResetError:
+      discard waitFor pendingRead

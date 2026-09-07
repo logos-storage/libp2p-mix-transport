@@ -7,6 +7,7 @@ import std/unittest
 import results
 import libp2p/[crypto/crypto, peerid]
 import libp2p_mix/serialization
+import protobuf_serialization
 
 import libp2p_mix_transport
 
@@ -136,14 +137,34 @@ suite "MixTransport wire format":
       sessionId: randomSessionId(),
       kind: FrameKind.Connect,
       firstSurbSequence: Opt.some(SurbSupplySequence(0)),
-      surbs: newSeq[seq[byte]](5),
+      surbs: newSeq[seq[byte]](MaxConnectSurbs),
     )
     for surb in frame.surbs.mitems:
       surb = newSeq[byte](SurbSize)
 
     check frame.encode().isOk
     frame.surbs.add(newSeq[byte](SurbSize))
+    check Protobuf.encode(frame).len > MaxTransportFrameBytes
     check frame.encode().isErr
+
+  test "SURB supply uses all Sphinx payload space available":
+    var frame = MixTransportFrame(
+      version: MixTransportVersion,
+      sessionId: randomSessionId(),
+      kind: FrameKind.SurbSupply,
+      firstSurbSequence: Opt.some(SurbSupplySequence(0)),
+      surbs: newSeq[seq[byte]](MaxSurbSupplyPerFrame),
+    )
+    for surb in frame.surbs.mitems:
+      surb = newSeq[byte](SurbSize)
+
+    check:
+      Protobuf.encode(frame).len <= MaxTransportFrameBytes
+      frame.encode().isOk
+    frame.surbs.add(newSeq[byte](SurbSize))
+    check:
+      Protobuf.encode(frame).len > MaxTransportFrameBytes
+      frame.encode().isErr
 
   test "SURB supply state is an absolute fixed-size snapshot":
     let frame = MixTransportFrame(
@@ -198,22 +219,28 @@ suite "MixTransport wire format":
 
     check frame.encode().isErr
 
-  test "open stream requires reply SURBs":
-    let frame = MixTransportFrame(
+  test "OpenStream reserves one reply batch and fills its guaranteed SURB capacity":
+    var frame = MixTransportFrame(
       version: MixTransportVersion,
       sessionId: randomSessionId(),
       kind: FrameKind.OpenStream,
-      streamId: Opt.some(StreamId(1)),
-      codec: Opt.some("/example/1.0.0"),
+      streamId: Opt.some(StreamId.high),
+      codec: Opt.some(newString(MaxCodecBytes)),
     )
 
     check frame.encode().isErr
 
-    var withReplySurbs = frame
-    withReplySurbs.surbs = newSeq[seq[byte]](DefaultReplySurbRedundancy)
-    for surb in withReplySurbs.surbs.mitems:
+    frame.surbs = newSeq[seq[byte]](MaxOpenStreamSurbs)
+    frame.firstSurbSequence = Opt.some(SurbSupplySequence(0))
+    for surb in frame.surbs.mitems:
       surb = newSeq[byte](SurbSize)
-    check withReplySurbs.encode().isOk
+    check:
+      Protobuf.encode(frame).len <= MaxTransportFrameBytes
+      frame.encode().isOk
+    frame.surbs.add(newSeq[byte](SurbSize))
+    check:
+      Protobuf.encode(frame).len > MaxTransportFrameBytes
+      frame.encode().isErr
 
   test "stream rejection identifies the stream it refuses":
     let frame = MixTransportFrame(
@@ -241,6 +268,32 @@ suite "MixTransport wire format":
       kind: FrameKind.StreamReject,
       streamId: Opt.some(StreamId(5)),
     ).encode().isOk
+
+  test "graceful stream close carries the sender's final Data sequence":
+    let frame = MixTransportFrame(
+      version: MixTransportVersion,
+      sessionId: randomSessionId(),
+      kind: FrameKind.CloseStream,
+      streamId: Opt.some(StreamId(3)),
+      finalSequence: Opt.some(SequenceNumber(17)),
+    )
+
+    let decoded = MixTransportFrame
+      .decode(frame.encode().expect("encode failed"))
+      .expect("decode failed")
+
+    check:
+      decoded.kind == FrameKind.CloseStream
+      decoded.streamId == frame.streamId
+      decoded.finalSequence == frame.finalSequence
+
+    var missingFinalSequence = frame
+    missingFinalSequence.finalSequence = Opt.none(SequenceNumber)
+    var unexpectedFinalSequence = frame
+    unexpectedFinalSequence.kind = FrameKind.ResetStream
+    check:
+      missingFinalSequence.encode().isErr
+      unexpectedFinalSequence.encode().isErr
 
   test "unsupported versions and oversized frames are rejected":
     let unsupported = MixTransportFrame(
