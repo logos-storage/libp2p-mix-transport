@@ -2,7 +2,7 @@
 
 {.used.}
 
-import std/[importutils, unittest]
+import std/[importutils, sets, unittest]
 
 import chronos, results
 import libp2p/[builders, crypto/crypto, crypto/secp, switch]
@@ -30,6 +30,20 @@ proc createMixProtocol(): MixProtocol =
   MixProtocol.new(nodeInfo, switch)
 
 suite "MixTransport lifecycle":
+  test "session event handlers can be registered once and removed":
+    let transport = newMixTransport(createMixProtocol())
+    let handler: SessionEventHandler = proc(
+        event: SessionEvent
+    ): Future[void] {.async: (raises: [CancelledError]).} =
+      discard event
+
+    transport.addSessionEventHandler(handler)
+    transport.addSessionEventHandler(handler)
+    check transport.sessionEventHandlers.len == 1
+
+    transport.removeSessionEventHandler(handler)
+    check transport.sessionEventHandlers.len == 0
+
   test "Data retransmissions are enabled by default and can be disabled":
     let
       mix = createMixProtocol()

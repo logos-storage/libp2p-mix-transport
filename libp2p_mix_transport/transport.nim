@@ -2,6 +2,8 @@
 
 {.push raises: [].}
 
+import std/sets
+
 import chronicles, chronos, results
 import libp2p/multistream
 import libp2p/peerid
@@ -27,20 +29,37 @@ const
     DefaultRecipientSurbCapacity - MaxSurbSupplyPerFrame
   UnknownStreamRejectionReason = "remote rejected the stream for an unknown reason"
 
-type MixTransport* = ref object
-  mix: MixProtocol
-  replyCredentials: ReplyCredentialStore
-  sessions: SessionStore
-  connectTimeout: Duration
-  streamOpenTimeout: Duration
-  dataRetransmissionTimeout: Duration
-  surbSupplyRetransmissionTimeout: Duration
-  reverseActivityTimeout: Duration
-  surbStatusProbeRetryInterval: Duration
-  maxSurbStatusProbeAttempts: int
-  surbReplenishmentLowWatermark: int
-  dataRetransmissionsEnabled: bool
-  started: bool
+type
+  SessionEventKind* {.pure.} = enum
+    Established
+    Closed
+
+  SessionEvent* = object
+    kind*: SessionEventKind
+    peerId*: PeerId
+    sessionId*: PeerId
+    role*: SessionRole
+
+  SessionEventHandler* = proc(event: SessionEvent): Future[void] {.
+    gcsafe, async: (raises: [CancelledError])
+  .}
+
+  MixTransport* = ref object
+    mix: MixProtocol
+    replyCredentials: ReplyCredentialStore
+    sessions: SessionStore
+    sessionEventHandlers: OrderedSet[SessionEventHandler]
+    publishedSessionIds: HashSet[PeerId]
+    connectTimeout: Duration
+    streamOpenTimeout: Duration
+    dataRetransmissionTimeout: Duration
+    surbSupplyRetransmissionTimeout: Duration
+    reverseActivityTimeout: Duration
+    surbStatusProbeRetryInterval: Duration
+    maxSurbStatusProbeAttempts: int
+    surbReplenishmentLowWatermark: int
+    dataRetransmissionsEnabled: bool
+    started: bool
 
 type PreparedReplySurbs = object
   encoded: seq[seq[byte]]
@@ -58,6 +77,48 @@ proc handleTeardownFrame(
 proc startSurbSupplier(
   self: MixTransport, session: TransportSession
 ) {.gcsafe, raises: [].}
+
+proc addSessionEventHandler*(
+    self: MixTransport, handler: SessionEventHandler
+) {.raises: [].} =
+  ## Register a handler for established and closed MixTransport sessions.
+  if not handler.isNil:
+    self.sessionEventHandlers.incl(handler)
+
+proc removeSessionEventHandler*(
+    self: MixTransport, handler: SessionEventHandler
+) {.raises: [].} =
+  self.sessionEventHandlers.excl(handler)
+
+proc publishSessionEvent(
+    self: MixTransport, session: TransportSession, kind: SessionEventKind
+) {.async: (raises: [CancelledError]).} =
+  case kind
+  of SessionEventKind.Established:
+    if session.sessionId in self.publishedSessionIds:
+      return
+    self.publishedSessionIds.incl(session.sessionId)
+  of SessionEventKind.Closed:
+    if session.sessionId notin self.publishedSessionIds:
+      return
+    self.publishedSessionIds.excl(session.sessionId)
+
+  let event = SessionEvent(
+    kind: kind, peerId: session.peerId, sessionId: session.sessionId, role: session.role
+  )
+  var handlers = newSeqOfCap[Future[void]](self.sessionEventHandlers.len)
+  for handler in self.sessionEventHandlers:
+    handlers.add(handler(event))
+  if handlers.len > 0:
+    checkFutures(await allFinished(handlers))
+
+proc removeAndShutdownSession(
+    self: MixTransport, session: TransportSession
+) {.async: (raises: [CancelledError]).} =
+  discard self.sessions.remove(session.sessionId)
+  discard self.replyCredentials.removeSession(session.sessionId)
+  await session.shutdown()
+  await self.publishSessionEvent(session, SessionEventKind.Closed)
 
 proc runProtocolHandler(
     session: TransportSession, stream: TransportStream, protocol: LPProtocol
@@ -260,10 +321,8 @@ proc writeStream(
 
 proc finishRemoteSession(
     self: MixTransport, session: TransportSession
-): Future[void] {.async: (raises: []).} =
-  discard self.sessions.remove(session.sessionId)
-  discard self.replyCredentials.removeSession(session.sessionId)
-  await session.shutdown()
+): Future[void] {.async: (raises: [CancelledError]).} =
+  await self.removeAndShutdownSession(session)
 
 proc finishRemoteStream(
     self: MixTransport, session: TransportSession, stream: TransportStream
@@ -272,7 +331,7 @@ proc finishRemoteStream(
   discard session.removeStream(stream.streamId)
   await stream.close()
   if session.remoteDisconnectRequested and session.streamCount == 0:
-    await self.finishRemoteSession(session)
+    await noCancel self.finishRemoteSession(session)
 
 proc runInboundDelivery(
     self: MixTransport, session: TransportSession, stream: TransportStream
@@ -373,7 +432,7 @@ proc configureStream(
     await stream.cancelAndWaitForStreamTasks()
     discard session.removeStream(stream.streamId)
     if session.remoteDisconnectRequested and session.streamCount == 0:
-      await self.finishRemoteSession(session)
+      await noCancel self.finishRemoteSession(session)
   stream.setTeardownHandler(teardownHandler)
   stream.trackStreamTask(runInboundDelivery(self, session, stream))
   stream.trackStreamTask(runAcknowledgements(self, session, stream))
@@ -556,6 +615,7 @@ proc handleConnect(
   (await self.sendWithSurbRedundancyBatch(replyBatch, payload)).isOkOr:
     return
   keepSession = true
+  await self.publishSessionEvent(session, SessionEventKind.Established)
 
 proc handleOpenStream(
     self: MixTransport, frame: MixTransportFrame
@@ -749,6 +809,8 @@ proc newMixTransport*(
     mix: mix,
     replyCredentials: ReplyCredentialStore.new(),
     sessions: newSessionStore(recipientSurbCapacity),
+    sessionEventHandlers: initOrderedSet[SessionEventHandler](),
+    publishedSessionIds: initHashSet[PeerId](),
     connectTimeout: connectTimeout,
     streamOpenTimeout: streamOpenTimeout,
     dataRetransmissionTimeout: dataRetransmissionTimeout,
@@ -873,10 +935,8 @@ proc runSurbSupplier(
         error "MixTransport session did not respond to SURB status probes",
           sessionId = session.sessionId,
           attempts = session.unansweredSurbStatusProbeCount
-        discard self.sessions.remove(session.sessionId)
-        discard self.replyCredentials.removeSession(session.sessionId)
         session.clearSurbSupplierTask()
-        await session.shutdown()
+        await self.removeAndShutdownSession(session)
         return
       session.recordSurbStatusProbeAttempt(self.surbStatusProbeRetryInterval)
       await self.sendSurbStatusProbe(session)
@@ -974,6 +1034,7 @@ proc connect*(
 
   self.sessions.getByDestination(destination).withValue(existing):
     if existing.state == SessionState.Established:
+      await self.publishSessionEvent(existing, SessionEventKind.Established)
       return ok(existing)
     return err("session establishment is already in progress")
 
@@ -1012,6 +1073,7 @@ proc connect*(
     return err("MixTransport session closed while connecting")
 
   keepSession = true
+  await self.publishSessionEvent(session, SessionEventKind.Established)
   ok(session)
 
 proc dial*(
@@ -1115,14 +1177,12 @@ proc disconnect*(
   if not await self.sendTeardownFrame(session, frame):
     return err("could not send Disconnect frame")
 
-  discard self.sessions.remove(session.sessionId)
-  discard self.replyCredentials.removeSession(session.sessionId)
-  await noCancel session.shutdown()
+  await self.removeAndShutdownSession(session)
   ok()
 
 proc resetSession*(
     self: MixTransport, session: TransportSession
-): Future[void] {.async: (raises: []).} =
+): Future[void] {.async: (raises: [CancelledError]).} =
   if self.sessions.get(session.sessionId).get(nil) != session:
     return
   let frame = MixTransportFrame(
@@ -1131,9 +1191,7 @@ proc resetSession*(
     kind: FrameKind.ResetSession,
   )
   discard await self.sendTeardownFrame(session, frame)
-  discard self.sessions.remove(session.sessionId)
-  discard self.replyCredentials.removeSession(session.sessionId)
-  await session.shutdown()
+  await self.removeAndShutdownSession(session)
 
 proc start*(
     self: MixTransport
@@ -1176,10 +1234,11 @@ proc stop*(self: MixTransport): Future[void] {.async: (raises: [CancelledError])
 
   self.mix.unregisterRawSurbReplyHandler()
   self.mix.unregisterMixDeliveryHandler(MixTransportCodec)
-  var shutdownTasks = newSeqOfCap[Future[void].Raising([])](sessions.len)
+  var shutdownTasks = newSeqOfCap[Future[void]](sessions.len)
   for session in sessions:
-    shutdownTasks.add(session.shutdown())
-  await noCancel shutdownTasks.allFutures()
+    shutdownTasks.add(self.removeAndShutdownSession(session))
+  if shutdownTasks.len > 0:
+    checkFutures(await allFinished(shutdownTasks))
   self.replyCredentials.clear()
   self.started = false
 
