@@ -121,6 +121,8 @@ type RoundTripOutcome = object
   handlerReceivedStream: bool
   receivedRequest: seq[byte]
   receivedResponse: seq[byte]
+  initiatorSessionEvents: seq[SessionEvent]
+  recipientSessionEvents: seq[SessionEvent]
 
 proc establishSessionAndStream(): Future[RoundTripOutcome] {.
     async: (raises: [CancelledError, LPError])
@@ -139,6 +141,19 @@ proc establishSessionAndStream(): Future[RoundTripOutcome] {.
       connectTimeout = TestOperationTimeout,
       streamOpenTimeout = TestOperationTimeout,
     )
+    initiatorSessionEvents = newAsyncQueue[SessionEvent]()
+    recipientSessionEvents = newAsyncQueue[SessionEvent]()
+
+  let initiatorSessionEventHandler: SessionEventHandler = proc(
+      event: SessionEvent
+  ): Future[void] {.async: (raises: [CancelledError]).} =
+    await initiatorSessionEvents.put(event)
+  let recipientSessionEventHandler: SessionEventHandler = proc(
+      event: SessionEvent
+  ): Future[void] {.async: (raises: [CancelledError]).} =
+    await recipientSessionEvents.put(event)
+  initiator.addSessionEventHandler(initiatorSessionEventHandler)
+  recipient.addSessionEventHandler(recipientSessionEventHandler)
 
   # StreamAck confirms that the recipient has a mounted handler for the
   # requested application codec. The handler remains active until transport
@@ -268,6 +283,20 @@ proc establishSessionAndStream(): Future[RoundTripOutcome] {.
   if not await recipientSessionClosed.withTimeout(TestOperationTimeout):
     raise newException(LPError, "recipient did not process Disconnect")
 
+  var
+    observedInitiatorSessionEvents: seq[SessionEvent]
+    observedRecipientSessionEvents: seq[SessionEvent]
+  for _ in 0 ..< 2:
+    let initiatorEvent = initiatorSessionEvents.get()
+    if not await initiatorEvent.withTimeout(TestOperationTimeout):
+      raise newException(LPError, "initiator session event was not published")
+    observedInitiatorSessionEvents.add(await initiatorEvent)
+
+    let recipientEvent = recipientSessionEvents.get()
+    if not await recipientEvent.withTimeout(TestOperationTimeout):
+      raise newException(LPError, "recipient session event was not published")
+    observedRecipientSessionEvents.add(await recipientEvent)
+
   RoundTripOutcome(
     destination: destination,
     session: session,
@@ -286,6 +315,8 @@ proc establishSessionAndStream(): Future[RoundTripOutcome] {.
     handlerReceivedStream: invocation.stream == recipientStream,
     receivedRequest: receivedRequest,
     receivedResponse: receivedResponse,
+    initiatorSessionEvents: move(observedInitiatorSessionEvents),
+    recipientSessionEvents: move(observedRecipientSessionEvents),
   )
 
 suite "MixTransport session and stream handshakes":
@@ -318,6 +349,24 @@ suite "MixTransport session and stream handshakes":
       outcome.handlerReceivedStream
       outcome.receivedRequest == TestRequest.toBytes()
       outcome.receivedResponse == TestResponse.toBytes()
+      outcome.initiatorSessionEvents.len == 2
+      outcome.initiatorSessionEvents[0].kind == SessionEventKind.Established
+      outcome.initiatorSessionEvents[0].peerId == outcome.destination
+      outcome.initiatorSessionEvents[0].sessionId == outcome.session.sessionId
+      outcome.initiatorSessionEvents[0].role == SessionRole.Initiator
+      outcome.initiatorSessionEvents[1].kind == SessionEventKind.Closed
+      outcome.initiatorSessionEvents[1].peerId == outcome.destination
+      outcome.initiatorSessionEvents[1].sessionId == outcome.session.sessionId
+      outcome.initiatorSessionEvents[1].role == SessionRole.Initiator
+      outcome.recipientSessionEvents.len == 2
+      outcome.recipientSessionEvents[0].kind == SessionEventKind.Established
+      outcome.recipientSessionEvents[0].peerId == outcome.session.sessionId
+      outcome.recipientSessionEvents[0].sessionId == outcome.session.sessionId
+      outcome.recipientSessionEvents[0].role == SessionRole.Recipient
+      outcome.recipientSessionEvents[1].kind == SessionEventKind.Closed
+      outcome.recipientSessionEvents[1].peerId == outcome.session.sessionId
+      outcome.recipientSessionEvents[1].sessionId == outcome.session.sessionId
+      outcome.recipientSessionEvents[1].role == SessionRole.Recipient
       outcome.replyDispositions ==
         @[
           RawSurbReplyDisposition.Handled, RawSurbReplyDisposition.Handled,
