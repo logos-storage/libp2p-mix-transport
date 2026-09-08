@@ -2,7 +2,7 @@
 
 {.push raises: [].}
 
-import chronicles, chronos, chronos/asyncsync, results, tables
+import chronicles, chronos, chronos/asyncsync, results, sets, tables
 import libp2p/multistream
 import libp2p/peerid
 import libp2p/protocols/protocol
@@ -27,23 +27,40 @@ const
     DefaultRecipientSurbCapacity - MaxSurbSupplyPerFrame
   UnknownStreamRejectionReason = "remote rejected the stream for an unknown reason"
 
-type MixTransport* = ref object of RootObj
-  mix: MixProtocol
-  replyCredentials: ReplyCredentialStore
-  sessions: SessionStore
-  connectTimeout: Duration
-  streamOpenTimeout: Duration
-  connLock: AsyncLock
-  connectAttempts:
-    Table[PeerId, Future[Result[TransportSession, string]].Raising([CancelledError])]
-  dataRetransmissionTimeout: Duration
-  surbSupplyRetransmissionTimeout: Duration
-  reverseActivityTimeout: Duration
-  surbStatusProbeRetryInterval: Duration
-  maxSurbStatusProbeAttempts: int
-  surbReplenishmentLowWatermark: int
-  dataRetransmissionsEnabled: bool
-  started: bool
+type
+  SessionEventKind* {.pure.} = enum
+    Established
+    Closed
+
+  SessionEvent* = object
+    kind*: SessionEventKind
+    peerId*: PeerId
+    sessionId*: PeerId
+    role*: SessionRole
+
+  SessionEventHandler* = proc(event: SessionEvent): Future[void] {.
+    gcsafe, async: (raises: [CancelledError])
+  .}
+
+  MixTransport* = ref object of RootObj
+    mix: MixProtocol
+    replyCredentials: ReplyCredentialStore
+    sessions: SessionStore
+    sessionEventHandlers: OrderedSet[SessionEventHandler]
+    publishedSessionIds: HashSet[PeerId]
+    connectTimeout: Duration
+    streamOpenTimeout: Duration
+    connLock: AsyncLock
+    connectAttempts:
+      Table[PeerId, Future[Result[TransportSession, string]].Raising([CancelledError])]
+    dataRetransmissionTimeout: Duration
+    surbSupplyRetransmissionTimeout: Duration
+    reverseActivityTimeout: Duration
+    surbStatusProbeRetryInterval: Duration
+    maxSurbStatusProbeAttempts: int
+    surbReplenishmentLowWatermark: int
+    dataRetransmissionsEnabled: bool
+    started: bool
 
 type PreparedReplySurbs = object
   encoded: seq[seq[byte]]
@@ -61,6 +78,48 @@ proc handleTeardownFrame(
 proc startSurbSupplier(
   self: MixTransport, session: TransportSession
 ) {.gcsafe, raises: [].}
+
+proc addSessionEventHandler*(
+    self: MixTransport, handler: SessionEventHandler
+) {.raises: [].} =
+  ## Register a handler for established and closed MixTransport sessions.
+  if not handler.isNil:
+    self.sessionEventHandlers.incl(handler)
+
+proc removeSessionEventHandler*(
+    self: MixTransport, handler: SessionEventHandler
+) {.raises: [].} =
+  self.sessionEventHandlers.excl(handler)
+
+proc publishSessionEvent(
+    self: MixTransport, session: TransportSession, kind: SessionEventKind
+) {.async: (raises: [CancelledError]).} =
+  case kind
+  of SessionEventKind.Established:
+    if session.sessionId in self.publishedSessionIds:
+      return
+    self.publishedSessionIds.incl(session.sessionId)
+  of SessionEventKind.Closed:
+    if session.sessionId notin self.publishedSessionIds:
+      return
+    self.publishedSessionIds.excl(session.sessionId)
+
+  let event = SessionEvent(
+    kind: kind, peerId: session.peerId, sessionId: session.sessionId, role: session.role
+  )
+  var handlers = newSeqOfCap[Future[void]](self.sessionEventHandlers.len)
+  for handler in self.sessionEventHandlers:
+    handlers.add(handler(event))
+  if handlers.len > 0:
+    checkFutures(await allFinished(handlers))
+
+proc removeAndShutdownSession(
+    self: MixTransport, session: TransportSession
+) {.async: (raises: [CancelledError]).} =
+  discard self.sessions.remove(session.sessionId)
+  discard self.replyCredentials.removeSession(session.sessionId)
+  await session.shutdown()
+  await self.publishSessionEvent(session, SessionEventKind.Closed)
 
 proc runProtocolHandler(
     session: TransportSession, stream: TransportStream, protocol: LPProtocol
@@ -284,10 +343,8 @@ proc writeStream(
 
 proc finishRemoteSession(
     self: MixTransport, session: TransportSession
-): Future[void] {.async: (raises: []).} =
-  discard self.sessions.remove(session.sessionId)
-  discard self.replyCredentials.removeSession(session.sessionId)
-  await session.shutdown()
+): Future[void] {.async: (raises: [CancelledError]).} =
+  await self.removeAndShutdownSession(session)
 
 proc finishRemoteStream(
     self: MixTransport, session: TransportSession, stream: TransportStream
@@ -296,7 +353,7 @@ proc finishRemoteStream(
   discard session.removeStream(stream.streamId)
   await stream.close()
   if session.remoteDisconnectRequested and session.streamCount == 0:
-    await self.finishRemoteSession(session)
+    await noCancel self.finishRemoteSession(session)
 
 proc runInboundDelivery(
     self: MixTransport, session: TransportSession, stream: TransportStream
@@ -397,7 +454,7 @@ proc configureStream(
     await stream.cancelAndWaitForStreamTasks()
     discard session.removeStream(stream.streamId)
     if session.remoteDisconnectRequested and session.streamCount == 0:
-      await self.finishRemoteSession(session)
+      await noCancel self.finishRemoteSession(session)
   stream.setTeardownHandler(teardownHandler)
   stream.trackStreamTask(runInboundDelivery(self, session, stream))
   stream.trackStreamTask(runAcknowledgements(self, session, stream))
@@ -593,6 +650,7 @@ proc handleConnect(
     return
 
   keepSession = true
+  await self.publishSessionEvent(session, SessionEventKind.Established)
 
 proc handleOpenStream(
     self: MixTransport, frame: MixTransportFrame
@@ -800,6 +858,8 @@ proc newMixTransport*(
     mix: mix,
     replyCredentials: ReplyCredentialStore.new(),
     sessions: newSessionStore(recipientSurbCapacity),
+    sessionEventHandlers: initOrderedSet[SessionEventHandler](),
+    publishedSessionIds: initHashSet[PeerId](),
     connectTimeout: connectTimeout,
     streamOpenTimeout: streamOpenTimeout,
     connLock: newAsyncLock(),
@@ -925,10 +985,8 @@ proc runSurbSupplier(
         error "MixTransport session did not respond to SURB status probes",
           sessionId = session.sessionId,
           attempts = session.unansweredSurbStatusProbeCount
-        discard self.sessions.remove(session.sessionId)
-        discard self.replyCredentials.removeSession(session.sessionId)
         session.clearSurbSupplierTask()
-        await session.shutdown()
+        await self.removeAndShutdownSession(session)
         return
       session.recordSurbStatusProbeAttempt(self.surbStatusProbeRetryInterval)
       await self.sendSurbStatusProbe(session)
@@ -1057,6 +1115,7 @@ proc connectInternal(
     return err("MixTransport session closed while connecting")
 
   keepSession = true
+  await self.publishSessionEvent(session, SessionEventKind.Established)
   ok(session)
 
 ## Connect operation synchronizer, implemented like this so we can test it in
@@ -1070,7 +1129,8 @@ proc connect[S, K, T](
       .}
     ),
     getExisting: (proc(self: S, destination: K): Opt[T] {.gcsafe, raises: [].}),
-): Future[Result[T, string]] {.async: (raises: [CancelledError]).} =
+): Future[Result[
+    tuple[conn: T, existing: bool], string]] {.async: (raises: [CancelledError]).} =
   template releaseLock() =
     try:
       self.connLock.release()
@@ -1081,11 +1141,11 @@ proc connect[S, K, T](
   await self.connLock.acquire()
   # If a connection already exists and it is established, we return it.
   self.getExisting(destination).withValue(existing):
-    trace "return existing connection", destination = destination
     releaseLock()
+    trace "return existing connection", destination = destination
     # It might happen that the connection is no longer valid here, but
     # that's fine.
-    return ok(existing)
+    return ok((existing, true))
 
   # If a valid connection doesn't exist, then this is officially a connection
   # attempt. Our goal here then becomes to merge all connection attempts
@@ -1104,7 +1164,13 @@ proc connect[S, K, T](
     except exceptions.KeyError:
       doAssert false, "assertion failed"
     releaseLock()
-    return await attempt
+
+    let res = (await attempt).valueOr:
+      return err(error)
+    
+    # In practice this is equivalent to obtaining an existing
+    # connection, so we return existing = true.
+    return ok((res, true))
 
   # If we're here, we're sure that we're the ones handling this
   # attempt at connecting to this destination.
@@ -1122,7 +1188,7 @@ proc connect[S, K, T](
     except CancelledError as e:
       raise e
     except CatchableError as e:
-      err(e.msg)
+      err(Result[T, string], e.msg)
     finally:
       # This is what will officially end an attempt. Once the
       # future is out of the table, another requester can re-attempt
@@ -1134,7 +1200,10 @@ proc connect[S, K, T](
 
   trace "complete connection attempt", destination = destination, success = res.isOk
   attempt.complete(res)
-  res
+  let conn = res.valueOr:
+    return err(error)
+  
+  return ok((conn, false))
 
 proc connect*(
     self: MixTransport, destination: PeerId
@@ -1150,9 +1219,15 @@ proc connect*(
         return Opt.some(existing)
     return Opt.none(TransportSession)
 
-  await connect[MixTransport, PeerId, TransportSession](
+  let (conn, existing) = (await connect[MixTransport, PeerId, TransportSession](
     self, destination, connectInternal, getExisting
-  )
+  )).valueOr:
+    return err(error)
+
+  if existing and conn.state == SessionState.Established:
+    await self.publishSessionEvent(conn, SessionEventKind.Established)
+  
+  ok(conn)
 
 proc dial*(
     self: MixTransport, destination: PeerId, codec: string
@@ -1258,14 +1333,12 @@ proc disconnect*(
   if not await self.sendTeardownFrame(session, frame):
     return err("could not send Disconnect frame")
 
-  discard self.sessions.remove(session.sessionId)
-  discard self.replyCredentials.removeSession(session.sessionId)
-  await noCancel session.shutdown()
+  await self.removeAndShutdownSession(session)
   ok()
 
 proc resetSession*(
     self: MixTransport, session: TransportSession
-): Future[void] {.async: (raises: []).} =
+): Future[void] {.async: (raises: [CancelledError]).} =
   if self.sessions.get(session.sessionId).get(nil) != session:
     return
   let frame = MixTransportFrame(
@@ -1274,9 +1347,7 @@ proc resetSession*(
     kind: FrameKind.ResetSession,
   )
   discard await self.sendTeardownFrame(session, frame)
-  discard self.sessions.remove(session.sessionId)
-  discard self.replyCredentials.removeSession(session.sessionId)
-  await session.shutdown()
+  await self.removeAndShutdownSession(session)
 
 proc start*(
     self: MixTransport
@@ -1319,10 +1390,11 @@ proc stop*(self: MixTransport): Future[void] {.async: (raises: [CancelledError])
 
   self.mix.unregisterRawSurbReplyHandler()
   self.mix.unregisterMixDeliveryHandler(MixTransportCodec)
-  var shutdownTasks = newSeqOfCap[Future[void].Raising([])](sessions.len)
+  var shutdownTasks = newSeqOfCap[Future[void]](sessions.len)
   for session in sessions:
-    shutdownTasks.add(session.shutdown())
-  await noCancel shutdownTasks.allFutures()
+    shutdownTasks.add(self.removeAndShutdownSession(session))
+  if shutdownTasks.len > 0:
+    checkFutures(await allFinished(shutdownTasks))
   self.replyCredentials.clear()
   self.started = false
 

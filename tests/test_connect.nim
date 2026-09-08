@@ -125,6 +125,8 @@ type RoundTripOutcome = object
   handlerReceivedStream: bool
   receivedRequest: seq[byte]
   receivedResponse: seq[byte]
+  initiatorSessionEvents: seq[SessionEvent]
+  recipientSessionEvents: seq[SessionEvent]
 
 type DelayedAckMixTransport = ref object of MixTransport
   interAckDelay: Duration
@@ -164,6 +166,8 @@ proc establishSessionAndStream(
       connectTimeout = TestOperationTimeout,
       streamOpenTimeout = TestOperationTimeout,
     )
+    initiatorSessionEvents = newAsyncQueue[SessionEvent]()
+    recipientSessionEvents = newAsyncQueue[SessionEvent]()
     recipient =
       if interAckDelay.isSome:
         var transport = DelayedAckMixTransport.newMixTransport(
@@ -179,6 +183,17 @@ proc establishSessionAndStream(
           connectTimeout = TestOperationTimeout,
           streamOpenTimeout = TestOperationTimeout,
         )
+
+  let initiatorSessionEventHandler: SessionEventHandler = proc(
+      event: SessionEvent
+  ): Future[void] {.async: (raises: [CancelledError]).} =
+    await initiatorSessionEvents.put(event)
+  let recipientSessionEventHandler: SessionEventHandler = proc(
+      event: SessionEvent
+  ): Future[void] {.async: (raises: [CancelledError]).} =
+    await recipientSessionEvents.put(event)
+  initiator.addSessionEventHandler(initiatorSessionEventHandler)
+  recipient.addSessionEventHandler(recipientSessionEventHandler)
 
   # StreamAck confirms that the recipient has a mounted handler for the
   # requested application codec. The handler remains active until transport
@@ -315,6 +330,20 @@ proc establishSessionAndStream(
   if not await recipientSessionClosed.withTimeout(TestOperationTimeout):
     raise newException(LPError, "recipient did not process Disconnect")
 
+  var
+    observedInitiatorSessionEvents: seq[SessionEvent]
+    observedRecipientSessionEvents: seq[SessionEvent]
+  for _ in 0 ..< 2:
+    let initiatorEvent = initiatorSessionEvents.get()
+    if not await initiatorEvent.withTimeout(TestOperationTimeout):
+      raise newException(LPError, "initiator session event was not published")
+    observedInitiatorSessionEvents.add(await initiatorEvent)
+
+    let recipientEvent = recipientSessionEvents.get()
+    if not await recipientEvent.withTimeout(TestOperationTimeout):
+      raise newException(LPError, "recipient session event was not published")
+    observedRecipientSessionEvents.add(await recipientEvent)
+
   RoundTripOutcome(
     destination: destination,
     session: session,
@@ -333,6 +362,8 @@ proc establishSessionAndStream(
     handlerReceivedStream: invocation.stream == recipientStream,
     receivedRequest: receivedRequest,
     receivedResponse: receivedResponse,
+    initiatorSessionEvents: move(observedInitiatorSessionEvents),
+    recipientSessionEvents: move(observedRecipientSessionEvents),
   )
 
 suite "MixTransport session and stream handshakes":
@@ -368,6 +399,24 @@ suite "MixTransport session and stream handshakes":
       outcome.handlerReceivedStream
       outcome.receivedRequest == TestRequest.toBytes()
       outcome.receivedResponse == TestResponse.toBytes()
+      outcome.initiatorSessionEvents.len == 2
+      outcome.initiatorSessionEvents[0].kind == SessionEventKind.Established
+      outcome.initiatorSessionEvents[0].peerId == outcome.destination
+      outcome.initiatorSessionEvents[0].sessionId == outcome.session.sessionId
+      outcome.initiatorSessionEvents[0].role == SessionRole.Initiator
+      outcome.initiatorSessionEvents[1].kind == SessionEventKind.Closed
+      outcome.initiatorSessionEvents[1].peerId == outcome.destination
+      outcome.initiatorSessionEvents[1].sessionId == outcome.session.sessionId
+      outcome.initiatorSessionEvents[1].role == SessionRole.Initiator
+      outcome.recipientSessionEvents.len == 2
+      outcome.recipientSessionEvents[0].kind == SessionEventKind.Established
+      outcome.recipientSessionEvents[0].peerId == outcome.session.sessionId
+      outcome.recipientSessionEvents[0].sessionId == outcome.session.sessionId
+      outcome.recipientSessionEvents[0].role == SessionRole.Recipient
+      outcome.recipientSessionEvents[1].kind == SessionEventKind.Closed
+      outcome.recipientSessionEvents[1].peerId == outcome.session.sessionId
+      outcome.recipientSessionEvents[1].sessionId == outcome.session.sessionId
+      outcome.recipientSessionEvents[1].role == SessionRole.Recipient
       outcome.replyDispositions ==
         @[
           RawSurbReplyDisposition.Handled, RawSurbReplyDisposition.Handled,
@@ -438,6 +487,8 @@ type
   ConnInternal = proc(self: Synchronizer, dest: Destination):
     Future[Result[Session, string]].Raising([CancelledError]) {.gcsafe, raises: [].}
 
+proc state*(self: Session): SessionState = SessionState.Established
+
 proc newSynchronizer*(T: type Synchronizer): T =
   T(connLock: newAsyncLock(), gate: newAsyncEvent())
 
@@ -480,11 +531,12 @@ suite "connect behavior under multiple callers":
       let transport = Synchronizer.newSynchronizer()
       transport.gate.fire()
 
-      let session = await connect[Synchronizer, Destination, Session](
-        transport, "destination1", connInternal(5), getExisting)
+      let (session, existing) = (await connect[Synchronizer, Destination, Session](
+        transport, "destination1", connInternal(5), getExisting)).get
 
       check:
-        session.get() == (attempt: 1, caller: 5)
+        session == (attempt: 1, caller: 5)
+        existing == false
         transport.connectAttempts.len == 0
 
     waitFor asyncTest()
@@ -495,11 +547,12 @@ suite "connect behavior under multiple callers":
       transport.sessions["destination1"] = (10, 1)
       transport.gate.fire()
 
-      let session = await connect[Synchronizer, Destination, Session](
-        transport, "destination1", connInternal(5), getExisting)
+      let (session, existing) = (await connect[Synchronizer, Destination, Session](
+        transport, "destination1", connInternal(5), getExisting)).get
 
       check:
-        session.get() == (attempt: 10, caller: 1)
+        session == (attempt: 10, caller: 1)
+        existing == true
 
     waitFor asyncTest()
 
@@ -508,7 +561,7 @@ suite "connect behavior under multiple callers":
       let transport = Synchronizer.newSynchronizer()
 
       let
-        first = connect[Synchronizer, Destination, Session](
+        first, = connect[Synchronizer, Destination, Session](
           transport, "destination1", connInternal(1), getExisting)
         second = connect[Synchronizer, Destination, Session](
           transport, "destination1", connInternal(2), getExisting)
@@ -516,12 +569,12 @@ suite "connect behavior under multiple callers":
       transport.gate.fire()
 
       let
-        firstSession = await first
-        secondSession = await second
+        (firstSession, _) = (await first).get
+        (secondSession, _) = (await second).get
 
       check:
-        firstSession.get() == (attempt: 1, caller: 1)
-        secondSession.get() == (attempt: 1, caller: 1)
+        firstSession == (attempt: 1, caller: 1)
+        secondSession == (attempt: 1, caller: 1)
         transport.connectAttempts.len == 0
 
     waitFor asyncTest()
@@ -554,7 +607,7 @@ suite "connect behavior under multiple callers":
         transport, "destination1", connInternal(3), getExisting)
       transport.gate.fire()
       check:
-        (await third).get() == (attempt: 1, caller: 3)
+        (await third).get().conn == (attempt: 1, caller: 3)
         transport.connectAttempts.len == 0
 
     waitFor asyncTest()
