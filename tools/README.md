@@ -47,6 +47,17 @@ nimble debugNode   # -> tools/node/node-debug    (release, JSON chronicles sink)
 `node-debug` writes structured JSON logs, which is what the message-level
 analysis notebook consumes.
 
+The harness uses `tools/node/node` by default. Select the debug executable
+before sourcing the harness so the choice is also propagated into a network
+namespace:
+
+```bash
+export TR_NODE_BINARY="$PWD/tools/node/node-debug"
+source tools/harness/harness.bash
+```
+
+If the harness is already loaded, set `TR_NODE_BINARY` and run `reload`.
+
 ### CLI
 
 ```
@@ -61,6 +72,14 @@ node [options] <peer-api-url>...
 | `-x, --mix-config` | `default` | Delay strategy preset: `default` (no sampling) or `exponential` |
 | `-e, --log-level` | `INFO` | Chronicles level, optionally with topic directives (`INFO;trace:mix-transport`) |
 | `-m, --max-connections` | `50` | libp2p connection-manager limit |
+
+The `default` Mix configuration uses `NoSamplingDelayStrategy`: the sender
+encodes a concrete delay of 0, 1 or 2 ms for every intermediate relay, and the
+relay uses that value directly. The `exponential` configuration encodes a mean
+of 100 ms; every intermediate relay independently samples its actual holding
+time from a bounded exponential distribution. The exit node has no intentional
+delay. These protocol-level holding times are independent of the IP-level
+delay, loss and rate limits introduced by `netem`.
 
 Positional arguments are the API URLs of *already running* nodes. At startup the
 node `GET`s `/status` on each of them and adds the returned `mixInfo` to its mix
@@ -109,9 +128,10 @@ the whole API. It sources, in order, `utils.bash`, `config.bash`, `emu.bash` and
 source tools/harness/harness.bash
 ```
 
-It detects interactive shells: sourcing it from your prompt drops the `set -e`
-so a typo doesn't close your terminal, and skips the trap. `reload` re-sources
-the library, which is handy while editing it.
+It detects interactive shells: sourcing it from your prompt leaves the caller's
+shell options unchanged and skips the exit trap. The executable experiment
+scripts enable their own strict shell options. `reload` re-sources the library,
+which is handy while editing it.
 
 ### Configuration (`config.bash`)
 

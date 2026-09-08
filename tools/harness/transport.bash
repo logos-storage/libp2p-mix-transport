@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 #
 # Simple harness for running transport experiments.
-set -euo pipefail
-
-require_binary "$TR_NODE_BINARY"
 
 MIX_PATH_LENGTH=3
 
@@ -53,6 +50,7 @@ tr_status() {
 tr_start_node() {
   local node_index=$1
   shift
+  require_binary "$TR_NODE_BINARY" || return
   local args=("$@")
   args+=(
     "--api-port=$TR_API_PORT"

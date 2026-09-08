@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-set -euo pipefail
 
 echoerr() { echo "$@" >&2; }
 
@@ -8,7 +7,7 @@ require_binary() {
   # Needs to be a file, and needs to be executable
   if [[ ! -f "$binary" || ! -x "$binary" ]]; then
     echoerr "Binary not found or not executable: $binary"
-    exit 1
+    return 1
   fi
   echoerr "Found binary $binary"
 }
