@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 #
 # Simple harness for running transport experiments.
-set -euo pipefail
 
-require_binary "$TR_NODE_BINARY"
+require_binary "${TR_NODE_BINARY}"
 
 MIX_PATH_LENGTH=3
 

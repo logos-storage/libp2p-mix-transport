@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-set -euo pipefail
 
 LIB_SRC=${LIB_SRC:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
 

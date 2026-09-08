@@ -6,3 +6,5 @@ nimbledeps/
 .codex
 nimble.paths
 nimble.develop
+experiment-output
+tools/node/
