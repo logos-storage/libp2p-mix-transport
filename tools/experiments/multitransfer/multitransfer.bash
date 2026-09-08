@@ -95,7 +95,7 @@ while [ "${_remaining}" -gt 0 ]; do
     if [ $_to_launch -gt 0 ]; then
         echoerr "${#_running[@]}/${N_CONCURRENT} transfers running, starting ${_to_launch} more"
         for _ in $(seq 1 $_to_launch); do
-            mapfile -t _pair < <(shuf -i "${MIX_PATH_LENGTH}"-$((N_NODES - 1)) -n 2 | sort -nr)
+            mapfile -t _pair < <(shuf -i "${MIX_PATH_LENGTH}"-$((N_NODES - 1)) -n 2)
             _src=${_pair[0]}
             _dst=${_pair[1]}
             $_tr_transfer "${_src}" "${_dst}" "${N_BYTES}" &

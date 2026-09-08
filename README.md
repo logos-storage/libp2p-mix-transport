@@ -57,6 +57,40 @@ demonstrate the transport API. A transport-specific example will later model a
 realistic bidirectional protocol with separate streams, similar to the stream
 arrangement used by block exchange.
 
+## Dialing a mix address
+
+`toMixAddress(info: MixPubInfo)` returns an address such as
+`/ip4/10.0.0.1/tcp/8081/mix-transport/<base64url-keys>`. Pass that address to
+`transport.connect(peerId, @[address])` or
+`transport.dial(peerId, @[address], codec)`. The existing PeerId-only calls
+remain available for peers already in the node pool or established sessions.
+
+The payload is 65 bytes: a compressed secp256k1 libp2p public key (33 bytes),
+followed by a Curve25519 mix public key (32 bytes), encoded as padded URL-safe
+base64. The public key must match the supplied PeerId. The address format
+preserves any MultiAddress endpoint prefix, including QUIC and circuit relays.
+Actual routing remains subject to the underlying Mix packet format, which
+currently supports IPv4 TCP and QUIC-v1, including circuit relays. The multicodec
+`0x300001` is a private-use assignment, not an upstream registered code.
+
+Supplied destinations stay attached to their transport session and are removed
+on failure or teardown. Each send temporarily installs only the destination's
+mix key, public key and preferred address, restoring the original entries before
+returning its future. It leaves no permanent pool or peer-store changes and
+publishes no discovery notifications. This relies on the current Mix
+implementation constructing its route synchronously before awaiting I/O, so
+other flows cannot select the temporary destination as a relay.
+The caller still needs at least three eligible nodes in its normal relay pool.
+Addresses are tried in order, skipping invalid entries and continuing after
+connection failures; each attempt uses the configured connection timeout.
+
+This repository's `config.nims` enables the libp2p extension hooks. Applications
+depending on this package must also set `libp2p_multicodec_exts` to the package's
+`libp2p_mix_transport/exts/multicodec.nim` and `libp2p_multiaddress_exts` to
+`libp2p_mix_transport/exts/multiaddress.nim` at compile time. Applications with
+their own extensions must combine the `CodecExts` and `AddressExts` entries
+in their extension files.
+
 ## Docs
 
 In the `docs` folder there are some Markdown documents. Some of the them may contain more of less sophisticated math formatting. I am using Obsidian to render math expressions in Markdown. Obsidian has excelent support for Math and it works somoothly (I am speaking about you HackMD!). So, it you are serious about anything in your life ;), please use Obsidian to access the documentation. You can find our Obsidian vault at [logos-storage/logos-storage-docs-obsidian](https://github.com/logos-storage/logos-storage-docs-obsidian).
