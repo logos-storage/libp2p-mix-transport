@@ -2,6 +2,8 @@
 #
 # Simple harness for running transport experiments.
 
+require_binary "${TR_NODE_BINARY}"
+
 MIX_PATH_LENGTH=3
 
 TR_TRANSFER_LOGS="${TR_LOGS_FOLDER}/transfers"
@@ -50,7 +52,6 @@ tr_status() {
 tr_start_node() {
   local node_index=$1
   shift
-  require_binary "$TR_NODE_BINARY" || return
   local args=("$@")
   args+=(
     "--api-port=$TR_API_PORT"
