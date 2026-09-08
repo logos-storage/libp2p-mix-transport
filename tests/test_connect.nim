@@ -12,14 +12,17 @@ import
     crypto/crypto,
     crypto/secp,
     peerid,
+    peerstore,
     protocols/protocol,
     stream/connection,
     switch,
     utils/opt,
   ]
 import libp2p_mix
+import libp2p_mix/pool
 import libp2p_mix/delay_strategy
 import libp2p_mix/serialization
+import libp2p_mix/curve25519
 import protobuf_serialization
 
 import libp2p_mix_transport
@@ -154,8 +157,14 @@ method sendWithSurbRedundancyBatch(
     return err("could not send through any SURB in the reply group")
   ok()
 
+type ConnectionMode {.pure.} = enum
+  PeerIdConnect
+  AddressConnect
+  AddressDial
+
 proc establishSessionAndStream(
-    interAckDelay: Opt[Duration] = Opt.none(Duration)
+    interAckDelay: Opt[Duration] = Opt.none(Duration),
+    mode: ConnectionMode = ConnectionMode.PeerIdConnect,
 ): Future[RoundTripOutcome] {.async: (raises: [CancelledError, LPError]).} =
   let
     nodes = createMixNodes(5)
@@ -236,12 +245,45 @@ proc establishSessionAndStream(
     disposition
   initiatorMix.rawSurbReplyHandler = observingHandler
 
-  # This call sends Connect through the live Mix overlay and completes only
-  # after ConnectAck returns through a supplied SURB.
+  # Exercise three public API paths through the same live network. The address
+  # cases must discover the destination from the supplied address, so remove it
+  # from the initiator's relay pool before making either call.
   let destination = recipientMix.switch.peerInfo.peerId
-  let session = (await initiator.connect(destination)).expect(
-    "could not establish MixTransport session"
-  )
+  var addrs: seq[MultiAddress]
+  if mode != ConnectionMode.PeerIdConnect:
+    # The first candidate is deliberately not a mix address, to exercise
+    # skipping unusable candidates before trying the advertised destination.
+    addrs = @[
+      MultiAddress.init("/ip4/127.0.0.1/tcp/1").expect("non-mix address"),
+      recipientMix.mixNodeInfo.toMixPubInfo().toMixAddress().expect("mix address"),
+    ]
+    discard initiatorMix.nodePool.remove(destination)
+  let originalPool = initiatorMix.nodePool
+  let poolSize = originalPool.len
+  var
+    session: TransportSession
+    initiatorStream: TransportStream
+  case mode
+  of ConnectionMode.PeerIdConnect:
+    session = (await initiator.connect(destination)).expect("PeerId connect")
+  of ConnectionMode.AddressConnect:
+    let connecting = initiator.connect(destination, addrs)
+    # Inspect the pool while the operation is pending, not just after success:
+    # unrelated flows must never see the destination as an available relay.
+    doAssert initiatorMix.nodePool == originalPool
+    doAssert initiatorMix.nodePool.get(destination).isNone
+    session = (await connecting).expect("address connect")
+  of ConnectionMode.AddressDial:
+    # Deliberately do NOT connect first. This case proves that dial(address)
+    # performs both handshakes: Connect/ConnectAck and OpenStream/StreamAck.
+    # Calling connect beforehand would test only reuse of an existing session.
+    let dialing = initiator.dial(destination, addrs, TestCodec)
+    doAssert initiatorMix.nodePool == originalPool
+    doAssert initiatorMix.nodePool.get(destination).isNone
+    initiatorStream = (await dialing).expect("address-only dial")
+    session = initiator.sessions.get(initiatorStream.sessionId).expect(
+      "dial did not retain the session it created"
+    )
 
   # Once the anonymous round trip has established the session, connecting to
   # the same destination reuses its stable pseudonym instead of sending another
@@ -261,12 +303,13 @@ proc establishSessionAndStream(
         raise newException(LPError, "SURB supplier did not fill its credit")
   let initialRecipientReplySurbs = recipientSession.receivedSurbCount
 
-  # dial reuses the established session, sends OpenStream, and returns only
-  # after the recipient has registered the same stream identifier and sent a
-  # StreamAck through a temporary redundancy batch formed from the session's SURBs.
-  let initiatorStream = (await initiator.dial(destination, TestCodec)).expect(
-    "could not establish MixTransport stream"
-  )
+  # The connect cases still need a stream: dial reuses their established
+  # session and completes OpenStream/StreamAck. AddressDial already did both
+  # handshakes above. From here all cases run identical data and teardown checks.
+  if mode != ConnectionMode.AddressDial:
+    initiatorStream = (await initiator.dial(destination, TestCodec)).expect(
+      "could not establish MixTransport stream"
+    )
   let recipientStream = recipientSession.getStream(initiatorStream.streamId).expect(
       "recipient did not retain the inbound stream"
     )
@@ -344,6 +387,12 @@ proc establishSessionAndStream(
       raise newException(LPError, "recipient session event was not published")
     observedRecipientSessionEvents.add(await recipientEvent)
 
+  if mode != ConnectionMode.PeerIdConnect:
+    doAssert initiatorMix.nodePool == originalPool
+    doAssert initiatorMix.nodePool.len == poolSize
+    doAssert initiatorMix.nodePool.get(destination).isNone
+    doAssert initiator.addressDestinations.len == 0
+
   RoundTripOutcome(
     destination: destination,
     session: session,
@@ -369,6 +418,80 @@ proc establishSessionAndStream(
 suite "MixTransport session and stream handshakes":
   setup:
     updateLogLevel("INFO;trace:mix-transport")
+
+  test "temporary destination entries restore absent and existing peer-store state":
+    for alreadyKnown in [false, true]:
+      let
+        mix = createMixNodes(1)[0]
+        transport = MixTransport.newMixTransport(mix)
+        info = MixNodeInfo.generateRandom(4243, newRng()).toMixPubInfo()
+        destination = info.peerId
+        sessionId = PeerId.random(newRng()).expect("session id")
+        mixKeys = mix.switch.peerStore[MixPubKeyBook]
+        keys = mix.switch.peerStore[KeyBook]
+        observed = mix.switch.peerStore[LastSeenOutboundBook]
+        addresses = mix.switch.peerStore[AddressBook]
+      var stale = info
+      stale.multiAddr = MultiAddress.init("/ip4/127.0.0.1/tcp/4244").expect(
+        "stale address"
+      )
+      stale.mixPubKey = MixNodeInfo.generateRandom(4244, newRng()).mixPubKey
+      if alreadyKnown:
+        mix.nodePool.add(stale)
+        observed[destination] = Opt.some(stale.multiAddr)
+      let addressEntries = addresses.entries(destination)
+      var notifications = 0
+      let onChange: PeerBookChangeHandler =
+        proc(peer: PeerId) {.gcsafe, raises: [].} =
+          inc notifications
+      mixKeys.addHandler(onChange)
+      keys.addHandler(onChange)
+      observed.addHandler(onChange)
+      addresses.addHandler(onChange)
+
+      transport.addressDestinations[sessionId] = info
+      # No relays are available, so send fails during route construction. Even
+      # this early exit must restore every destination entry without discovery
+      # callbacks that could expose it to unrelated flows.
+      let sending = transport.sendToDestination(destination, sessionId, @[1.byte])
+      check (destination in mixKeys) == alreadyKnown
+      check (destination in keys) == alreadyKnown
+      check (destination in observed) == alreadyKnown
+      check addresses.entries(destination) == addressEntries
+      check notifications == 0
+      if alreadyKnown:
+        check mixKeys[destination].fieldElementToBytes() ==
+          stale.mixPubKey.fieldElementToBytes()
+        check keys[destination].skkey.getBytes() == stale.libp2pPubKey.getBytes()
+        check observed[destination] == Opt.some(stale.multiAddr)
+      check (waitFor sending).isErr
+
+  test "failed address connection releases private destination information":
+    let mix = createMixNodes(1)[0]
+    let transport = MixTransport.newMixTransport(mix)
+    let info = MixNodeInfo.generateRandom(4243, newRng()).toMixPubInfo()
+    let address = info.toMixAddress().expect("mix address")
+    (waitFor transport.start()).expect("start")
+    defer:
+      waitFor transport.stop()
+    check (waitFor transport.connect(info.peerId, @[address])).isErr
+    check mix.nodePool.len == 0
+    check transport.addressDestinations.len == 0
+    check transport.connectAttempts.len == 0
+
+  test "connect by address works without enrolling destination as a relay":
+    let outcome = waitFor establishSessionAndStream(
+      mode = ConnectionMode.AddressConnect
+    )
+    check outcome.session.state == SessionState.Closed
+    check outcome.reused == outcome.session
+
+  test "dial by address creates a session and carries traffic without pool membership":
+    let outcome = waitFor establishSessionAndStream(
+      mode = ConnectionMode.AddressDial
+    )
+    check outcome.session.state == SessionState.Closed
+    check outcome.reused == outcome.session
 
   test "StreamAck establishes a stream and StreamReject rejects an unsupported codec":
     let outcome = waitFor establishSessionAndStream()

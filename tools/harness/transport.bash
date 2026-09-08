@@ -111,8 +111,9 @@ tr_transfer_mix() {
   local source_node=$1 dest_node=$2 size=$3
   local src_ip
   src_ip=$(_tr_node_ip "$source_node")
-  local dest_peer_id
-  dest_peer_id=$(tr_peer_id "$dest_node")
+  local dest_status request_body
+  dest_status=$(tr_status "$dest_node")
+  request_body=$(jq -c --argjson size "$size" '{peerId: .mixInfo.peerId, mixAddress: .mixInfo.mixAddress, size: $size}' <<< "$dest_status")
   local label="${source_node} -> ${dest_node}"
   local logfile="${TR_TRANSFER_LOGS}/mix-${source_node}-${dest_node}-${RANDOM}.log"
 
@@ -131,7 +132,7 @@ tr_transfer_mix() {
   { time with_log "$label" "$logfile" \
       curl --fail-with-body --no-progress-meter -X POST "http://${src_ip}:${TR_API_PORT}/request" \
         -H "Content-Type: application/json" \
-        -d '{"peerId": "'"${dest_peer_id}"'", "size": '"${size}"'}' ; } 2>> "${TR_MEASUREMENTS}"
+        -d "$request_body" ; } 2>> "${TR_MEASUREMENTS}"
 }
 
 tr_kill_node() {

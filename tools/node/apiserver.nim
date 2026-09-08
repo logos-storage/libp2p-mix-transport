@@ -9,6 +9,8 @@ import pkg/libp2p/crypto/secp
 import pkg/libp2p_mix
 import pkg/libp2p_mix/curve25519
 
+import libp2p_mix_transport
+
 import ./node
 
 logScope:
@@ -20,6 +22,7 @@ proc toJson*(obj: MixPubInfo): JsonNode =
     # have to deal with different APIs
     "peerId": base64.encode(obj.peerId.data),
     "multiAddr": $obj.multiAddr,
+    "mixAddress": $obj.toMixAddress().expect("valid node mix address"),
     "mixPubKey": base64.encode(obj.mixPubKey.fieldElementToBytes),
     "libp2pPubKey": base64.encode(obj.libp2pPubKey.getBytes),
   }
@@ -80,9 +83,12 @@ proc handleRequest(
     address: MultiAddress
   # If we have a PeerId, use mix transport.
   if data.hasKey("peerId"):
+    if not data.hasKey("mixAddress"):
+      return await req.respond(Http400, "mixAddress must accompany peerId")
     fromJson(peerId, data["peerId"])
+    fromJson(address, data["mixAddress"])
     info "Handle data request over mix", peerId = peerId
-    let res = await node.request(peerId, size)
+    let res = await node.request(peerId, @[address], size)
     if res.isErr:
       return await req.respond(Http500, "Failed to request: " & res.error)
   # Otherwise, contact peer directly.

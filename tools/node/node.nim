@@ -171,9 +171,13 @@ proc request(
 ## an optionally provided seed, and then waits for the result and
 ## verifies it. This version uses a Mix transport connection.
 proc request*(
-    self: Node, target: PeerId, size: int32, seed: Option[int64] = int64.none
+    self: Node,
+    target: PeerId,
+    addrs: seq[MultiAddress],
+    size: int32,
+    seed: Option[int64] = int64.none,
 ): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
-  let stream = (await self.mixTransport.dial(target, TransferCodec)).valueOr:
+  let stream = (await self.mixTransport.dial(target, addrs, TransferCodec)).valueOr:
     return err(error)
 
   await request(stream, size, seed, stream.sessionId)
