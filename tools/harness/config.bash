@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-set -euo pipefail
 
 LIB_SRC=${LIB_SRC:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
 
 echoerr "Overrides are:"
-set | grep "^TR_" --color=never
+set | grep "^TR_" --color=never || true
 
 # Stuff you might want to change:
 TR_NODE_BINARY=${TR_NODE_BINARY:-$(realpath "${LIB_SRC}/../node/node")}
