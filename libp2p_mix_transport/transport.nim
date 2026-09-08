@@ -723,16 +723,17 @@ proc handleOpenStream(
       discard session.removeStream(stream.streamId)
       await noCancel stream.shutdown()
 
-  # We need to transition our local state machine before sending the ACKs,
-  # or the initiator might race us, send data before we're done, and have
-  # their data silently dropped.
+  # Install the stream's Data delivery, acknowledgement, retransmission and
+  # teardown machinery before the first StreamAck can reach the initiator.
+  # The initiator may start using the stream as soon as that first redundant
+  # acknowledgement arrives.
+  self.configureStream(session, stream)
   stream.establish()
   if not await self.sendStreamResponse(
     session, move(replyBatch), stream.streamId, FrameKind.StreamAck
   ):
     return
 
-  self.configureStream(session, stream)
   let handlerTask = runProtocolHandler(session, stream, protocol)
   # If the handler dies immediately, don't set it: the cleanup in
   # runProtocolHandler has already run, and will fail to clear it.
