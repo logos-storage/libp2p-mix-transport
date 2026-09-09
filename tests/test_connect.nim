@@ -4,7 +4,7 @@
 
 import std/[importutils, tables, unittest]
 
-import chronos, results
+import chronicles, chronos, results
 import stew/byteutils
 import
   libp2p/[
@@ -15,6 +15,7 @@ import
     protocols/protocol,
     stream/connection,
     switch,
+    utils/opt,
   ]
 import libp2p_mix
 import libp2p_mix/delay_strategy
@@ -22,6 +23,10 @@ import libp2p_mix/serialization
 import protobuf_serialization
 
 import libp2p_mix_transport
+import libp2p_mix_transport/connect_attempts
+import libp2p_mix_transport/transport {.all.}
+
+import ./logging
 
 privateAccess(MixProtocol)
 privateAccess(MixTransport)
@@ -124,9 +129,26 @@ type RoundTripOutcome = object
   initiatorSessionEvents: seq[SessionEvent]
   recipientSessionEvents: seq[SessionEvent]
 
-proc establishSessionAndStream(): Future[RoundTripOutcome] {.
-    async: (raises: [CancelledError, LPError])
-.} =
+proc delayAcknowledgementCopies(transport: MixTransport, interAckDelay: Duration) =
+  let originalSurbSender = transport.surbSender
+  transport.surbSender = proc(
+      surb: sink SURB, payload: sink seq[byte]
+  ): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
+    let
+      frame = MixTransportFrame.decode(payload).get()
+      isAcknowledgement =
+        frame.kind == FrameKind.ConnectAck or frame.kind == FrameKind.StreamAck
+      sendResult = await originalSurbSender(move(surb), move(payload))
+
+    if isAcknowledgement:
+      info "delaying next ack send", duration = $interAckDelay, frameKind = frame.kind
+      await sleepAsync(interAckDelay)
+
+    sendResult
+
+proc establishSessionAndStream(
+    interAckDelay: Opt[Duration] = Opt.none(Duration)
+): Future[RoundTripOutcome] {.async: (raises: [CancelledError, LPError]).} =
   let
     nodes = createMixNodes(5)
     initiatorMix = nodes[0]
@@ -136,13 +158,16 @@ proc establishSessionAndStream(): Future[RoundTripOutcome] {.
       connectTimeout = TestOperationTimeout,
       streamOpenTimeout = TestOperationTimeout,
     )
+    initiatorSessionEvents = newAsyncQueue[SessionEvent]()
+    recipientSessionEvents = newAsyncQueue[SessionEvent]()
     recipient = newMixTransport(
       recipientMix,
       connectTimeout = TestOperationTimeout,
       streamOpenTimeout = TestOperationTimeout,
     )
-    initiatorSessionEvents = newAsyncQueue[SessionEvent]()
-    recipientSessionEvents = newAsyncQueue[SessionEvent]()
+
+  if interAckDelay.isSome:
+    recipient.delayAcknowledgementCopies(interAckDelay.get())
 
   let initiatorSessionEventHandler: SessionEventHandler = proc(
       event: SessionEvent
@@ -230,10 +255,14 @@ proc establishSessionAndStream(): Future[RoundTripOutcome] {.
   let recipientStream = recipientSession.getStream(initiatorStream.streamId).expect(
       "recipient did not retain the inbound stream"
     )
+
+  # When we're delaying ACKs, we want the initiator to start sending data
+  # as quickly as possible, or this will cover up the state transition bugs
+  # we're trying to test for.
   let invocationFuture = protocolInvocations.get()
-  if not await invocationFuture.withTimeout(TestOperationTimeout):
-    raise newException(LPError, "recipient protocol handler was not invoked")
-  let invocation = await invocationFuture
+  if interAckDelay.isNone:
+    if not await invocationFuture.withTimeout(TestOperationTimeout):
+      raise newException(LPError, "recipient protocol handler was not invoked")
 
   # Application bytes use the ordinary libp2p Connection interface. The
   # transport divides the write into Data frames, restores stream order at the
@@ -266,6 +295,9 @@ proc establishSessionAndStream(): Future[RoundTripOutcome] {.
     if not await observed.withTimeout(TestOperationTimeout):
       raise newException(LPError, "redundant reply did not reach the initiator")
     replyDispositions.add(await observed)
+
+  # These futures must've been completed
+  let invocation = await invocationFuture
 
   # Closing the initiating connection emits CloseStream. The recipient waits
   # until every Data sequence named by that frame has entered its BufferStream,
@@ -320,6 +352,9 @@ proc establishSessionAndStream(): Future[RoundTripOutcome] {.
   )
 
 suite "MixTransport session and stream handshakes":
+  setup:
+    updateLogLevel("INFO;trace:mix-transport")
+
   test "StreamAck establishes a stream and StreamReject rejects an unsupported codec":
     let outcome = waitFor establishSessionAndStream()
 
@@ -416,6 +451,254 @@ suite "MixTransport session and stream handshakes":
     check:
       session.receivedSurbCount == 2
       session.surbSupplySnapshot().receiveBase == 1
+
+  test "data packets are not rejected if ACK arrives too fast":
+    try:
+      discard waitFor establishSessionAndStream(Opt.some(2.seconds))
+    except LPError as err:
+      raiseAssert "Unexpected error: " & err.msg
+
+type
+  Synchronizer = ref object
+    connectAttempts: ConnectAttemptCoordinator[string, Session]
+    sessions: Table[string, Session]
+    gate: AsyncEvent
+    operationCancelled: AsyncEvent
+
+  Caller = int
+  ConnAttempt = int
+  Destination = string
+  Session = tuple[attempt: ConnAttempt, caller: Caller]
+
+proc state*(self: Session): SessionState =
+  SessionState.Established
+
+proc newSynchronizer(): Synchronizer =
+  Synchronizer(
+    connectAttempts: newConnectAttemptCoordinator[string, Session](),
+    gate: newAsyncEvent(),
+    operationCancelled: newAsyncEvent(),
+  )
+
+proc getExisting*(self: Synchronizer, dest: Destination): Opt[Session] {.raises: [].} =
+  if self.sessions.hasKey(dest):
+    try:
+      return Opt.some(self.sessions[dest])
+    except KeyError:
+      doAssert false
+  else:
+    return Opt.none(Session)
+
+proc connInternal(
+    self: Synchronizer, caller: Caller, error: Opt[string] = Opt.none(string)
+): ConnectOperation[Destination, Session] =
+  proc wrapped(
+      dest: Destination
+  ): Future[Result[Session, string]] {.async: (raises: [CancelledError]).} =
+    # makes sure the connection attempt doesn't end before we can
+    # fire the next caller - this is how we ensure that calls get
+    # placed into the same attempt.
+    try:
+      await self.gate.wait()
+    except CancelledError as exc:
+      self.operationCancelled.fire()
+      raise exc
+
+    if error.isSome:
+      return err(error.get())
+
+    let attempt =
+      try:
+        self.sessions[dest].attempt
+      except KeyError:
+        0
+
+    let session = (attempt + 1, caller)
+    self.sessions[dest] = session
+    return ok(session)
+
+  wrapped
+
+proc existingConnectionLookup(
+    self: Synchronizer
+): ExistingConnectionLookup[Destination, Session] =
+  proc wrapped(dest: Destination): Opt[Session] {.gcsafe, raises: [].} =
+    self.getExisting(dest)
+
+  wrapped
+
+suite "connect behavior under multiple callers":
+  test "should create connection when there is only one caller":
+    proc asyncTest(): Future[void] {.async: (handleException: true).} =
+      let transport = newSynchronizer()
+      transport.gate.fire()
+
+      let (session, existing) = (
+        await transport.connectAttempts.connect(
+          "destination1",
+          transport.connInternal(5),
+          transport.existingConnectionLookup(),
+        )
+      ).get
+
+      check:
+        session == (attempt: 1, caller: 5)
+        existing == false
+        transport.connectAttempts.activeAttemptCount == 0
+
+    waitFor asyncTest()
+
+  test "should return existing connection if there is one":
+    proc asyncTest(): Future[void] {.async: (handleException: true).} =
+      let transport = newSynchronizer()
+      transport.sessions["destination1"] = (10, 1)
+      transport.gate.fire()
+
+      let (session, existing) = (
+        await transport.connectAttempts.connect(
+          "destination1",
+          transport.connInternal(5),
+          transport.existingConnectionLookup(),
+        )
+      ).get
+
+      check:
+        session == (attempt: 10, caller: 1)
+        existing == true
+
+    waitFor asyncTest()
+
+  test "should await the owner's attempt when there is more than one caller":
+    proc asyncTest(): Future[void] {.async: (handleException: true).} =
+      let transport = newSynchronizer()
+
+      let
+        first = transport.connectAttempts.connect(
+          "destination1",
+          transport.connInternal(1),
+          transport.existingConnectionLookup(),
+        )
+        second = transport.connectAttempts.connect(
+          "destination1",
+          transport.connInternal(2),
+          transport.existingConnectionLookup(),
+        )
+
+      transport.gate.fire()
+
+      let
+        (firstSession, _) = (await first).get
+        (secondSession, _) = (await second).get
+
+      check:
+        firstSession == (attempt: 1, caller: 1)
+        secondSession == (attempt: 1, caller: 1)
+        transport.connectAttempts.activeAttemptCount == 0
+
+    waitFor asyncTest()
+
+  test "cancelling one caller does not cancel an attempt used by another caller":
+    proc asyncTest(): Future[void] {.async: (handleException: true).} =
+      let transport = newSynchronizer()
+      let
+        first = transport.connectAttempts.connect(
+          "destination1",
+          transport.connInternal(1),
+          transport.existingConnectionLookup(),
+        )
+        second = transport.connectAttempts.connect(
+          "destination1",
+          transport.connInternal(2),
+          transport.existingConnectionLookup(),
+        )
+
+      await first.cancelAndWait()
+      check:
+        first.cancelled
+        transport.connectAttempts.activeAttemptCount == 1
+
+      transport.gate.fire()
+      check:
+        (await second).get().connection == (attempt: 1, caller: 1)
+        transport.connectAttempts.activeAttemptCount == 0
+
+    waitFor asyncTest()
+
+  test "cancelling the only caller cancels the transport-owned attempt":
+    proc asyncTest(): Future[void] {.async: (handleException: true).} =
+      let transport = newSynchronizer()
+      let caller = transport.connectAttempts.connect(
+        "destination1", transport.connInternal(1), transport.existingConnectionLookup()
+      )
+
+      await caller.cancelAndWait()
+      check:
+        caller.cancelled
+        await transport.operationCancelled.wait().withTimeout(1.seconds)
+        transport.connectAttempts.activeAttemptCount == 0
+
+    waitFor asyncTest()
+
+  test "stopping owned attempts wakes every caller with the stop reason":
+    proc asyncTest(): Future[void] {.async: (handleException: true).} =
+      let transport = newSynchronizer()
+      let
+        first = transport.connectAttempts.connect(
+          "destination1",
+          transport.connInternal(1),
+          transport.existingConnectionLookup(),
+        )
+        second = transport.connectAttempts.connect(
+          "destination1",
+          transport.connInternal(2),
+          transport.existingConnectionLookup(),
+        )
+
+      await transport.connectAttempts.cancelAll("transport stopped")
+      check:
+        (await first).error == "transport stopped"
+        (await second).error == "transport stopped"
+        transport.connectAttempts.activeAttemptCount == 0
+
+    waitFor asyncTest()
+
+  test "should allow another attempt if the previous one failed":
+    proc asyncTest(): Future[void] {.async: (handleException: true).} =
+      let transport = newSynchronizer()
+
+      let
+        first = transport.connectAttempts.connect(
+          "destination1",
+          transport.connInternal(1, Opt.some("ooops, this is an error")),
+          transport.existingConnectionLookup(),
+        )
+        second = transport.connectAttempts.connect(
+          "destination1",
+          transport.connInternal(2, Opt.some("this is also an error")),
+          transport.existingConnectionLookup(),
+        )
+
+      transport.gate.fire()
+      # Despite the error, the first two calls should end in the same
+      # outcome as they are logically the same attempt.
+      check:
+        (await first).error() == "ooops, this is an error"
+        (await second).error() == "ooops, this is an error"
+        transport.connectAttempts.activeAttemptCount == 0
+
+      # A third call that happens after the first two complete,
+      # however, should be able to go through as it represents
+      # a separate attempt.
+      transport.gate.clear()
+      let third = transport.connectAttempts.connect(
+        "destination1", transport.connInternal(3), transport.existingConnectionLookup()
+      )
+      transport.gate.fire()
+      check:
+        (await third).get().connection == (attempt: 1, caller: 3)
+        transport.connectAttempts.activeAttemptCount == 0
+
+    waitFor asyncTest()
 
   test "ResetSession closes every stream as a remote reset":
     let
