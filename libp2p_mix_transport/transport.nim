@@ -28,6 +28,10 @@ const
   UnknownStreamRejectionReason = "remote rejected the stream for an unknown reason"
 
 type
+  SurbSender = proc(
+    surb: sink SURB, payload: sink seq[byte]
+  ): Future[Result[void, string]].Raising([CancelledError]) {.gcsafe, raises: [].}
+
   SessionEventKind* {.pure.} = enum
     Established
     Closed
@@ -42,8 +46,9 @@ type
     gcsafe, async: (raises: [CancelledError])
   .}
 
-  MixTransport* = ref object of RootObj
+  MixTransport* = ref object
     mix: MixProtocol
+    surbSender: SurbSender
     replyCredentials: ReplyCredentialStore
     sessions: SessionStore
     sessionEventHandlers: OrderedSet[SessionEventHandler]
@@ -209,15 +214,15 @@ proc handleReplyFrame(
   else:
     discard
 
-method sendWithSurbRedundancyBatch(
+proc sendWithSurbRedundancyBatch(
     self: MixTransport, surbs: sink seq[SURB], payload: sink seq[byte]
-): Future[Result[void, string]] {.async: (raises: [CancelledError]), base.} =
+): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
   var sent = false
   for surb in surbs.mitems:
     # Each SURB is consumed once, but every redundant packet needs the same
     # payload. Passing payload without move lets Nim copy it for each send.
     traceOutbound(surb, payload)
-    if (await self.mix.sendWithSurb(move(surb), payload)).isOk:
+    if (await self.surbSender(move(surb), payload)).isOk:
       sent = true
 
   if not sent:
@@ -820,7 +825,6 @@ proc handleRawSurbReply(
   RawSurbReplyDisposition.Unhandled
 
 proc newMixTransport*(
-    T: type MixTransport,
     mix: MixProtocol,
     connectTimeout = DefaultConnectTimeout,
     streamOpenTimeout = DefaultStreamOpenTimeout,
@@ -832,7 +836,7 @@ proc newMixTransport*(
     surbReplenishmentLowWatermark = DefaultSurbReplenishmentLowWatermark,
     enableDataRetransmissions = true,
     recipientSurbCapacity = DefaultRecipientSurbCapacity,
-): T =
+): MixTransport =
 
   doAssert not mix.isNil, "MixProtocol must not be nil"
   doAssert connectTimeout > ZeroDuration, "connect timeout must be positive"
@@ -853,8 +857,16 @@ proc newMixTransport*(
     "SURB replenishment low watermark must be below recipient capacity"
   doAssert recipientSurbCapacity >= MaxConnectSurbs - DefaultReplySurbRedundancy,
     "recipient SURB capacity must hold the Connect bootstrap supply"
-  T(
+  let surbSender: SurbSender = proc(
+      surb: sink SURB, payload: sink seq[byte]
+  ): Future[Result[void, string]] {.
+      async: (raw: true, raises: [CancelledError])
+  .} =
+    mix.sendWithSurb(move(surb), move(payload))
+
+  MixTransport(
     mix: mix,
+    surbSender: surbSender,
     replyCredentials: ReplyCredentialStore.new(),
     sessions: newSessionStore(recipientSurbCapacity),
     sessionEventHandlers: initOrderedSet[SessionEventHandler](),

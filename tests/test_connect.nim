@@ -129,31 +129,23 @@ type RoundTripOutcome = object
   initiatorSessionEvents: seq[SessionEvent]
   recipientSessionEvents: seq[SessionEvent]
 
-type DelayedAckMixTransport = ref object of MixTransport
-  interAckDelay: Duration
+proc delayAcknowledgementCopies(transport: MixTransport, interAckDelay: Duration) =
+  let originalSurbSender = transport.surbSender
+  transport.surbSender = proc(
+      surb: sink SURB, payload: sink seq[byte]
+  ): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
+    let
+      frame = MixTransportFrame.decode(payload).get()
+      isAcknowledgement =
+        frame.kind == FrameKind.ConnectAck or frame.kind == FrameKind.StreamAck
+      sendResult = await originalSurbSender(move(surb), move(payload))
 
-method sendWithSurbRedundancyBatch(
-    self: DelayedAckMixTransport, surbs: sink seq[SURB], payload: sink seq[byte]
-): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
-  let
-    frame = MixTransportFrame.decode(payload).get()
-    isAck = frame.kind == FrameKind.ConnectAck or frame.kind == FrameKind.StreamAck
-
-  var sent = false
-  for surb in surbs.mitems:
-    # Each SURB is consumed once, but every redundant packet needs the same
-    # payload. Passing payload without move lets Nim copy it for each send.
-    if (await self.mix.sendWithSurb(move(surb), payload)).isOk:
-      sent = true
-
-    if isAck:
+    if isAcknowledgement:
       info "delaying next ack send",
-        duration = $self.interAckDelay, frameKind = frame.kind
-      await sleepAsync(self.interAckDelay)
+        duration = $interAckDelay, frameKind = frame.kind
+      await sleepAsync(interAckDelay)
 
-  if not sent:
-    return err("could not send through any SURB in the reply group")
-  ok()
+    sendResult
 
 proc establishSessionAndStream(
     interAckDelay: Opt[Duration] = Opt.none(Duration)
@@ -162,28 +154,21 @@ proc establishSessionAndStream(
     nodes = createMixNodes(5)
     initiatorMix = nodes[0]
     recipientMix = nodes[^1]
-    initiator = MixTransport.newMixTransport(
+    initiator = newMixTransport(
       initiatorMix,
       connectTimeout = TestOperationTimeout,
       streamOpenTimeout = TestOperationTimeout,
     )
     initiatorSessionEvents = newAsyncQueue[SessionEvent]()
     recipientSessionEvents = newAsyncQueue[SessionEvent]()
-    recipient =
-      if interAckDelay.isSome:
-        var transport = DelayedAckMixTransport.newMixTransport(
-          recipientMix,
-          connectTimeout = TestOperationTimeout,
-          streamOpenTimeout = TestOperationTimeout,
-        )
-        transport.interAckDelay = interAckDelay.get()
-        transport
-      else:
-        MixTransport.newMixTransport(
-          recipientMix,
-          connectTimeout = TestOperationTimeout,
-          streamOpenTimeout = TestOperationTimeout,
-        )
+    recipient = newMixTransport(
+      recipientMix,
+      connectTimeout = TestOperationTimeout,
+      streamOpenTimeout = TestOperationTimeout,
+    )
+
+  if interAckDelay.isSome:
+    recipient.delayAcknowledgementCopies(interAckDelay.get())
 
   let initiatorSessionEventHandler: SessionEventHandler = proc(
       event: SessionEvent
@@ -428,7 +413,7 @@ suite "MixTransport session and stream handshakes":
   test "numbered supply retains each valid SURB independently":
     let
       mix = createMixNodes(1)[0]
-      transport = MixTransport.newMixTransport(mix)
+      transport = newMixTransport(mix)
       session = transport.sessions
         .addRecipientSession(
           PeerId.random(mix.rng).expect("could not generate session identifier")
@@ -695,7 +680,7 @@ suite "connect behavior under multiple callers":
   test "ResetSession closes every stream as a remote reset":
     let
       mix = createMixNodes(1)[0]
-      transport = MixTransport.newMixTransport(mix)
+      transport = newMixTransport(mix)
       session = transport.sessions
         .addRecipientSession(
           PeerId.random(mix.rng).expect("could not generate session identifier")
