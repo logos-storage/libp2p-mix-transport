@@ -268,7 +268,7 @@ fixed number of transfers in flight between randomly chosen node pairs until the
 requested total has completed.
 
 ```bash
-tools/experiments/multitransfer/multitransfer.bash \
+bash tools/experiments/multitransfer/multitransfer.bash \
     <n_nodes> <n_transfers> <concurrent> <filesize_bytes> <use_mix> <strategy> <emu_profile>
 ```
 
@@ -296,6 +296,16 @@ doesn't say *which* job finished.
 (network sizes, concurrency levels, delay strategies, emulation profiles),
 holding `sudo` alive for the duration. Edit the `PARAMS` array to change the
 sweep.
+
+Run the complete configured sweep from the repository root with:
+
+```bash
+TR_BASE="$PWD/tools/experiments/multitransfer/output" \
+  bash tools/experiments/multitransfer/multitransfer-set.bash
+```
+
+Setting `TR_BASE` explicitly places the generated CSV files and node logs in the
+directory read by the bundled analysis notebooks.
 
 ## Analysis
 
