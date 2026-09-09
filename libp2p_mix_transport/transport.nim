@@ -28,6 +28,14 @@ const
   UnknownStreamRejectionReason = "remote rejected the stream for an unknown reason"
 
 type
+  ConnectAttempt[T] = ref object
+    outcome: Future[Result[T, string]].Raising([])
+    task: Future[void].Raising([CancelledError])
+    waiterCount: int
+    cancelling: bool
+    cancellationReason: string
+    retryAfterCancellation: bool
+
   SessionEventKind* {.pure.} = enum
     Established
     Closed
@@ -51,8 +59,7 @@ type
     connectTimeout: Duration
     streamOpenTimeout: Duration
     connLock: AsyncLock
-    connectAttempts:
-      Table[PeerId, Future[Result[TransportSession, string]].Raising([CancelledError])]
+    connectAttempts: Table[PeerId, ConnectAttempt[TransportSession]]
     dataRetransmissionTimeout: Duration
     surbSupplyRetransmissionTimeout: Duration
     reverseActivityTimeout: Duration
@@ -1119,6 +1126,89 @@ proc connectInternal(
   await self.publishSessionEvent(session, SessionEventKind.Established)
   ok(session)
 
+proc finishConnectAttempt[S, K, T](
+    self: S, destination: K, attempt: ConnectAttempt[T], outcome: Result[T, string]
+) {.async: (raises: []).} =
+  await noCancel self.connLock.acquire()
+  try:
+    self.connectAttempts.withValue(destination, current):
+      if current[] == attempt:
+        self.connectAttempts.del(destination)
+    if not attempt.outcome.finished:
+      attempt.outcome.complete(outcome)
+  finally:
+    try:
+      self.connLock.release()
+    except AsyncLockError:
+      doAssert false, "lock release twice"
+
+proc runConnectAttempt[S, K, T](
+    self: S,
+    destination: K,
+    attempt: ConnectAttempt[T],
+    connInternal: (
+      proc(self: S, destination: K): Future[Result[T, string]].Raising([CancelledError]) {.
+        gcsafe, raises: []
+      .}
+    ),
+): Future[void] {.async: (raises: [CancelledError]).} =
+  var
+    outcome = err(Result[T, string], "connection attempt was cancelled")
+    cancellation: ref CancelledError
+
+  try:
+    outcome = await self.connInternal(destination)
+  except CancelledError as exc:
+    cancellation = exc
+    if attempt.cancellationReason.len > 0:
+      outcome = err(Result[T, string], attempt.cancellationReason)
+  except CatchableError as exc:
+    outcome = err(Result[T, string], exc.msg)
+
+  await noCancel self.finishConnectAttempt(destination, attempt, outcome)
+  if not cancellation.isNil:
+    raise cancellation
+
+proc releaseConnectWaiter[S, K, T](
+    self: S, destination: K, attempt: ConnectAttempt[T]
+) {.async: (raises: []).} =
+  await noCancel self.connLock.acquire()
+  try:
+    doAssert attempt.waiterCount > 0
+    dec attempt.waiterCount
+    if attempt.waiterCount == 0 and not attempt.outcome.finished and
+        not attempt.cancelling:
+      attempt.cancelling = true
+      attempt.cancellationReason = "connection attempt has no remaining callers"
+      attempt.retryAfterCancellation = true
+      attempt.task.cancelSoon()
+  finally:
+    try:
+      self.connLock.release()
+    except AsyncLockError:
+      doAssert false, "lock release twice"
+
+proc cancelConnectAttempts[S, K, T](self: S, reason: string) {.async: (raises: []).} =
+  await noCancel self.connLock.acquire()
+  var attempts: seq[ConnectAttempt[T]]
+  try:
+    attempts = newSeqOfCap[ConnectAttempt[T]](self.connectAttempts.len)
+    for attempt in self.connectAttempts.values:
+      attempt.cancellationReason = reason
+      attempt.retryAfterCancellation = false
+      if not attempt.cancelling:
+        attempt.cancelling = true
+        attempt.task.cancelSoon()
+      attempts.add(attempt)
+  finally:
+    try:
+      self.connLock.release()
+    except AsyncLockError:
+      doAssert false, "lock release twice"
+
+  for attempt in attempts:
+    await noCancel attempt.task.cancelAndWait()
+
 ## Connect operation synchronizer, implemented like this so we can test it in
 ## isolation.
 proc connect[S, K, T](
@@ -1130,81 +1220,71 @@ proc connect[S, K, T](
       .}
     ),
     getExisting: (proc(self: S, destination: K): Opt[T] {.gcsafe, raises: [].}),
-): Future[Result[
-    tuple[conn: T, existing: bool], string]] {.async: (raises: [CancelledError]).} =
+): Future[Result[tuple[conn: T, existing: bool], string]] {.
+    async: (raises: [CancelledError])
+.} =
   template releaseLock() =
     try:
       self.connLock.release()
     except AsyncLockError:
       doAssert false, "lock release twice"
 
-  trace "acquire connect lock", destination = destination
-  await self.connLock.acquire()
-  # If a connection already exists and it is established, we return it.
-  self.getExisting(destination).withValue(existing):
-    releaseLock()
-    trace "return existing connection", destination = destination
-    # It might happen that the connection is no longer valid here, but
-    # that's fine.
-    return ok((existing, true))
+  while true:
+    trace "acquire connect lock", destination = destination
+    await self.connLock.acquire()
 
-  # If a valid connection doesn't exist, then this is officially a connection
-  # attempt. Our goal here then becomes to merge all connection attempts
-  # into a single operation, with only one of the requesters "owning" the
-  # actual attempt while everyone else awaits.
+    # If a connection already exists and it is established, return it.
+    self.getExisting(destination).withValue(existing):
+      releaseLock()
+      trace "return existing connection", destination = destination
+      # It might happen that the connection is no longer valid here, but
+      # that's fine.
+      return ok((existing, true))
 
-  # Are we the first ones to attempt this connection?
-  trace "attempt connection", destination = destination
-  if destination in self.connectAttempts:
-    # No, someone else owns the attempt, so we just wait.
-    # Copies before releasing the lock as otherwise the attempt
-    # could complete before we can get a hold of the future.
-    var attempt: Future[Result[T, string]].Raising([CancelledError])
+    var
+      attempt: ConnectAttempt[T]
+      existingAttempt = false
     try:
       attempt = self.connectAttempts[destination]
+      existingAttempt = true
+      if not attempt.cancelling:
+        inc attempt.waiterCount
     except exceptions.KeyError:
-      doAssert false, "assertion failed"
-    releaseLock()
-
-    let res = (await attempt).valueOr:
-      return err(error)
-    
-    # In practice this is equivalent to obtaining an existing
-    # connection, so we return existing = true.
-    return ok((res, true))
-
-  # If we're here, we're sure that we're the ones handling this
-  # attempt at connecting to this destination.
-  let attempt =
-    Future[Result[T, string]].Raising([CancelledError]).init("transport.connect")
-  # Note that this should never replace an existing attempt.
-  doAssert destination notin self.connectAttempts
-  self.connectAttempts[destination] = attempt
-  # We can release the lock here as we've secured the attempt.
-  releaseLock()
-
-  let res =
-    try:
-      await self.connInternal(destination)
-    except CancelledError as e:
-      raise e
-    except CatchableError as e:
-      err(Result[T, string], e.msg)
+      attempt = ConnectAttempt[T](
+        outcome: Future[Result[T, string]].Raising([]).init(
+            "transport.connect.outcome", {FutureFlag.OwnCancelSchedule}
+          ),
+        waiterCount: 1,
+      )
+      self.connectAttempts[destination] = attempt
+      attempt.task = self.runConnectAttempt(destination, attempt, connInternal)
     finally:
-      # This is what will officially end an attempt. Once the
-      # future is out of the table, another requester can re-attempt
-      # the connection. Until then, everyone will see the result of
-      # the previous attempt.
-      await self.connLock.acquire()
-      self.connectAttempts.del(destination)
       releaseLock()
 
-  trace "complete connection attempt", destination = destination, success = res.isOk
-  attempt.complete(res)
-  let conn = res.valueOr:
-    return err(error)
-  
-  return ok((conn, false))
+    if existingAttempt and attempt.cancelling:
+      # Do not overlap a new attempt with a worker that is still unwinding.
+      await attempt.outcome.join()
+      if attempt.retryAfterCancellation:
+        continue
+      return err(attempt.cancellationReason)
+
+    trace "await connection attempt", destination = destination
+
+    var outcome: Result[T, string]
+    try:
+      await attempt.outcome.join()
+      try:
+        outcome = attempt.outcome.read()
+      except FuturePendingError:
+        doAssert false, "joined connection outcome is still pending"
+    finally:
+      await noCancel self.releaseConnectWaiter(destination, attempt)
+
+    trace "complete connection attempt",
+      destination = destination, success = outcome.isOk
+    let conn = outcome.valueOr:
+      return err(error)
+    return ok((conn, existingAttempt))
 
 proc connect*(
     self: MixTransport, destination: PeerId
@@ -1379,6 +1459,10 @@ proc start*(
 proc stop*(self: MixTransport): Future[void] {.async: (raises: [CancelledError]).} =
   if not self.started:
     return
+
+  await cancelConnectAttempts[MixTransport, PeerId, TransportSession](
+    self, "MixTransport stopped during connection attempt"
+  )
 
   let sessions = self.sessions.takeSessions()
   for session in sessions:
