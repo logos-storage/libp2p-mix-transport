@@ -1,13 +1,5 @@
 switch("nimcache", "nimcache")
 switch("path", thisDir())
-switch(
-  "define",
-  "libp2p_multicodec_exts=" & thisDir() & "/libp2p_mix_transport/exts/multicodec.nim",
-)
-switch(
-  "define",
-  "libp2p_multiaddress_exts=" & thisDir() & "/libp2p_mix_transport/exts/multiaddress.nim",
-)
 
 # begin Nimble config (version 2)
 when withDir(thisDir(), system.fileExists("nimble.paths")):

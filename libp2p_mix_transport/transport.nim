@@ -13,7 +13,8 @@ import libp2p/stream/connection
 import libp2p/utils/opt
 import libp2p_mix
 import libp2p_mix/[pool, multiaddr]
-import ./[addresses, reply_credentials, sessions, streams, trace, wire]
+import ./address/parse
+import ./[reply_credentials, sessions, streams, trace, wire]
 
 logScope:
   topics = "mix-transport transport"
