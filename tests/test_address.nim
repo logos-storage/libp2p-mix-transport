@@ -49,9 +49,9 @@ suite "Mix transport addresses":
     # Appending a binary component also invokes MultiAddress validation;
     # malformed key lengths are rejected without going through text parsing.
     var shortAddress = info.multiAddr
-    let shortComponent = MultiAddress.init(
-      multiCodec("mix-transport"), @[1.byte]
-    ).expect("short binary component")
+    let shortComponent = MultiAddress
+      .init(multiCodec("mix-transport"), @[1.byte])
+      .expect("short binary component")
     check shortAddress.append(shortComponent).isErr
     let zeroKeys = MultiAddress
       .init(
