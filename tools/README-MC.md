@@ -518,7 +518,7 @@ The defaults are:
 
 The scheduler starts transfers in background processes. When the concurrency limit is reached, `wait -n` waits until any transfer process exits. Bash does not return the completed process identifier in the form used by the script, so the scheduler checks every recorded PID with `kill -0` and removes processes that no longer exist.
 
-`multitransfer-set.bash` contains a `PARAMS` array for running several experiment configurations sequentially. Edit that array before launching a large sweep. The script refreshes the caller's `sudo` timestamp every 30 seconds so repeated namespace creation does not repeatedly prompt for a password.
+`multitransfer-set.bash` contains a `PARAMS` array for running several experiment configurations sequentially. Edit that array before launching a large sweep. The script refreshes the caller's `sudo` timestamp every 30 seconds so repeated namespace creation does not repeatedly prompt for a password. Every configuration receives a new run identifier and writes a separate measurement CSV and log directory.
 
 Run the complete configured sweep from the repository root with:
 
