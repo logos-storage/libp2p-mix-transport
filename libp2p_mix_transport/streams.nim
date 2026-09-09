@@ -15,7 +15,7 @@ from ./wire import
   SequenceNumber, StreamId
 
 logScope:
-  scope = "mix-transport streams"
+  topics = "mix-transport streams"
 
 type
   StreamWriteHandler* = proc(data: sink seq[byte]): Future[void] {.
@@ -357,8 +357,10 @@ proc receiveRemoteReset*(stream: TransportStream) =
   stream.suppressRemoteTeardown()
 
 proc establish*(stream: TransportStream) =
-  trace "stream established successfully", streamId = stream.streamId,
-    sessionId = stream.sessionId, direction = stream.direction
+  trace "stream established successfully",
+    streamId = stream.streamId,
+    sessionId = stream.sessionId,
+    direction = stream.direction
   stream.state = StreamState.Established
   stream.resolved.fire()
 

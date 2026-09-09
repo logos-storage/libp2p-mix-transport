@@ -36,5 +36,10 @@ PARAMS=(
 
 for param in "${PARAMS[@]}"; do
   echo "Running: $param"
-  bash -c "bash ${SCRIPT_DIR}/multitransfer.bash $param"
+  read -r -a args <<< "$param"
+  env \
+    -u TR_RUN_ID \
+    -u TR_RUNTIME_FOLDER \
+    -u TR_LOGS_FOLDER \
+    bash "${SCRIPT_DIR}/multitransfer.bash" "${args[@]}"
 done

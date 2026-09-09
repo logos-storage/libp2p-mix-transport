@@ -31,7 +31,7 @@ proc createMixProtocol(): MixProtocol =
 
 suite "MixTransport lifecycle":
   test "session event handlers can be registered once and removed":
-    let transport = MixTransport.newMixTransport(createMixProtocol())
+    let transport = newMixTransport(createMixProtocol())
     let handler: SessionEventHandler = proc(
         event: SessionEvent
     ): Future[void] {.async: (raises: [CancelledError]).} =
@@ -47,9 +47,8 @@ suite "MixTransport lifecycle":
   test "Data retransmissions are enabled by default and can be disabled":
     let
       mix = createMixProtocol()
-      defaultTransport = MixTransport.newMixTransport(mix)
-      retransmissionsDisabled = MixTransport.newMixTransport(mix,
-        enableDataRetransmissions = false)
+      defaultTransport = newMixTransport(mix)
+      retransmissionsDisabled = newMixTransport(mix, enableDataRetransmissions = false)
 
     check:
       defaultTransport.dataRetransmissionsEnabled
@@ -58,8 +57,8 @@ suite "MixTransport lifecycle":
   test "status probe recovery has bounded configurable attempts":
     let
       mix = createMixProtocol()
-      defaultTransport = MixTransport.newMixTransport(mix)
-      configuredTransport = MixTransport.newMixTransport(
+      defaultTransport = newMixTransport(mix)
+      configuredTransport = newMixTransport(
         mix,
         reverseActivityTimeout = 1.minutes,
         surbStatusProbeRetryInterval = 5.seconds,
@@ -78,8 +77,8 @@ suite "MixTransport lifecycle":
   test "SURB replenishment uses a configurable low watermark":
     let
       mix = createMixProtocol()
-      defaultTransport = MixTransport.newMixTransport(mix)
-      configuredTransport = MixTransport.newMixTransport(mix, surbReplenishmentLowWatermark = 4)
+      defaultTransport = newMixTransport(mix)
+      configuredTransport = newMixTransport(mix, surbReplenishmentLowWatermark = 4)
 
     check:
       DefaultSurbReplenishmentLowWatermark ==
@@ -91,8 +90,8 @@ suite "MixTransport lifecycle":
   test "start and stop own the Mix plug-in registrations":
     let
       mix = createMixProtocol()
-      first = MixTransport.newMixTransport(mix)
-      second = MixTransport.newMixTransport(mix)
+      first = newMixTransport(mix)
+      second = newMixTransport(mix)
 
     # The first transport acquires both Mix plug-in registrations.
     check waitFor(first.start()).isOk
@@ -115,7 +114,7 @@ suite "MixTransport lifecycle":
   test "failed start rolls back the service registration":
     let
       mix = createMixProtocol()
-      transport = MixTransport.newMixTransport(mix)
+      transport = newMixTransport(mix)
 
     # Occupy the raw SURB reply handler slot. Transport startup will register
     # its service handler first and then fail to register its SURB handler.
@@ -135,6 +134,6 @@ suite "MixTransport lifecycle":
     # failed startup rolled its already-registered service handler back.
     mix.unregisterRawSurbReplyHandler()
 
-    let replacement = MixTransport.newMixTransport(mix)
+    let replacement = newMixTransport(mix)
     check waitFor(replacement.start()).isOk
     waitFor(replacement.stop())

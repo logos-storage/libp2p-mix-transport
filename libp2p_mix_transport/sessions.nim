@@ -198,7 +198,8 @@ proc addRecipientSession*(
   ok(session)
 
 proc establish*(session: TransportSession) =
-  trace "session established successfully", sessionId = session.sessionId, role = session.role
+  trace "session established successfully",
+    sessionId = session.sessionId, role = session.role
   session.state = SessionState.Established
   session.established.fire()
 
@@ -682,8 +683,8 @@ proc remove*(store: SessionStore, sessionId: PeerId): Opt[TransportSession] =
   let session = store.get(sessionId).valueOr:
     return Opt.none(TransportSession)
 
-  trace "removing session", sessionId = session.sessionId,
-    role = session.role, state = session.state
+  trace "removing session",
+    sessionId = session.sessionId, role = session.role, state = session.state
 
   store.bySessionId.del(sessionId)
   session.destination.withValue(destination):

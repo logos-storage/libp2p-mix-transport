@@ -1,9 +1,7 @@
+# SPDX-License-Identifier: MIT
+
 import strutils
-import pkg/[
-  chronicles,
-  chronicles/helpers,
-  chronicles/topics_registry,
-]
+import pkg/[chronicles, chronicles/helpers, chronicles/topics_registry]
 
 ## Helper for setting log levels which supports the format `level1;level2:topic1,topic2;...`.
 ## Example:

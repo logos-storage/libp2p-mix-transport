@@ -2,7 +2,7 @@
 
 {.push raises: [].}
 
-import chronicles, chronos, chronos/asyncsync, results, sets, tables
+import chronicles, chronos, results, sets, tables
 import libp2p/multistream
 import libp2p/peerid
 import libp2p/peerstore
@@ -14,7 +14,7 @@ import libp2p/utils/opt
 import libp2p_mix
 import libp2p_mix/[pool, multiaddr]
 import ./address/parse
-import ./[reply_credentials, sessions, streams, trace, wire]
+import ./[connect_attempts, reply_credentials, sessions, streams, trace, wire]
 
 logScope:
   topics = "mix-transport transport"
@@ -32,6 +32,10 @@ const
   UnknownStreamRejectionReason = "remote rejected the stream for an unknown reason"
 
 type
+  SurbSender = proc(
+    surb: sink SURB, payload: sink seq[byte]
+  ): Future[Result[void, string]].Raising([CancelledError]) {.gcsafe, raises: [].}
+
   SessionEventKind* {.pure.} = enum
     Established
     Closed
@@ -46,18 +50,17 @@ type
     gcsafe, async: (raises: [CancelledError])
   .}
 
-  MixTransport* = ref object of RootObj
+  MixTransport* = ref object
     mix: MixProtocol
     addressDestinations: Table[PeerId, MixPubInfo]
+    surbSender: SurbSender
     replyCredentials: ReplyCredentialStore
     sessions: SessionStore
     sessionEventHandlers: OrderedSet[SessionEventHandler]
     publishedSessionIds: HashSet[PeerId]
     connectTimeout: Duration
     streamOpenTimeout: Duration
-    connLock: AsyncLock
-    connectAttempts:
-      Table[PeerId, Future[Result[TransportSession, string]].Raising([CancelledError])]
+    connectAttempts: ConnectAttemptCoordinator[PeerId, TransportSession]
     dataRetransmissionTimeout: Duration
     surbSupplyRetransmissionTimeout: Duration
     reverseActivityTimeout: Duration
@@ -217,15 +220,15 @@ proc handleReplyFrame(
   else:
     discard
 
-method sendWithSurbRedundancyBatch(
+proc sendWithSurbRedundancyBatch(
     self: MixTransport, surbs: sink seq[SURB], payload: sink seq[byte]
-): Future[Result[void, string]] {.async: (raises: [CancelledError]), base.} =
+): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
   var sent = false
   for surb in surbs.mitems:
     # Each SURB is consumed once, but every redundant packet needs the same
     # payload. Passing payload without move lets Nim copy it for each send.
     traceOutbound(surb, payload)
-    if (await self.mix.sendWithSurb(move(surb), payload)).isOk:
+    if (await self.surbSender(move(surb), payload)).isOk:
       sent = true
 
   if not sent:
@@ -757,16 +760,17 @@ proc handleOpenStream(
       discard session.removeStream(stream.streamId)
       await noCancel stream.shutdown()
 
-  # We need to transition our local state machine before sending the ACKs,
-  # or the initiator might race us, send data before we're done, and have
-  # their data silently dropped.
+  # Install the stream's Data delivery, acknowledgement, retransmission and
+  # teardown machinery before the first StreamAck can reach the initiator.
+  # The initiator may start using the stream as soon as that first redundant
+  # acknowledgement arrives.
+  self.configureStream(session, stream)
   stream.establish()
   if not await self.sendStreamResponse(
     session, move(replyBatch), stream.streamId, FrameKind.StreamAck
   ):
     return
 
-  self.configureStream(session, stream)
   let handlerTask = runProtocolHandler(session, stream, protocol)
   # If the handler dies immediately, don't set it: the cleanup in
   # runProtocolHandler has already run, and will fail to clear it.
@@ -854,7 +858,6 @@ proc handleRawSurbReply(
   RawSurbReplyDisposition.Unhandled
 
 proc newMixTransport*(
-    T: type MixTransport,
     mix: MixProtocol,
     connectTimeout = DefaultConnectTimeout,
     streamOpenTimeout = DefaultStreamOpenTimeout,
@@ -866,7 +869,7 @@ proc newMixTransport*(
     surbReplenishmentLowWatermark = DefaultSurbReplenishmentLowWatermark,
     enableDataRetransmissions = true,
     recipientSurbCapacity = DefaultRecipientSurbCapacity,
-): T =
+): MixTransport =
   doAssert not mix.isNil, "MixProtocol must not be nil"
   doAssert connectTimeout > ZeroDuration, "connect timeout must be positive"
   doAssert streamOpenTimeout > ZeroDuration, "stream open timeout must be positive"
@@ -886,15 +889,21 @@ proc newMixTransport*(
     "SURB replenishment low watermark must be below recipient capacity"
   doAssert recipientSurbCapacity >= MaxConnectSurbs - DefaultReplySurbRedundancy,
     "recipient SURB capacity must hold the Connect bootstrap supply"
-  T(
+  let surbSender: SurbSender = proc(
+      surb: sink SURB, payload: sink seq[byte]
+  ): Future[Result[void, string]] {.async: (raw: true, raises: [CancelledError]).} =
+    mix.sendWithSurb(move(surb), move(payload))
+
+  MixTransport(
     mix: mix,
+    surbSender: surbSender,
     replyCredentials: ReplyCredentialStore.new(),
     sessions: newSessionStore(recipientSurbCapacity),
     sessionEventHandlers: initOrderedSet[SessionEventHandler](),
     publishedSessionIds: initHashSet[PeerId](),
     connectTimeout: connectTimeout,
     streamOpenTimeout: streamOpenTimeout,
-    connLock: newAsyncLock(),
+    connectAttempts: newConnectAttemptCoordinator[PeerId, TransportSession](),
     dataRetransmissionTimeout: dataRetransmissionTimeout,
     surbSupplyRetransmissionTimeout: surbSupplyRetransmissionTimeout,
     reverseActivityTimeout: reverseActivityTimeout,
@@ -1157,93 +1166,6 @@ proc connectInternal(
   await self.publishSessionEvent(session, SessionEventKind.Established)
   ok(session)
 
-## Connect operation synchronizer, implemented like this so we can test it in
-## isolation.
-proc connect[S, K, T](
-    self: S,
-    destination: K,
-    connInternal: (
-      proc(self: S, destination: K): Future[Result[T, string]].Raising([CancelledError]) {.
-        gcsafe, raises: []
-      .}
-    ),
-    getExisting: (proc(self: S, destination: K): Opt[T] {.gcsafe, raises: [].}),
-): Future[Result[
-    tuple[conn: T, existing: bool], string]] {.async: (raises: [CancelledError]).} =
-  template releaseLock() =
-    try:
-      self.connLock.release()
-    except AsyncLockError:
-      doAssert false, "lock release twice"
-
-  trace "acquire connect lock", destination = destination
-  await self.connLock.acquire()
-  # If a connection already exists and it is established, we return it.
-  self.getExisting(destination).withValue(existing):
-    releaseLock()
-    trace "return existing connection", destination = destination
-    # It might happen that the connection is no longer valid here, but
-    # that's fine.
-    return ok((existing, true))
-
-  # If a valid connection doesn't exist, then this is officially a connection
-  # attempt. Our goal here then becomes to merge all connection attempts
-  # into a single operation, with only one of the requesters "owning" the
-  # actual attempt while everyone else awaits.
-
-  # Are we the first ones to attempt this connection?
-  trace "attempt connection", destination = destination
-  if destination in self.connectAttempts:
-    # No, someone else owns the attempt, so we just wait.
-    # Copies before releasing the lock as otherwise the attempt
-    # could complete before we can get a hold of the future.
-    var attempt: Future[Result[T, string]].Raising([CancelledError])
-    try:
-      attempt = self.connectAttempts[destination]
-    except exceptions.KeyError:
-      doAssert false, "assertion failed"
-    releaseLock()
-
-    let res = (await attempt).valueOr:
-      return err(error)
-    
-    # In practice this is equivalent to obtaining an existing
-    # connection, so we return existing = true.
-    return ok((res, true))
-
-  # If we're here, we're sure that we're the ones handling this
-  # attempt at connecting to this destination.
-  let attempt =
-    Future[Result[T, string]].Raising([CancelledError]).init("transport.connect")
-  # Note that this should never replace an existing attempt.
-  doAssert destination notin self.connectAttempts
-  self.connectAttempts[destination] = attempt
-  # We can release the lock here as we've secured the attempt.
-  releaseLock()
-
-  let res =
-    try:
-      await self.connInternal(destination)
-    except CancelledError as e:
-      raise e
-    except CatchableError as e:
-      err(Result[T, string], e.msg)
-    finally:
-      # This is what will officially end an attempt. Once the
-      # future is out of the table, another requester can re-attempt
-      # the connection. Until then, everyone will see the result of
-      # the previous attempt.
-      await self.connLock.acquire()
-      self.connectAttempts.del(destination)
-      releaseLock()
-
-  trace "complete connection attempt", destination = destination, success = res.isOk
-  attempt.complete(res)
-  let conn = res.valueOr:
-    return err(error)
-  
-  return ok((conn, false))
-
 proc getExisting(
     self: MixTransport, destination: PeerId
 ): Opt[TransportSession] {.nimcall, gcsafe.} =
@@ -1258,20 +1180,20 @@ proc connect*(
   if not self.started:
     return err("MixTransport is not started")
 
-  var candidates: seq[MixPubInfo]
-  var lastError = "no usable mix address"
+  var
+    candidates: seq[MixPubInfo]
+    lastError = "no usable mix address"
   for address in addrs:
     let mixinfo = MixPubInfo.fromMixAddress(destination, address).valueOr:
-      lastError = mixinfo.error
+      lastError = error
       continue
-
-    candidates.add(mixinfo.get())
+    candidates.add(mixinfo)
 
   if addrs.len > 0 and candidates.len == 0:
     return err(lastError)
 
-  proc connectWithMixInfo(
-      self: MixTransport, destination: PeerId
+  let withMixInfo: ConnectOperation[PeerId, TransportSession] = proc(
+      destination: PeerId
   ): Future[Result[TransportSession, string]] {.async: (raises: [CancelledError]).} =
     var failure: string
     for candidate in candidates:
@@ -1281,39 +1203,50 @@ proc connect*(
       failure = attempt.error
     return err(failure)
 
-  let (conn, existing) = (
-    await connect[MixTransport, PeerId, TransportSession](
-      self, destination, connectWithMixInfo, getExisting
-    )
+  let paGetExisting: ExistingConnectionLookup[PeerId, TransportSession] = proc(
+    p: PeerId
+  ): Opt[TransportSession] =
+    getExisting(self, p)
+
+  trace "connect requested", destination
+  let (session, existing) = (
+    await self.connectAttempts.connect(destination, withMixInfo, paGetExisting)
   ).valueOr:
     return err(error)
 
-  if existing and conn.state == SessionState.Established:
-    await self.publishSessionEvent(conn, SessionEventKind.Established)
+  if existing and session.state == SessionState.Established:
+    await self.publishSessionEvent(session, SessionEventKind.Established)
 
-  ok(conn)
+  ok(session)
 
 proc connect*(
     self: MixTransport, destination: PeerId
 ): Future[Result[TransportSession, string]] {.async: (raises: [CancelledError]).} =
-  
-  proc connectWithPeerId(
-    self: MixTransport, 
-    destination: PeerId
-  ): Future[Result[TransportSession, string]] {.async: (raises: [CancelledError]).} =
-    await self.connectInternal(destination)
+  if not self.started:
+    return err("MixTransport is not started")
 
-  let (conn, existing) = (
-    await connect[MixTransport, PeerId, TransportSession](
-      self, destination, connectWithPeerId, getExisting
-    )
+  let withPeerId: ConnectOperation[PeerId, TransportSession] = proc(
+      destination: PeerId
+  ): Future[Result[TransportSession, string]] {.
+      async: (raw: true, raises: [CancelledError])
+  .} =
+    self.connectInternal(destination)
+
+  let paGetExisting: ExistingConnectionLookup[PeerId, TransportSession] = proc(
+    p: PeerId
+  ): Opt[TransportSession] =
+    getExisting(self, p)
+
+  trace "connect requested", destination
+  let (session, existing) = (
+    await self.connectAttempts.connect(destination, withPeerId, paGetExisting)
   ).valueOr:
     return err(error)
 
-  if existing and conn.state == SessionState.Established:
-    await self.publishSessionEvent(conn, SessionEventKind.Established)
+  if existing and session.state == SessionState.Established:
+    await self.publishSessionEvent(session, SessionEventKind.Established)
 
-  ok(conn)
+  ok(session)
 
 proc dial*(
     self: MixTransport, destination: PeerId, addrs: seq[MultiAddress], codec: string
@@ -1465,6 +1398,8 @@ proc start*(
 proc stop*(self: MixTransport): Future[void] {.async: (raises: [CancelledError]).} =
   if not self.started:
     return
+
+  await self.connectAttempts.cancelAll("MixTransport stopped during connection attempt")
 
   let sessions = self.sessions.takeSessions()
   for session in sessions:
