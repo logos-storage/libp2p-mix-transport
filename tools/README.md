@@ -295,7 +295,8 @@ doesn't say *which* job finished.
 `multitransfer-set.bash` runs a batch of parameter combinations back to back
 (network sizes, concurrency levels, delay strategies, emulation profiles),
 holding `sudo` alive for the duration. Edit the `PARAMS` array to change the
-sweep.
+sweep. Every configuration receives a new run identifier and writes a separate
+measurement CSV and log directory.
 
 Run the complete configured sweep from the repository root with:
 
