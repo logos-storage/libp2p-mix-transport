@@ -290,7 +290,7 @@ proc init*(
     info: mixNodeInfo,
     switch: switch,
     mixProto: mixProto,
-    mixTransport: MixTransport.newMixTransport(mixProto),
+    mixTransport: newMixTransport(mixProto),
   ).ok
 
 proc start*(
