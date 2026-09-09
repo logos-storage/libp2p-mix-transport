@@ -275,6 +275,10 @@ proc sendToDestination(
   # returned, so no unrelated flow can select the temporary peer as a relay.
   self.mix.send(MixDestination.exitNode(destination), MixTransportCodec, payload)
 
+  # FIXME this whole thing is a brittle hack. Ideally Mix should provide a
+  #   proper API for sending to a destination without requiring insertion into
+  #   MixNodePool.
+
 proc sendStreamFrame(
     self: MixTransport, session: TransportSession, frame: MixTransportFrame
 ): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
@@ -1240,6 +1244,14 @@ proc connect[S, K, T](
   
   return ok((conn, false))
 
+proc getExisting(
+    self: MixTransport, destination: PeerId
+): Opt[TransportSession] {.nimcall, gcsafe.} =
+  self.sessions.getByDestination(destination).withValue(existing):
+    if existing.state == SessionState.Established:
+      return Opt.some(existing)
+  return Opt.none(TransportSession)
+
 proc connect*(
     self: MixTransport, destination: PeerId, addrs: seq[MultiAddress]
 ): Future[Result[TransportSession, string]] {.async: (raises: [CancelledError]).} =
@@ -1249,20 +1261,19 @@ proc connect*(
   var candidates: seq[MixPubInfo]
   var lastError = "no usable mix address"
   for address in addrs:
-    let decoded = fromMixAddress(destination, address)
-    if decoded.isOk:
-      candidates.add(decoded.get())
-    else:
-      lastError = decoded.error
+    let mixinfo = MixPubInfo.fromMixAddress(destination, address).valueOr:
+      lastError = mixinfo.error
+      continue
+
+    candidates.add(mixinfo.get())
+
   if addrs.len > 0 and candidates.len == 0:
     return err(lastError)
 
-  proc connectWithInfo(
+  proc connectWithMixInfo(
       self: MixTransport, destination: PeerId
   ): Future[Result[TransportSession, string]] {.async: (raises: [CancelledError]).} =
-    if candidates.len == 0:
-      return await self.connectInternal(destination)
-    var failure = "no usable mix address"
+    var failure: string
     for candidate in candidates:
       let attempt = await self.connectInternal(destination, Opt.some(candidate))
       if attempt.isOk:
@@ -1270,17 +1281,9 @@ proc connect*(
       failure = attempt.error
     return err(failure)
 
-  proc getExisting(
-      self: MixTransport, destination: PeerId
-  ): Opt[TransportSession] {.nimcall, gcsafe.} =
-    self.sessions.getByDestination(destination).withValue(existing):
-      if existing.state == SessionState.Established:
-        return Opt.some(existing)
-    return Opt.none(TransportSession)
-
   let (conn, existing) = (
     await connect[MixTransport, PeerId, TransportSession](
-      self, destination, connectWithInfo, getExisting
+      self, destination, connectWithMixInfo, getExisting
     )
   ).valueOr:
     return err(error)
@@ -1293,8 +1296,24 @@ proc connect*(
 proc connect*(
     self: MixTransport, destination: PeerId
 ): Future[Result[TransportSession, string]] {.async: (raises: [CancelledError]).} =
-  ## Connect using an existing session or a destination already in the node pool.
-  await self.connect(destination, @[])
+  
+  proc connectWithPeerId(
+    self: MixTransport, 
+    destination: PeerId
+  ): Future[Result[TransportSession, string]] {.async: (raises: [CancelledError]).} =
+    await self.connectInternal(destination)
+
+  let (conn, existing) = (
+    await connect[MixTransport, PeerId, TransportSession](
+      self, destination, connectWithPeerId, getExisting
+    )
+  ).valueOr:
+    return err(error)
+
+  if existing and conn.state == SessionState.Established:
+    await self.publishSessionEvent(conn, SessionEventKind.Established)
+
+  ok(conn)
 
 proc dial*(
     self: MixTransport, destination: PeerId, addrs: seq[MultiAddress], codec: string
