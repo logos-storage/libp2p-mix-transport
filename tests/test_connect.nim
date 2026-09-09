@@ -472,8 +472,8 @@ type
 
 proc state*(self: Session): SessionState = SessionState.Established
 
-proc newSynchronizer*(T: type Synchronizer): T =
-  T(
+proc newSynchronizer(): Synchronizer =
+  Synchronizer(
     connectAttempts: newConnectAttemptCoordinator[string, Session](),
     gate: newAsyncEvent(),
     operationCancelled: newAsyncEvent(),
@@ -529,7 +529,7 @@ suite "connect behavior under multiple callers":
 
   test "should create connection when there is only one caller":
     proc asyncTest(): Future[void] {.async: (handleException: true).} =
-      let transport = Synchronizer.newSynchronizer()
+      let transport = newSynchronizer()
       transport.gate.fire()
 
       let (session, existing) = (await transport.connectAttempts.connect(
@@ -545,7 +545,7 @@ suite "connect behavior under multiple callers":
 
   test "should return existing connection if there is one":
     proc asyncTest(): Future[void] {.async: (handleException: true).} =
-      let transport = Synchronizer.newSynchronizer()
+      let transport = newSynchronizer()
       transport.sessions["destination1"] = (10, 1)
       transport.gate.fire()
 
@@ -561,7 +561,7 @@ suite "connect behavior under multiple callers":
 
   test "should await the owner's attempt when there is more than one caller":
     proc asyncTest(): Future[void] {.async: (handleException: true).} =
-      let transport = Synchronizer.newSynchronizer()
+      let transport = newSynchronizer()
 
       let
         first = transport.connectAttempts.connect(
@@ -586,7 +586,7 @@ suite "connect behavior under multiple callers":
 
   test "cancelling one caller does not cancel an attempt used by another caller":
     proc asyncTest(): Future[void] {.async: (handleException: true).} =
-      let transport = Synchronizer.newSynchronizer()
+      let transport = newSynchronizer()
       let
         first = transport.connectAttempts.connect(
           "destination1", transport.connInternal(1),
@@ -609,7 +609,7 @@ suite "connect behavior under multiple callers":
 
   test "cancelling the only caller cancels the transport-owned attempt":
     proc asyncTest(): Future[void] {.async: (handleException: true).} =
-      let transport = Synchronizer.newSynchronizer()
+      let transport = newSynchronizer()
       let caller = transport.connectAttempts.connect(
         "destination1", transport.connInternal(1),
         transport.existingConnectionLookup())
@@ -624,7 +624,7 @@ suite "connect behavior under multiple callers":
 
   test "stopping owned attempts wakes every caller with the stop reason":
     proc asyncTest(): Future[void] {.async: (handleException: true).} =
-      let transport = Synchronizer.newSynchronizer()
+      let transport = newSynchronizer()
       let
         first = transport.connectAttempts.connect(
           "destination1", transport.connInternal(1),
@@ -643,7 +643,7 @@ suite "connect behavior under multiple callers":
 
   test "should allow another attempt if the previous one failed":
     proc asyncTest(): Future[void] {.async: (handleException: true).} =
-      let transport = Synchronizer.newSynchronizer()
+      let transport = newSynchronizer()
 
       let
         first = transport.connectAttempts.connect(
