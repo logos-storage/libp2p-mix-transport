@@ -7,4 +7,5 @@ nimbledeps/
 nimble.paths
 nimble.develop
 experiment-output
-tools/node/
+tools/node/node
+tools/node/node-debug

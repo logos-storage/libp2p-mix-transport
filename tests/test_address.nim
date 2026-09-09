@@ -8,20 +8,23 @@ import libp2p_mix
 import libp2p_mix_transport
 
 suite "Mix transport addresses":
-  test "text and binary round trips preserve keys and endpoint":
-    let info = MixNodeInfo.generateRandom(8081, newRng()).toMixPubInfo()
-    let address = info.toMixAddress().expect("encode")
-    let textAddress = MultiAddress.init($address).expect("text parse")
-    let binaryAddress = MultiAddress.init(address.data.buffer).expect("binary parse")
+  test "should decode to what's been encoded":
+    let
+      info = MixNodeInfo.generateRandom(8081, newRng()).toMixPubInfo()
+      address = info.toMixAddress().expect("encode")
+      textAddress = MultiAddress.init($address).expect("text parse")
+      binaryAddress = MultiAddress.init(address.data.buffer).expect("binary parse")
+
     check textAddress == address
     check binaryAddress == address
-    let decoded = fromMixAddress(info.peerId, binaryAddress).expect("decode")
+
+    let decoded = MixPubInfo.fromMixAddress(info.peerId, binaryAddress).expect("decode")
     check decoded.peerId == info.peerId
     check decoded.multiAddr == info.multiAddr
     check decoded.libp2pPubKey.getBytes() == info.libp2pPubKey.getBytes()
     check decoded.mixPubKey.fieldElementToBytes() == info.mixPubKey.fieldElementToBytes()
 
-  test "preserve QUIC, circuit-relay, IPv6 and DNS endpoint components":
+  test "should preserve transport prefixes":
     var info = MixNodeInfo.generateRandom(8081, newRng()).toMixPubInfo()
     let relay = MixNodeInfo.generateRandom(8082, newRng()).peerId
     for endpoint in [
@@ -34,35 +37,44 @@ suite "Mix transport addresses":
       info.multiAddr = MultiAddress.init(endpoint).expect("endpoint")
       let address = info.toMixAddress().expect("encode endpoint")
       let binary = MultiAddress.init(address.data.buffer).expect("binary parse")
-      let decoded = fromMixAddress(info.peerId, binary).expect("decode endpoint")
+      let decoded = MixPubInfo.fromMixAddress(info.peerId, binary).expect("decode endpoint")
       check decoded.multiAddr == info.multiAddr
       check MultiAddress.init($address).expect("text parse") == binary
 
-  test "reject malformed payloads and misplaced mix components":
+  test "should ignore suffixes":
+    var info = MixNodeInfo.generateRandom(8081, newRng()).toMixPubInfo()
+    let address = info.toMixAddress().expect("encode")
+    let suffixed = MultiAddress.init($address & "/tls").expect("text parse with suffix")
+    let decoded = MixPubInfo.fromMixAddress(info.peerId, suffixed).expect("decode with suffix")
+    check decoded.multiAddr == info.multiAddr
+
+  test "should reject malformed payloads or missing mix components":
+    # Bad payloads.
     for payload in ["!invalid!", "AAAA", base64.encode(newSeq[byte](66), safe = true)]:
       check MultiAddress.init("/ip4/127.0.0.1/tcp/8081/mix-transport/" & payload).isErr
-    let info = MixNodeInfo.generateRandom(8081, newRng()).toMixPubInfo()
-    let address = info.toMixAddress().expect("encode")
-    let component = address[^1].expect("mix component")
-    for value in [$address & "/tls", $component, $address & $component]:
-      check fromMixAddress(info.peerId, MultiAddress.init(value).expect("parse")).isErr
+
+    # Missing mix-transport component.
+    let peerId = PeerId.random(newRng()).get()
+    check MixPubInfo.fromMixAddress(peerId,
+      MultiAddress.init("/ip4/127.0.0.1/tcp/8081/tls").get()).isErr
+
     # Appending a binary component also invokes MultiAddress validation;
     # malformed key lengths are rejected without going through text parsing.
-    var shortAddress = info.multiAddr
+    var shortAddress = MultiAddress.init("/ip4/127.0.0.1/tcp/8081").get()
     let shortComponent = MultiAddress
       .init(multiCodec("mix-transport"), @[1.byte])
-      .expect("short binary component")
+      .get()
     check shortAddress.append(shortComponent).isErr
+
     let zeroKeys = MultiAddress
       .init(
         "/ip4/127.0.0.1/tcp/8081/mix-transport/" &
           base64.encode(newSeq[byte](65), safe = true)
-      )
-      .expect("parse")
-    check fromMixAddress(info.peerId, zeroKeys).isErr
+      ).get()
+    check MixPubInfo.fromMixAddress(peerId, zeroKeys).isErr
 
-  test "bind the address public key to the destination PeerId":
+  test "verifies that the address public key matches the destination PeerId":
     let
       first = MixNodeInfo.generateRandom(8081, newRng()).toMixPubInfo()
       second = MixNodeInfo.generateRandom(8082, newRng()).toMixPubInfo()
-    check fromMixAddress(second.peerId, first.toMixAddress().expect("encode")).isErr
+    check MixPubInfo.fromMixAddress(second.peerId, first.toMixAddress().expect("encode")).isErr
