@@ -243,7 +243,6 @@ proc waitForReplySurbs(
 proc sendStreamFrame(
     self: MixTransport, session: TransportSession, frame: MixTransportFrame
 ): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
-
   trace "sending stream frame",
     frameKind = frame.kind, sessionId = session.sessionId, role = session.role
 
@@ -261,7 +260,6 @@ proc sendStreamFrame(
       )
     ).isOkOr:
       return err("could not send " & $frame.kind & " frame: " & error)
-
   of SessionRole.Recipient:
     await session.acquireReplySend()
     defer:
@@ -807,7 +805,6 @@ proc handleDelivery(
 proc handleRawSurbReply(
     self: MixTransport, reply: RawSurbReply
 ): Future[RawSurbReplyDisposition] {.async: (raises: [CancelledError]).} =
-
   traceInbound(reply)
   if self.replyCredentials.isRetiredIdentifier(reply.identifier):
     return RawSurbReplyDisposition.Handled
@@ -837,7 +834,6 @@ proc newMixTransport*(
     enableDataRetransmissions = true,
     recipientSurbCapacity = DefaultRecipientSurbCapacity,
 ): MixTransport =
-
   doAssert not mix.isNil, "MixProtocol must not be nil"
   doAssert connectTimeout > ZeroDuration, "connect timeout must be positive"
   doAssert streamOpenTimeout > ZeroDuration, "stream open timeout must be positive"
@@ -859,9 +855,7 @@ proc newMixTransport*(
     "recipient SURB capacity must hold the Connect bootstrap supply"
   let surbSender: SurbSender = proc(
       surb: sink SURB, payload: sink seq[byte]
-  ): Future[Result[void, string]] {.
-      async: (raw: true, raises: [CancelledError])
-  .} =
+  ): Future[Result[void, string]] {.async: (raw: true, raises: [CancelledError]).} =
     mix.sendWithSurb(move(surb), move(payload))
 
   MixTransport(
@@ -1158,7 +1152,7 @@ proc connect*(
 
   if existing and session.state == SessionState.Established:
     await self.publishSessionEvent(session, SessionEventKind.Established)
-  
+
   ok(session)
 
 proc dial*(

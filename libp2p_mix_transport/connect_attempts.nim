@@ -117,8 +117,8 @@ proc connect*[K, T](
     except KeyError:
       attempt = ConnectAttempt[T](
         outcome: Future[Result[T, string]].Raising([]).init(
-          "connect-attempt.outcome", {FutureFlag.OwnCancelSchedule}
-        ),
+            "connect-attempt.outcome", {FutureFlag.OwnCancelSchedule}
+          ),
         waiterCount: 1,
       )
       coordinator.attempts[key] = attempt

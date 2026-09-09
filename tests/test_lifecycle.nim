@@ -48,8 +48,7 @@ suite "MixTransport lifecycle":
     let
       mix = createMixProtocol()
       defaultTransport = newMixTransport(mix)
-      retransmissionsDisabled = newMixTransport(mix,
-        enableDataRetransmissions = false)
+      retransmissionsDisabled = newMixTransport(mix, enableDataRetransmissions = false)
 
     check:
       defaultTransport.dataRetransmissionsEnabled

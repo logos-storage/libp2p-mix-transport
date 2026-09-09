@@ -141,8 +141,7 @@ proc delayAcknowledgementCopies(transport: MixTransport, interAckDelay: Duration
       sendResult = await originalSurbSender(move(surb), move(payload))
 
     if isAcknowledgement:
-      info "delaying next ack send",
-        duration = $interAckDelay, frameKind = frame.kind
+      info "delaying next ack send", duration = $interAckDelay, frameKind = frame.kind
       await sleepAsync(interAckDelay)
 
     sendResult
@@ -465,12 +464,14 @@ type
     sessions: Table[string, Session]
     gate: AsyncEvent
     operationCancelled: AsyncEvent
+
   Caller = int
   ConnAttempt = int
   Destination = string
   Session = tuple[attempt: ConnAttempt, caller: Caller]
 
-proc state*(self: Session): SessionState = SessionState.Established
+proc state*(self: Session): SessionState =
+  SessionState.Established
 
 proc newSynchronizer(): Synchronizer =
   Synchronizer(
@@ -491,9 +492,9 @@ proc getExisting*(self: Synchronizer, dest: Destination): Opt[Session] {.raises:
 proc connInternal(
     self: Synchronizer, caller: Caller, error: Opt[string] = Opt.none(string)
 ): ConnectOperation[Destination, Session] =
-  proc wrapped(dest: Destination): Future[Result[Session, string]] {.
-      async: (raises: [CancelledError])
-  .} =
+  proc wrapped(
+      dest: Destination
+  ): Future[Result[Session, string]] {.async: (raises: [CancelledError]).} =
     # makes sure the connection attempt doesn't end before we can
     # fire the next caller - this is how we ensure that calls get
     # placed into the same attempt.
@@ -506,10 +507,11 @@ proc connInternal(
     if error.isSome:
       return err(error.get())
 
-    let attempt = try:
-      self.sessions[dest].attempt
-    except KeyError:
-      0
+    let attempt =
+      try:
+        self.sessions[dest].attempt
+      except KeyError:
+        0
 
     let session = (attempt + 1, caller)
     self.sessions[dest] = session
@@ -526,15 +528,18 @@ proc existingConnectionLookup(
   wrapped
 
 suite "connect behavior under multiple callers":
-
   test "should create connection when there is only one caller":
     proc asyncTest(): Future[void] {.async: (handleException: true).} =
       let transport = newSynchronizer()
       transport.gate.fire()
 
-      let (session, existing) = (await transport.connectAttempts.connect(
-        "destination1", transport.connInternal(5),
-        transport.existingConnectionLookup())).get
+      let (session, existing) = (
+        await transport.connectAttempts.connect(
+          "destination1",
+          transport.connInternal(5),
+          transport.existingConnectionLookup(),
+        )
+      ).get
 
       check:
         session == (attempt: 1, caller: 5)
@@ -549,9 +554,13 @@ suite "connect behavior under multiple callers":
       transport.sessions["destination1"] = (10, 1)
       transport.gate.fire()
 
-      let (session, existing) = (await transport.connectAttempts.connect(
-        "destination1", transport.connInternal(5),
-        transport.existingConnectionLookup())).get
+      let (session, existing) = (
+        await transport.connectAttempts.connect(
+          "destination1",
+          transport.connInternal(5),
+          transport.existingConnectionLookup(),
+        )
+      ).get
 
       check:
         session == (attempt: 10, caller: 1)
@@ -565,11 +574,15 @@ suite "connect behavior under multiple callers":
 
       let
         first = transport.connectAttempts.connect(
-          "destination1", transport.connInternal(1),
-          transport.existingConnectionLookup())
+          "destination1",
+          transport.connInternal(1),
+          transport.existingConnectionLookup(),
+        )
         second = transport.connectAttempts.connect(
-          "destination1", transport.connInternal(2),
-          transport.existingConnectionLookup())
+          "destination1",
+          transport.connInternal(2),
+          transport.existingConnectionLookup(),
+        )
 
       transport.gate.fire()
 
@@ -589,11 +602,15 @@ suite "connect behavior under multiple callers":
       let transport = newSynchronizer()
       let
         first = transport.connectAttempts.connect(
-          "destination1", transport.connInternal(1),
-          transport.existingConnectionLookup())
+          "destination1",
+          transport.connInternal(1),
+          transport.existingConnectionLookup(),
+        )
         second = transport.connectAttempts.connect(
-          "destination1", transport.connInternal(2),
-          transport.existingConnectionLookup())
+          "destination1",
+          transport.connInternal(2),
+          transport.existingConnectionLookup(),
+        )
 
       await first.cancelAndWait()
       check:
@@ -611,8 +628,8 @@ suite "connect behavior under multiple callers":
     proc asyncTest(): Future[void] {.async: (handleException: true).} =
       let transport = newSynchronizer()
       let caller = transport.connectAttempts.connect(
-        "destination1", transport.connInternal(1),
-        transport.existingConnectionLookup())
+        "destination1", transport.connInternal(1), transport.existingConnectionLookup()
+      )
 
       await caller.cancelAndWait()
       check:
@@ -627,11 +644,15 @@ suite "connect behavior under multiple callers":
       let transport = newSynchronizer()
       let
         first = transport.connectAttempts.connect(
-          "destination1", transport.connInternal(1),
-          transport.existingConnectionLookup())
+          "destination1",
+          transport.connInternal(1),
+          transport.existingConnectionLookup(),
+        )
         second = transport.connectAttempts.connect(
-          "destination1", transport.connInternal(2),
-          transport.existingConnectionLookup())
+          "destination1",
+          transport.connInternal(2),
+          transport.existingConnectionLookup(),
+        )
 
       await transport.connectAttempts.cancelAll("transport stopped")
       check:
@@ -649,11 +670,13 @@ suite "connect behavior under multiple callers":
         first = transport.connectAttempts.connect(
           "destination1",
           transport.connInternal(1, Opt.some("ooops, this is an error")),
-          transport.existingConnectionLookup())
+          transport.existingConnectionLookup(),
+        )
         second = transport.connectAttempts.connect(
           "destination1",
           transport.connInternal(2, Opt.some("this is also an error")),
-          transport.existingConnectionLookup())
+          transport.existingConnectionLookup(),
+        )
 
       transport.gate.fire()
       # Despite the error, the first two calls should end in the same
@@ -668,8 +691,8 @@ suite "connect behavior under multiple callers":
       # a separate attempt.
       transport.gate.clear()
       let third = transport.connectAttempts.connect(
-        "destination1", transport.connInternal(3),
-        transport.existingConnectionLookup())
+        "destination1", transport.connInternal(3), transport.existingConnectionLookup()
+      )
       transport.gate.fire()
       check:
         (await third).get().connection == (attempt: 1, caller: 3)
