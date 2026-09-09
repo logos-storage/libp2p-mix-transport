@@ -89,7 +89,7 @@ start_sudo_keepalive() {
 stop_sudo_keepalive() {
   if [[ -v _sudo_keepalive_pid ]]; then
     echoerr "stop sudo keepalive"
-    kill $_sudo_keepalive_pid 2> /dev/null || true
+    kill "$_sudo_keepalive_pid" 2> /dev/null || true
     unset _sudo_keepalive_pid
   fi
 }

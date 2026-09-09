@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+
 import std/random
 import std/times
 import std/strformat
