@@ -25,7 +25,8 @@ var
   styleFlags = "--styleCheck:usages --styleCheck:error"
   # XXX I suppose we could have those spread in config.nims over the repo, but I
   #   opted to keeping it all here.
-  addressFlags = "-d:libp2p_multiaddress_exts=" & thisDir() & "/tests/exts/multiaddress.nim" &
+  addressFlags =
+    "-d:libp2p_multiaddress_exts=" & thisDir() & "/tests/exts/multiaddress.nim" &
     " -d:libp2p_multicodec_exts=" & thisDir() & "/tests/exts/multicodec.nim"
 
 proc compile(filename: string) =
