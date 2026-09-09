@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+
 import chronicles
 import nimcrypto/[sha2, utils]
 import protobuf_serialization

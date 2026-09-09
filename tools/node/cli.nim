@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+
 import std/httpclient
 import std/json
 import std/os
@@ -22,7 +24,6 @@ const
   DefaultApiPort = 8080.uint
   DefaultListenPort = 0.uint
   DefaultListenIp = "127.0.0.1"
-  DefaultLogLevel = "INFO"
   DefaultMaxConnections = 50 # same as libp2p
 
 template echoerr(msg: string) =
@@ -35,7 +36,8 @@ proc updateLogLevel*(logLevel: string) {.raises: [ValueError].} =
   except ValueError:
     raise (ref ValueError)(
       msg:
-        "Please specify one of: trace, debug, " & "info, notice, warn, error or fatal (but not " & directives[0] & ")"
+        "Please specify one of: trace, debug, " &
+        "info, notice, warn, error or fatal (but not " & directives[0] & ")"
     )
 
   if directives.len > 1:
@@ -118,8 +120,7 @@ proc main() =
 
   let
     mixNodes = collectMixConfigs(positionalArgs)
-    node = Node.init(mixNodes,
-      mixConfig, listenIp, listenPort, maxConnections).valueOr:
+    node = Node.init(mixNodes, mixConfig, listenIp, listenPort, maxConnections).valueOr:
       error "Failed to initialize node", msg = error
       quit(1)
     server = newServer(node, listenIp, apiPort).valueOr:

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+
 import std/base64
 import std/json
 import std/strformat
