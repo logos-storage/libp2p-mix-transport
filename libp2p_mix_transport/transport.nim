@@ -2,9 +2,7 @@
 
 {.push raises: [].}
 
-import std/sets
-
-import chronicles, chronos, results
+import chronicles, chronos, results, sets
 import libp2p/multistream
 import libp2p/peerid
 import libp2p/protocols/protocol
@@ -12,10 +10,10 @@ import libp2p/stream/bufferstream
 import libp2p/stream/connection
 import libp2p/utils/opt
 import libp2p_mix
-import ./[reply_credentials, sessions, streams, wire]
+import ./[connect_attempts, reply_credentials, sessions, streams, trace, wire]
 
 logScope:
-  topics = "libp2p mix-transport"
+  topics = "mix-transport transport"
 
 const
   DefaultConnectTimeout* = 30.seconds
@@ -30,6 +28,10 @@ const
   UnknownStreamRejectionReason = "remote rejected the stream for an unknown reason"
 
 type
+  SurbSender = proc(
+    surb: sink SURB, payload: sink seq[byte]
+  ): Future[Result[void, string]].Raising([CancelledError]) {.gcsafe, raises: [].}
+
   SessionEventKind* {.pure.} = enum
     Established
     Closed
@@ -46,12 +48,14 @@ type
 
   MixTransport* = ref object
     mix: MixProtocol
+    surbSender: SurbSender
     replyCredentials: ReplyCredentialStore
     sessions: SessionStore
     sessionEventHandlers: OrderedSet[SessionEventHandler]
     publishedSessionIds: HashSet[PeerId]
     connectTimeout: Duration
     streamOpenTimeout: Duration
+    connectAttempts: ConnectAttemptCoordinator[PeerId, TransportSession]
     dataRetransmissionTimeout: Duration
     surbSupplyRetransmissionTimeout: Duration
     reverseActivityTimeout: Duration
@@ -156,7 +160,14 @@ proc applySurbSupplySnapshot(
 proc handleReplyFrame(
     self: MixTransport, frame: MixTransportFrame
 ): Future[void] {.async: (raises: [CancelledError]).} =
+  logScope:
+    sessionId = frame.sessionId
+    kind = frame.kind
+
+  traceInbound(frame)
+
   let session = self.sessions.get(frame.sessionId).valueOr:
+    trace "discard reply frame - unknown session"
     return
 
   if not session.applySurbSupplySnapshot(frame):
@@ -166,14 +177,20 @@ proc handleReplyFrame(
 
   case frame.kind
   of FrameKind.ConnectAck:
-    if session.role != SessionRole.Initiator or session.state != SessionState.Pending:
+    if session.role != SessionRole.Initiator:
+      trace "discard reply frame - we are not the initiator"
+      return
+    if session.state != SessionState.Pending:
+      trace "discard reply frame - not in Pending state"
       return
     session.establish()
     self.startSurbSupplier(session)
   of FrameKind.StreamAck, FrameKind.StreamReject:
     if session.state != SessionState.Established:
+      trace "discard reply frame - session not established"
       return
     let stream = session.getStream(frame.streamId.get()).valueOr:
+      trace "discard reply frame - unknown stream id", streamId = frame.streamId.get()
       return
     if stream.direction != StreamDirection.Outbound or
         stream.state != StreamState.Pending:
@@ -204,7 +221,8 @@ proc sendWithSurbRedundancyBatch(
   for surb in surbs.mitems:
     # Each SURB is consumed once, but every redundant packet needs the same
     # payload. Passing payload without move lets Nim copy it for each send.
-    if (await self.mix.sendWithSurb(move(surb), payload)).isOk:
+    traceOutbound(surb, payload)
+    if (await self.surbSender(move(surb), payload)).isOk:
       sent = true
 
   if not sent:
@@ -225,10 +243,15 @@ proc waitForReplySurbs(
 proc sendStreamFrame(
     self: MixTransport, session: TransportSession, frame: MixTransportFrame
 ): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
+  trace "sending stream frame",
+    frameKind = frame.kind, sessionId = session.sessionId, role = session.role
+
   case session.role
   of SessionRole.Initiator:
     let payload = frame.encode().valueOr:
       return err("could not encode " & $frame.kind & " frame: " & error)
+
+    traceOutbound(frame)
     let destination = session.destination.valueOr:
       return err("initiator session has no destination")
     (
@@ -440,22 +463,21 @@ proc configureStream(
     stream.trackStreamTask(runRetransmissions(self, session, stream))
 
 proc handleData(self: MixTransport, frame: MixTransportFrame) {.gcsafe, raises: [].} =
+  logScope:
+    sessionId = frame.sessionId
+    frameKind = frame.kind
+
   let session = self.sessions.get(frame.sessionId).valueOr:
-    debug "Dropping Data frame for unknown session", sessionId = frame.sessionId
+    debug "discarding frame: session not found"
     return
   if session.state != SessionState.Established:
-    debug "Dropping Data frame because session is not established",
-      sessionId = frame.sessionId, sessionState = session.state
+    debug "discarding frame: session not yet established"
     return
   let stream = session.getStream(frame.streamId.get()).valueOr:
-    debug "Dropping Data frame for unknown stream",
-      sessionId = frame.sessionId, streamId = frame.streamId.get()
+    debug "discarding frame: stream not found"
     return
   if stream.state != StreamState.Established:
-    debug "Dropping Data frame because stream is not established",
-      sessionId = frame.sessionId,
-      streamId = stream.streamId,
-      streamState = stream.state
+    debug "discarding frame: stream not yet established"
     return
   discard stream.receiveData(frame.sequence.get(), frame.payload.get())
 
@@ -552,12 +574,18 @@ proc sendStreamResponse(
   doAssert kind in {FrameKind.StreamAck, FrameKind.StreamReject}
   doAssert (kind == FrameKind.StreamReject) == (rejectionReason.len > 0)
 
+  logScope:
+    sessionId = session.sessionId
+    streamId = streamId
+    kind = kind
+
   let boundedRejectionReason =
     if rejectionReason.len > MaxStreamRejectionReasonBytes:
       rejectionReason[0 ..< MaxStreamRejectionReasonBytes]
     else:
       rejectionReason
 
+  trace "sending stream response", rejectionReason = boundedRejectionReason
   var response = MixTransportFrame(
     version: MixTransportVersion,
     sessionId: session.sessionId,
@@ -577,7 +605,11 @@ proc sendStreamResponse(
 proc handleConnect(
     self: MixTransport, frame: MixTransportFrame
 ): Future[void] {.async: (raises: [CancelledError]).} =
+  logScope:
+    sessionId = frame.sessionId
+
   if self.sessions.get(frame.sessionId).isSome:
+    trace "session already exists, ignoring connect"
     return
 
   var replyBatch = newSeqOfCap[SURB](DefaultReplySurbRedundancy)
@@ -586,7 +618,9 @@ proc handleConnect(
       return
     replyBatch.add(surb)
   let session = self.sessions.addRecipientSession(frame.sessionId).valueOr:
+    error "error registering session", error = error
     return
+
   var keepSession = false
   defer:
     if not keepSession:
@@ -609,11 +643,13 @@ proc handleConnect(
   let payload = acknowledgement.encode().valueOr:
     return
 
-  # ConnectAck allows the initiator to send session traffic immediately. Make
-  # the recipient ready before the first redundant ACK copy can arrive.
+  # Marks the session as established BEFORE sending out ACKs
+  # or the other side might try to use it before it's ready
+  # and have its frames dropped.
   session.establish()
   (await self.sendWithSurbRedundancyBatch(replyBatch, payload)).isOkOr:
     return
+
   keepSession = true
   await self.publishSessionEvent(session, SessionEventKind.Established)
 
@@ -688,8 +724,10 @@ proc handleOpenStream(
       discard session.removeStream(stream.streamId)
       await noCancel stream.shutdown()
 
-  # StreamAck allows the initiator to send Data immediately. Install the
-  # bounded receive path before the first redundant ACK copy can arrive.
+  # Install the stream's Data delivery, acknowledgement, retransmission and
+  # teardown machinery before the first StreamAck can reach the initiator.
+  # The initiator may start using the stream as soon as that first redundant
+  # acknowledgement arrives.
   self.configureStream(session, stream)
   stream.establish()
   if not await self.sendStreamResponse(
@@ -697,11 +735,14 @@ proc handleOpenStream(
   ):
     return
 
-  keepStream = true
-  keepReservation = true
   let handlerTask = runProtocolHandler(session, stream, protocol)
+  # If the handler dies immediately, don't set it: the cleanup in
+  # runProtocolHandler has already run, and will fail to clear it.
   if not handlerTask.finished:
     stream.setHandlerTask(handlerTask)
+
+  keepStream = true
+  keepReservation = true
 
 proc handleSurbStatusProbe(
     self: MixTransport, frame: MixTransportFrame
@@ -735,7 +776,13 @@ proc handleDelivery(
     self: MixTransport, delivery: MixDelivery
 ): Future[void] {.async: (raises: [CancelledError]).} =
   let frame = MixTransportFrame.decode(delivery.payload).valueOr:
+    error "failed to decode mix transport frame", error = error
     return
+
+  traceInbound(frame)
+
+  trace "handling request transport frame",
+    frameKind = frame.kind, sessionId = frame.sessionId
   case frame.kind
   of FrameKind.Connect:
     await self.handleConnect(frame)
@@ -758,6 +805,7 @@ proc handleDelivery(
 proc handleRawSurbReply(
     self: MixTransport, reply: RawSurbReply
 ): Future[RawSurbReplyDisposition] {.async: (raises: [CancelledError]).} =
+  traceInbound(reply)
   if self.replyCredentials.isRetiredIdentifier(reply.identifier):
     return RawSurbReplyDisposition.Handled
 
@@ -805,14 +853,21 @@ proc newMixTransport*(
     "SURB replenishment low watermark must be below recipient capacity"
   doAssert recipientSurbCapacity >= MaxConnectSurbs - DefaultReplySurbRedundancy,
     "recipient SURB capacity must hold the Connect bootstrap supply"
+  let surbSender: SurbSender = proc(
+      surb: sink SURB, payload: sink seq[byte]
+  ): Future[Result[void, string]] {.async: (raw: true, raises: [CancelledError]).} =
+    mix.sendWithSurb(move(surb), move(payload))
+
   MixTransport(
     mix: mix,
+    surbSender: surbSender,
     replyCredentials: ReplyCredentialStore.new(),
     sessions: newSessionStore(recipientSurbCapacity),
     sessionEventHandlers: initOrderedSet[SessionEventHandler](),
     publishedSessionIds: initHashSet[PeerId](),
     connectTimeout: connectTimeout,
     streamOpenTimeout: streamOpenTimeout,
+    connectAttempts: newConnectAttemptCoordinator[PeerId, TransportSession](),
     dataRetransmissionTimeout: dataRetransmissionTimeout,
     surbSupplyRetransmissionTimeout: surbSupplyRetransmissionTimeout,
     reverseActivityTimeout: reverseActivityTimeout,
@@ -1026,18 +1081,9 @@ proc createConnectFrame(
 
   ok(frame)
 
-proc connect*(
+proc connectInternal(
     self: MixTransport, destination: PeerId
 ): Future[Result[TransportSession, string]] {.async: (raises: [CancelledError]).} =
-  if not self.started:
-    return err("MixTransport is not started")
-
-  self.sessions.getByDestination(destination).withValue(existing):
-    if existing.state == SessionState.Established:
-      await self.publishSessionEvent(existing, SessionEventKind.Established)
-      return ok(existing)
-    return err("session establishment is already in progress")
-
   let sessionId = PeerId.random(self.mix.switch.rng).valueOr:
     return err("could not generate session identifier: " & $error)
   let session = self.sessions.addInitiatorSession(destination, sessionId).valueOr:
@@ -1054,6 +1100,7 @@ proc connect*(
   let payload = frame.encode().valueOr:
     return err("could not encode Connect frame: " & error)
 
+  traceOutbound(frame)
   (
     await self.mix.send(
       MixDestination.exitNode(destination), MixTransportCodec, payload
@@ -1074,6 +1121,38 @@ proc connect*(
 
   keepSession = true
   await self.publishSessionEvent(session, SessionEventKind.Established)
+  ok(session)
+
+proc connect*(
+    self: MixTransport, destination: PeerId
+): Future[Result[TransportSession, string]] {.async: (raises: [CancelledError]).} =
+  if not self.started:
+    return err("MixTransport is not started")
+
+  let operation: ConnectOperation[PeerId, TransportSession] = proc(
+      destination: PeerId
+  ): Future[Result[TransportSession, string]] {.
+      async: (raw: true, raises: [CancelledError])
+  .} =
+    self.connectInternal(destination)
+
+  let getExisting: ExistingConnectionLookup[PeerId, TransportSession] = proc(
+      destination: PeerId
+  ): Opt[TransportSession] {.gcsafe, raises: [].} =
+    self.sessions.getByDestination(destination).withValue(existing):
+      if existing.state == SessionState.Established:
+        return Opt.some(existing)
+    return Opt.none(TransportSession)
+
+  trace "connect requested", destination
+  let (session, existing) = (
+    await self.connectAttempts.connect(destination, operation, getExisting)
+  ).valueOr:
+    return err(error)
+
+  if existing and session.state == SessionState.Established:
+    await self.publishSessionEvent(session, SessionEventKind.Established)
+
   ok(session)
 
 proc dial*(
@@ -1134,12 +1213,15 @@ proc dial*(
 
   let payload = frame.encode().valueOr:
     return err("could not encode OpenStream frame: " & error)
+
+  traceOutbound(frame)
   (
     await self.mix.send(
       MixDestination.exitNode(destination), MixTransportCodec, payload
     )
   ).isOkOr:
     return err("could not send OpenStream frame: " & error)
+
   keepReplyCredentials = true
   firstSupplySequence.withValue(sequence):
     session.scheduleSurbSupplyRetransmission(
@@ -1222,6 +1304,8 @@ proc start*(
 proc stop*(self: MixTransport): Future[void] {.async: (raises: [CancelledError]).} =
   if not self.started:
     return
+
+  await self.connectAttempts.cancelAll("MixTransport stopped during connection attempt")
 
   let sessions = self.sessions.takeSessions()
   for session in sessions:
