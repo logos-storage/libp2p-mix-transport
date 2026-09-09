@@ -29,6 +29,7 @@ import ./logging
 
 privateAccess(MixProtocol)
 privateAccess(MixTransport)
+privateAccess(ConnectAttempt)
 
 proc createMixNodes(count: int): seq[MixProtocol] =
   # Every node is a normal Mix relay. The first and last nodes will also run
@@ -475,7 +476,7 @@ suite "MixTransport session and stream handshakes":
 
 type
   Synchronizer = ref object
-    connectAttempts: Table[string, Future[Result[Session, string]].Raising([CancelledError])]
+    connectAttempts: Table[string, ConnectAttempt[Session]]
     sessions: Table[string, Session]
     connLock: AsyncLock
     gate: AsyncEvent
@@ -575,6 +576,70 @@ suite "connect behavior under multiple callers":
       check:
         firstSession == (attempt: 1, caller: 1)
         secondSession == (attempt: 1, caller: 1)
+        transport.connectAttempts.len == 0
+
+    waitFor asyncTest()
+
+  test "cancelling one caller does not cancel an attempt used by another caller":
+    proc asyncTest(): Future[void] {.async: (handleException: true).} =
+      let transport = Synchronizer.newSynchronizer()
+      let
+        first = connect[Synchronizer, Destination, Session](
+          transport, "destination1", connInternal(1), getExisting
+        )
+        second = connect[Synchronizer, Destination, Session](
+          transport, "destination1", connInternal(2), getExisting
+        )
+        attempt = transport.connectAttempts["destination1"]
+
+      await first.cancelAndWait()
+      check:
+        first.cancelled
+        not attempt.task.finished
+        attempt.waiterCount == 1
+
+      transport.gate.fire()
+      check:
+        (await second).get().conn == (attempt: 1, caller: 1)
+        transport.connectAttempts.len == 0
+
+    waitFor asyncTest()
+
+  test "cancelling the only caller cancels the transport-owned attempt":
+    proc asyncTest(): Future[void] {.async: (handleException: true).} =
+      let transport = Synchronizer.newSynchronizer()
+      let
+        caller = connect[Synchronizer, Destination, Session](
+          transport, "destination1", connInternal(1), getExisting
+        )
+        attempt = transport.connectAttempts["destination1"]
+
+      await caller.cancelAndWait()
+      await attempt.task.cancelAndWait()
+      check:
+        caller.cancelled
+        attempt.task.cancelled
+        transport.connectAttempts.len == 0
+
+    waitFor asyncTest()
+
+  test "stopping owned attempts wakes every caller with the stop reason":
+    proc asyncTest(): Future[void] {.async: (handleException: true).} =
+      let transport = Synchronizer.newSynchronizer()
+      let
+        first = connect[Synchronizer, Destination, Session](
+          transport, "destination1", connInternal(1), getExisting
+        )
+        second = connect[Synchronizer, Destination, Session](
+          transport, "destination1", connInternal(2), getExisting
+        )
+
+      await cancelConnectAttempts[Synchronizer, Destination, Session](
+        transport, "transport stopped"
+      )
+      check:
+        (await first).error == "transport stopped"
+        (await second).error == "transport stopped"
         transport.connectAttempts.len == 0
 
     waitFor asyncTest()
