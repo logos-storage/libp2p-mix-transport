@@ -2,7 +2,7 @@
 {.used.}
 
 import std/[base64, unittest]
-import libp2p/[crypto/crypto, crypto/secp, multicodec, peerid]
+import libp2p/[crypto/crypto, crypto/secp, multicodec, multiaddress, peerid]
 import libp2p_mix/curve25519
 import libp2p_mix
 import libp2p_mix_transport

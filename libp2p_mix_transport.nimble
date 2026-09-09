@@ -23,6 +23,10 @@ var
   nimc = getEnv("NIMC", "nim")
   flags = getEnv("NIMFLAGS", "")
   styleFlags = "--styleCheck:usages --styleCheck:error"
+  # XXX I suppose we could have those spread in config.nims over the repo, but I
+  #   opted to keeping it all here.
+  addressFlags = "-d:libp2p_multiaddress_exts=" & thisDir() & "/tests/exts/multiaddress.nim" &
+    " -d:libp2p_multicodec_exts=" & thisDir() & "/tests/exts/multicodec.nim"
 
 proc compile(filename: string) =
   exec nimc & " c " & styleFlags & " " & flags & " " & filename
@@ -35,6 +39,7 @@ proc buildExample(filename: string) =
   rmFile("examples/" & filename.changeFileExt("").toExe)
 
 task test, "Run tests":
+  flags &= addressFlags
   compile("tests/test_all.nim")
   exec "./tests/test_all"
   rmFile "tests/test_all"
@@ -44,9 +49,9 @@ task example, "Build examples":
   buildExample("mix_ping_quic.nim")
 
 task node, "Build standalone node":
-  flags &= " -d:release"
+  flags &= " -d:release " & addressFlags
   compile("tools/node/cli.nim", "tools/node/node")
 
-task debugNode, "Build standalone node for protocol debugging":
-  flags &= " -d:release -d:chronicles_sinks=json"
+task debugNode, "Build standalone node with structured logs for analysis":
+  flags &= " -d:release -d:chronicles_sinks=json " & addressFlags
   compile("tools/node/cli.nim", "tools/node/node-debug")
