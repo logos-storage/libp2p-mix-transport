@@ -84,15 +84,28 @@ Creating the return SURBs still requires the normal pool used by `createSurb`.
 Addresses are tried in order, skipping invalid entries and continuing after
 connection failures; each attempt uses the configured connection timeout.
 
-The test and standalone-node build tasks enable libp2p's extension hooks using
-the example files in `tests/exts/`. Those files are not installed with the
-package. Applications must provide their own extension files and select them
-with `libp2p_multicodec_exts` and `libp2p_multiaddress_exts` at compile time.
-Use `tests/exts/multicodec.nim` as the example for the `CodecExts` entry. For
-multiaddresses, use `tests/exts/multiaddress.nim` as the example: adapt its
-`includeFile` path to the installed `libp2p_mix_transport/address/ext.nim` and
-include `MixAddressExt` in `AddressExts`. Applications with existing extensions
-should add these entries to their own arrays.
+Libp2p needs compile-time registration to parse or print the custom
+`/mix-transport/...` address component. The package provides default registration
+files under `libp2p_mix_transport/address/defaults/`. Applications without other
+custom extensions can select them with these compiler options, replacing
+`<package-dir>` with the path to their installed MixTransport package:
+
+```text
+-d:libp2p_multiaddress_exts=<package-dir>/libp2p_mix_transport/address/defaults/multiaddress.nim
+-d:libp2p_multicodec_exts=<package-dir>/libp2p_mix_transport/address/defaults/multicodec.nim
+```
+
+Applications with existing extensions should keep their own registration files.
+Add the `("mix-transport", 0x300001)` entry to `CodecExts`. In the multiaddress
+registration file, use `includeFile` to include
+`libp2p_mix_transport/address/ext.nim` and add `MixAddressExt` to `AddressExts`.
+The include path must resolve to the installed file. The implementation is
+included rather than imported because it uses types and private fields from
+the surrounding libp2p multiaddress module.
+
+In this repository, `tests/config.nims` and `tools/node/config.nims` select the
+default files for tests and the standalone node. These settings apply to both
+direct compilation and Nimble tasks; the Nimble tasks do not repeat the flags.
 
 ## Docs
 
