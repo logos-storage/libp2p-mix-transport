@@ -57,6 +57,56 @@ demonstrate the transport API. A transport-specific example will later model a
 realistic bidirectional protocol with separate streams, similar to the stream
 arrangement used by block exchange.
 
+## Dialing a mix address
+
+`toMixAddress(info: MixPubInfo)` returns an address such as
+`/ip4/10.0.0.1/tcp/8081/mix-transport/<base64url-keys>`. Pass that address to
+`transport.connect(peerId, @[address])` or
+`transport.dial(peerId, @[address], codec)`. The existing PeerId-only calls
+remain available for peers already in the node pool or established sessions.
+
+The payload is 65 bytes: a compressed secp256k1 libp2p public key (33 bytes),
+followed by a Curve25519 mix public key (32 bytes), encoded as padded URL-safe
+base64. The public key must match the supplied PeerId. The address format
+preserves any MultiAddress endpoint prefix, including QUIC and circuit relays.
+Actual routing remains subject to the underlying Mix packet format, which
+currently supports IPv4 TCP and QUIC-v1, including circuit relays. The multicodec
+`0x300001` is a private-use assignment, not an upstream registered code.
+
+Supplied destinations stay attached to their transport session and are removed
+on failure or teardown. For each forward frame, MixTransport passes the stored
+`MixPubInfo` to Mix's explicit-destination `send` overload. Mix uses that
+information for the final hop and selects the preceding hops from its relay
+pool, excluding the destination. No destination entries are installed in the
+peer store, and the provider does not become a relay candidate for other sends.
+For the current three-hop path, an explicit send needs two eligible relay nodes.
+Creating the return SURBs still requires the normal pool used by `createSurb`.
+Addresses are tried in order, skipping invalid entries and continuing after
+connection failures; each attempt uses the configured connection timeout.
+
+Libp2p needs compile-time registration to parse or print the custom
+`/mix-transport/...` address component. The package provides default registration
+files under `libp2p_mix_transport/address/defaults/`. Applications without other
+custom extensions can select them with these compiler options, replacing
+`<package-dir>` with the path to their installed MixTransport package:
+
+```text
+-d:libp2p_multiaddress_exts=<package-dir>/libp2p_mix_transport/address/defaults/multiaddress.nim
+-d:libp2p_multicodec_exts=<package-dir>/libp2p_mix_transport/address/defaults/multicodec.nim
+```
+
+Applications with existing extensions should keep their own registration files.
+Add the `("mix-transport", 0x300001)` entry to `CodecExts`. In the multiaddress
+registration file, use `includeFile` to include
+`libp2p_mix_transport/address/ext.nim` and add `MixAddressExt` to `AddressExts`.
+The include path must resolve to the installed file. The implementation is
+included rather than imported because it uses types and private fields from
+the surrounding libp2p multiaddress module.
+
+In this repository, `tests/config.nims` and `tools/node/config.nims` select the
+default files for tests and the standalone node. These settings apply to both
+direct compilation and Nimble tasks; the Nimble tasks do not repeat the flags.
+
 ## Docs
 
 In the `docs` folder there are some Markdown documents. Some of the them may contain more of less sophisticated math formatting. I am using Obsidian to render math expressions in Markdown. Obsidian has excelent support for Math and it works somoothly (I am speaking about you HackMD!). So, it you are serious about anything in your life ;), please use Obsidian to access the documentation. You can find our Obsidian vault at [logos-storage/logos-storage-docs-obsidian](https://github.com/logos-storage/logos-storage-docs-obsidian).
