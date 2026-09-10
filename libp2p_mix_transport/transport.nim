@@ -5,14 +5,11 @@
 import chronicles, chronos, results, sets, tables
 import libp2p/multistream
 import libp2p/peerid
-import libp2p/peerstore
-import libp2p/crypto/crypto
 import libp2p/protocols/protocol
 import libp2p/stream/bufferstream
 import libp2p/stream/connection
 import libp2p/utils/opt
 import libp2p_mix
-import libp2p_mix/[pool, multiaddr]
 import ./address/parse
 import ./[connect_attempts, reply_credentials, sessions, streams, trace, wire]
 
@@ -247,40 +244,11 @@ proc waitForReplySurbs(
   ok()
 
 proc sendToDestination(
-    self: MixTransport, destination: PeerId, sessionId: PeerId, payload: seq[byte]
-): Future[Result[void, string]].Raising([CancelledError]) {.gcsafe, raises: [].} =
-  if sessionId notin self.addressDestinations:
-    return
-      self.mix.send(MixDestination.exitNode(destination), MixTransportCodec, payload)
-  # MixNodePool reads these three entries from the switch's peer store. Override
-  # only this destination, including its preferred address, for route creation.
-  # pool.add/remove would leave address/key changes behind and might select a
-  # previously observed address instead of the supplied candidate.
-  template temporarilySet(bookType, value: untyped) =
-    let book = self.mix.switch.peerStore[bookType]
-    let existed = destination in book.book
-    let previous = book.book.getOrDefault(destination)
-    # Do not publish discovery events for these temporary routing entries:
-    # change handlers could start unrelated flows while the entry is present.
-    book.book[destination] = value
-    defer:
-      if existed:
-        book.book[destination] = previous
-      else:
-        book.book.del(destination)
-
-  let info = self.addressDestinations.getOrDefault(sessionId)
-  temporarilySet(MixPubKeyBook, info.mixPubKey)
-  temporarilySet(KeyBook, PublicKey(scheme: Secp256k1, skkey: info.libp2pPubKey))
-  temporarilySet(LastSeenOutboundBook, Opt.some(info.multiAddr))
-  # Chronos starts send eagerly; Mix finishes route construction before its
-  # first await (sendPacket). All entries are restored before this future is
-  # returned, so no unrelated flow can select the temporary peer as a relay.
-  self.mix.send(MixDestination.exitNode(destination), MixTransportCodec, payload)
-
-  # FIXME this whole thing is a brittle hack. Ideally Mix should provide a
-  #   proper API for sending to a destination without requiring insertion into
-  #   MixNodePool.
+    self: MixTransport, destination: PeerId, sessionId: PeerId, payload: sink seq[byte]
+): Future[Result[void, string]] {.async: (raw: true, raises: [CancelledError]).} =
+  self.addressDestinations.withValue(sessionId, info):
+    return self.mix.send(info[], MixTransportCodec, move(payload))
+  self.mix.send(MixDestination.exitNode(destination), MixTransportCodec, move(payload))
 
 proc sendStreamFrame(
     self: MixTransport, session: TransportSession, frame: MixTransportFrame
@@ -1122,11 +1090,6 @@ proc connectInternal(
     destination: PeerId,
     info: Opt[MixPubInfo] = Opt.none(MixPubInfo),
 ): Future[Result[TransportSession, string]] {.async: (raises: [CancelledError]).} =
-  info.withValue(value):
-    # The address codec is transport-independent. Enforce the underlying Mix
-    # packet format's capabilities here, before installing routing information.
-    discard multiAddrToBytes(destination, value.multiAddr).valueOr:
-      return err("unsupported Mix destination address: " & error)
   let sessionId = PeerId.random(self.mix.switch.rng).valueOr:
     return err("could not generate session identifier: " & $error)
   let session = self.sessions.addInitiatorSession(destination, sessionId).valueOr:
@@ -1195,6 +1158,8 @@ proc connect*(
   let withMixInfo: ConnectOperation[PeerId, TransportSession] = proc(
       destination: PeerId
   ): Future[Result[TransportSession, string]] {.async: (raises: [CancelledError]).} =
+    if candidates.len == 0:
+      return await self.connectInternal(destination)
     var failure: string
     for candidate in candidates:
       let attempt = await self.connectInternal(destination, Opt.some(candidate))
@@ -1204,7 +1169,7 @@ proc connect*(
     return err(failure)
 
   let paGetExisting: ExistingConnectionLookup[PeerId, TransportSession] = proc(
-    p: PeerId
+      p: PeerId
   ): Opt[TransportSession] =
     getExisting(self, p)
 
@@ -1233,7 +1198,7 @@ proc connect*(
     self.connectInternal(destination)
 
   let paGetExisting: ExistingConnectionLookup[PeerId, TransportSession] = proc(
-    p: PeerId
+      p: PeerId
   ): Opt[TransportSession] =
     getExisting(self, p)
 

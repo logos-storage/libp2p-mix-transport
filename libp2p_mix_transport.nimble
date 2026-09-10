@@ -10,7 +10,7 @@ entryPoints = @[
 ]
 
 requires "nim >= 2.2.4"
-requires "libp2p == 2.2.0"
+requires "libp2p == 2.2.1"
 requires "https://github.com/logos-co/nim-libp2p-mix.git#feat/mix-transport"
 requires "chronicles >= 0.11.0"
 requires "chronos >= 4.2.2"
@@ -40,7 +40,7 @@ proc buildExample(filename: string) =
   rmFile("examples/" & filename.changeFileExt("").toExe)
 
 task test, "Run tests":
-  flags &= addressFlags
+  flags &= " " & addressFlags
   compile("tests/test_all.nim")
   exec "./tests/test_all"
   rmFile "tests/test_all"

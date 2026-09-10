@@ -74,22 +74,25 @@ currently supports IPv4 TCP and QUIC-v1, including circuit relays. The multicode
 `0x300001` is a private-use assignment, not an upstream registered code.
 
 Supplied destinations stay attached to their transport session and are removed
-on failure or teardown. Each send temporarily installs only the destination's
-mix key, public key and preferred address, restoring the original entries before
-returning its future. It leaves no permanent pool or peer-store changes and
-publishes no discovery notifications. This relies on the current Mix
-implementation constructing its route synchronously before awaiting I/O, so
-other flows cannot select the temporary destination as a relay.
-The caller still needs at least three eligible nodes in its normal relay pool.
+on failure or teardown. For each forward frame, MixTransport passes the stored
+`MixPubInfo` to Mix's explicit-destination `send` overload. Mix uses that
+information for the final hop and selects the preceding hops from its relay
+pool, excluding the destination. No destination entries are installed in the
+peer store, and the provider does not become a relay candidate for other sends.
+For the current three-hop path, an explicit send needs two eligible relay nodes.
+Creating the return SURBs still requires the normal pool used by `createSurb`.
 Addresses are tried in order, skipping invalid entries and continuing after
 connection failures; each attempt uses the configured connection timeout.
 
-This repository's `config.nims` enables the libp2p extension hooks. Applications
-depending on this package must also set `libp2p_multicodec_exts` to the package's
-`libp2p_mix_transport/exts/multicodec.nim` and `libp2p_multiaddress_exts` to
-`libp2p_mix_transport/exts/multiaddress.nim` at compile time. Applications with
-their own extensions must combine the `CodecExts` and `AddressExts` entries
-in their extension files.
+The test and standalone-node build tasks enable libp2p's extension hooks using
+the example files in `tests/exts/`. Those files are not installed with the
+package. Applications must provide their own extension files and select them
+with `libp2p_multicodec_exts` and `libp2p_multiaddress_exts` at compile time.
+Use `tests/exts/multicodec.nim` as the example for the `CodecExts` entry. For
+multiaddresses, use `tests/exts/multiaddress.nim` as the example: adapt its
+`includeFile` path to the installed `libp2p_mix_transport/address/ext.nim` and
+include `MixAddressExt` in `AddressExts`. Applications with existing extensions
+should add these entries to their own arrays.
 
 ## Docs
 

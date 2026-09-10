@@ -9,15 +9,17 @@ import
 import libp2p_mix
 import libp2p_mix/curve25519
 
-const 
-    AddressPayloadSize = SkRawCompressedPublicKeySize + Curve25519KeySize
-    # Minimum number of protocol components expected BEFORE the mix-transport component
-    MinPrefixLength = 1
+const
+  AddressPayloadSize = SkRawCompressedPublicKeySize + Curve25519KeySize
+  # Minimum number of protocol components expected BEFORE the mix-transport component
+  MinPrefixLength = 1
 
-proc extract(address: MultiAddress): Result[tuple[prefix: MultiAddress, component: MultiAddress], string] =
+proc extract(
+    address: MultiAddress
+): Result[tuple[prefix: MultiAddress, component: MultiAddress], string] =
   let protocols = ?address.protocols()
-  var mixIndex = -1 
-  for i, protocol in ?address.protocols():
+  var mixIndex = -1
+  for i, protocol in protocols:
     if protocol == multiCodec("mix-transport"):
       mixIndex = i
       break
@@ -32,16 +34,16 @@ proc extract(address: MultiAddress): Result[tuple[prefix: MultiAddress, componen
     return err("address has no transport prefix")
   ok((prefix: prefix, component: component))
 
-proc isMTAddress*(address: MultiAddress): bool = extract(address).isOk
+proc isMTAddress*(address: MultiAddress): bool =
+  extract(address).isOk
 
 proc fromMixAddress*(
-    T: type MixPubInfo, address: MultiAddress, destination: Opt[PeerId],
+    T: type MixPubInfo, address: MultiAddress, destination: Opt[PeerId]
 ): Result[MixPubInfo, string] =
-
-  let 
+  let
     (endpoint, mix) = ?extract(address)
     payload = ?mix.protoArgument()
-  
+
   if payload.len != AddressPayloadSize:
     return err("invalid payload size")
 
