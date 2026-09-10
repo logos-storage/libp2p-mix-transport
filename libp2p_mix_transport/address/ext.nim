@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 
-# Extension for handling mix-transport addresses in libp2p multiaddress format.
-# Needs to be kept as a separate module, with minimal imports as this gets sourced 
-# in the middle of `multiaddress.nim`. You should not IMPORT this module, you 
-# should source it into your extension file with `includeFile` (see tests/exts/multiaddress).
+# Conversion helpers included into libp2p's multiaddress module at compile time.
+# Use includeFile, not import: these declarations use the surrounding module's
+# types and private fields. Keep imports minimal to avoid circular dependencies.
+# defaults/multiaddress.nim shows how to register MixAddressExt in AddressExts.
 
 import std/base64
 
