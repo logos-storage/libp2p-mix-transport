@@ -151,6 +151,7 @@ proc delayAcknowledgementCopies(transport: MixTransport, interAckDelay: Duration
 
 type ConnectionMode {.pure.} = enum
   PeerIdConnect
+  PeerIdDial
   AddressConnect
   AddressDial
 
@@ -235,7 +236,7 @@ proc establishSessionAndStream(
   # from the initiator's relay pool before making either call.
   let destination = recipientMix.switch.peerInfo.peerId
   var addrs: seq[MultiAddress]
-  if mode != ConnectionMode.PeerIdConnect:
+  if mode in {ConnectionMode.AddressConnect, ConnectionMode.AddressDial}:
     # The first candidate is deliberately not a mix address, to exercise
     # skipping unusable candidates before trying the advertised destination.
     addrs = @[
@@ -251,6 +252,10 @@ proc establishSessionAndStream(
   case mode
   of ConnectionMode.PeerIdConnect:
     session = (await initiator.connect(destination)).expect("PeerId connect")
+  of ConnectionMode.PeerIdDial:
+    initiatorStream =
+      (await initiator.dial(destination, TestCodec)).expect("PeerId dial")
+    session = initiator.sessions.get(initiatorStream.sessionId).expect("dial session")
   of ConnectionMode.AddressConnect:
     let connecting = initiator.connect(destination, addrs)
     # Inspect the pool while the operation is pending, not just after success:
@@ -267,8 +272,8 @@ proc establishSessionAndStream(
     doAssert initiatorMix.nodePool.get(destination).isNone
     initiatorStream = (await dialing).expect("address-only dial")
     session = initiator.sessions.get(initiatorStream.sessionId).expect(
-      "dial did not retain the session it created"
-    )
+        "dial did not retain the session it created"
+      )
 
   # Once the anonymous round trip has established the session, connecting to
   # the same destination reuses its stable pseudonym instead of sending another
@@ -291,7 +296,7 @@ proc establishSessionAndStream(
   # The connect cases still need a stream: dial reuses their established
   # session and completes OpenStream/StreamAck. AddressDial already did both
   # handshakes above. From here all cases run identical data and teardown checks.
-  if mode != ConnectionMode.AddressDial:
+  if mode notin {ConnectionMode.AddressDial, ConnectionMode.PeerIdDial}:
     initiatorStream = (await initiator.dial(destination, TestCodec)).expect(
       "could not establish MixTransport stream"
     )
@@ -372,7 +377,7 @@ proc establishSessionAndStream(
       raise newException(LPError, "recipient session event was not published")
     observedRecipientSessionEvents.add(await recipientEvent)
 
-  if mode != ConnectionMode.PeerIdConnect:
+  if mode in {ConnectionMode.AddressConnect, ConnectionMode.AddressDial}:
     doAssert initiatorMix.nodePool == originalPool
     doAssert initiatorMix.nodePool.len == poolSize
     doAssert initiatorMix.nodePool.get(destination).isNone
@@ -404,7 +409,7 @@ suite "MixTransport session and stream handshakes":
   setup:
     updateLogLevel("INFO;trace:mix-transport")
 
-  test "temporary destination entries restore absent and existing peer-store state":
+  test "explicit destination sends leave absent and existing peer-store state untouched":
     for alreadyKnown in [false, true]:
       let
         mix = createMixNodes(1)[0]
@@ -417,27 +422,25 @@ suite "MixTransport session and stream handshakes":
         observed = mix.switch.peerStore[LastSeenOutboundBook]
         addresses = mix.switch.peerStore[AddressBook]
       var stale = info
-      stale.multiAddr = MultiAddress.init("/ip4/127.0.0.1/tcp/4244").expect(
-        "stale address"
-      )
+      stale.multiAddr =
+        MultiAddress.init("/ip4/127.0.0.1/tcp/4244").expect("stale address")
       stale.mixPubKey = MixNodeInfo.generateRandom(4244, newRng()).mixPubKey
       if alreadyKnown:
         mix.nodePool.add(stale)
         observed[destination] = Opt.some(stale.multiAddr)
       let addressEntries = addresses.entries(destination)
       var notifications = 0
-      let onChange: PeerBookChangeHandler =
-        proc(peer: PeerId) {.gcsafe, raises: [].} =
-          inc notifications
+      let onChange: PeerBookChangeHandler = proc(peer: PeerId) {.gcsafe, raises: [].} =
+        inc notifications
       mixKeys.addHandler(onChange)
       keys.addHandler(onChange)
       observed.addHandler(onChange)
       addresses.addHandler(onChange)
 
       transport.addressDestinations[sessionId] = info
-      # No relays are available, so send fails during route construction. Even
-      # this early exit must restore every destination entry without discovery
-      # callbacks that could expose it to unrelated flows.
+      # No relays are available, so send fails during route construction.
+      # Providing destination information must not modify the peer store,
+      # including when the pool already contains different information.
       let sending = transport.sendToDestination(destination, sessionId, @[1.byte])
       check (destination in mixKeys) == alreadyKnown
       check (destination in keys) == alreadyKnown
@@ -463,17 +466,18 @@ suite "MixTransport session and stream handshakes":
     check mix.nodePool.len == 0
     check transport.addressDestinations.len == 0
 
+  test "PeerId-only dial creates a session without an explicit connect":
+    let outcome = waitFor establishSessionAndStream(mode = ConnectionMode.PeerIdDial)
+    check outcome.session.state == SessionState.Closed
+
   test "connect by address works without enrolling destination as a relay":
-    let outcome = waitFor establishSessionAndStream(
-      mode = ConnectionMode.AddressConnect
-    )
+    let outcome =
+      waitFor establishSessionAndStream(mode = ConnectionMode.AddressConnect)
     check outcome.session.state == SessionState.Closed
     check outcome.reused == outcome.session
 
   test "dial by address creates a session and carries traffic without pool membership":
-    let outcome = waitFor establishSessionAndStream(
-      mode = ConnectionMode.AddressDial
-    )
+    let outcome = waitFor establishSessionAndStream(mode = ConnectionMode.AddressDial)
     check outcome.session.state == SessionState.Closed
     check outcome.reused == outcome.session
 
