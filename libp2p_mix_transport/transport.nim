@@ -1184,7 +1184,7 @@ proc connect*(
     candidates: seq[MixPubInfo]
     lastError = "no usable mix address"
   for address in addrs:
-    let mixinfo = MixPubInfo.fromMixAddress(destination, address).valueOr:
+    let mixinfo = MixPubInfo.fromMixAddress(address, Opt.some(destination)).valueOr:
       lastError = error
       continue
     candidates.add(mixinfo)
