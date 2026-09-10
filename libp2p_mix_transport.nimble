@@ -10,7 +10,7 @@ entryPoints = @[
 ]
 
 requires "nim >= 2.2.4"
-requires "libp2p == 2.2.0"
+requires "libp2p == 2.2.1"
 requires "https://github.com/logos-co/nim-libp2p-mix.git#feat/mix-transport"
 requires "chronicles >= 0.11.0"
 requires "chronos >= 4.2.2"
@@ -47,6 +47,6 @@ task node, "Build standalone node":
   flags &= " -d:release"
   compile("tools/node/cli.nim", "tools/node/node")
 
-task debugNode, "Build standalone node for protocol debugging":
+task debugNode, "Build standalone node with structured logs for analysis":
   flags &= " -d:release -d:chronicles_sinks=json"
   compile("tools/node/cli.nim", "tools/node/node-debug")

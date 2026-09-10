@@ -6,5 +6,7 @@ nimbledeps/
 .codex
 nimble.paths
 nimble.develop
-/experiment-output/
-tools/node/
+experiment-output
+# FIXME should probably set a /build folder for this...
+tools/node/node
+tools/node/node-debug
