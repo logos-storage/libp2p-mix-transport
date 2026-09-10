@@ -35,7 +35,7 @@ proc extract(address: MultiAddress): Result[tuple[prefix: MultiAddress, componen
 proc isMTAddress*(address: MultiAddress): bool = extract(address).isOk
 
 proc fromMixAddress*(
-    T: type MixPubInfo, destination: PeerId, address: MultiAddress
+    T: type MixPubInfo, address: MultiAddress, destination: Opt[PeerId],
 ): Result[MixPubInfo, string] =
 
   let 
@@ -54,7 +54,7 @@ proc fromMixAddress*(
       return err("invalid peer public key")
 
   # Just in case. :-)
-  if peer != destination:
+  if destination.isSome and peer != destination.get():
     return err("mix address public key does not match destination PeerId")
 
   let mixKey = bytesToAlphaFieldElement(
@@ -62,7 +62,7 @@ proc fromMixAddress*(
   ).valueOr:
     return err("invalid mix public key: " & error)
 
-  ok(MixPubInfo.init(destination, endpoint, mixKey, publicKey))
+  ok(MixPubInfo.init(peer, endpoint, mixKey, publicKey))
 
 proc toMixAddress*(info: MixPubInfo): Result[MultiAddress, string] =
   ## The payload is compressed secp256k1 (33 bytes), then Curve25519 (32 bytes).
