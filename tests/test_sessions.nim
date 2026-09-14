@@ -14,6 +14,89 @@ import libp2p_mix_transport
 proc randomPeerId(rng: Rng): PeerId =
   PeerId.random(rng).expect("could not generate peer identifier")
 
+proc establishedSession(role: SessionRole): TransportSession =
+  let
+    rng = newRng()
+    store = newSessionStore()
+  result =
+    if role == SessionRole.Initiator:
+      store.addInitiatorSession(randomPeerId(rng), randomPeerId(rng)).get()
+    else:
+      store.addRecipientSession(randomPeerId(rng)).get()
+  result.establish()
+
+func remoteStreamId(role: SessionRole, position: int): StreamId =
+  StreamId(position * 2 + (if role == SessionRole.Initiator: 2 else: 1))
+
+suite "MixTransport opening history":
+  test "a removed stream cannot be opened again":
+    for role in SessionRole:
+      let session = establishedSession(role)
+      let id = remoteStreamId(role, 0)
+      check session.acceptInboundStreamOpening(id)
+      discard session.addInboundStream(id, "/test/1").get()
+      discard session.removeStream(id)
+      check not session.acceptInboundStreamOpening(id)
+
+  test "a rejected opening is remembered without registering a stream":
+    for role in SessionRole:
+      let session = establishedSession(role)
+      let id = remoteStreamId(role, 0)
+      check session.acceptInboundStreamOpening(id)
+      check session.streamCount == 0
+      check not session.acceptInboundStreamOpening(id)
+
+  test "unseen openings inside the window may arrive out of order":
+    for role in SessionRole:
+      let session = establishedSession(role)
+      check session.acceptInboundStreamOpening(remoteStreamId(role, 2))
+      check session.acceptInboundStreamOpening(remoteStreamId(role, 0))
+      check session.acceptInboundStreamOpening(remoteStreamId(role, 1))
+
+  test "advancing the window rejects old positions but retains boundary history":
+    for role in SessionRole:
+      let session = establishedSession(role)
+      check session.acceptInboundStreamOpening(remoteStreamId(role, 1))
+      check session.acceptInboundStreamOpening(
+        remoteStreamId(role, InboundOpeningWindow)
+      )
+      # Position zero is now too old, even though it was never received.
+      check not session.acceptInboundStreamOpening(remoteStreamId(role, 0))
+      check not session.acceptInboundStreamOpening(remoteStreamId(role, 1))
+      check session.acceptInboundStreamOpening(
+        remoteStreamId(role, InboundOpeningWindow - 1)
+      )
+
+  test "large jumps clear reused bitmap slots without admitting old openings":
+    for role in SessionRole:
+      let session = establishedSession(role)
+      let farPosition = InboundOpeningWindow * 4
+      check session.acceptInboundStreamOpening(remoteStreamId(role, 0))
+      check session.acceptInboundStreamOpening(remoteStreamId(role, farPosition))
+      check not session.acceptInboundStreamOpening(remoteStreamId(role, 0))
+      check session.acceptInboundStreamOpening(remoteStreamId(role, farPosition - 1))
+      check not session.acceptInboundStreamOpening(remoteStreamId(role, farPosition))
+
+  test "the final remote stream ID does not overflow the window":
+    for role in SessionRole:
+      let session = establishedSession(role)
+      let last =
+        if role == SessionRole.Initiator:
+          StreamId.high - 1
+        else:
+          StreamId.high
+      check session.acceptInboundStreamOpening(last)
+      check session.acceptInboundStreamOpening(last - 2)
+      check not session.acceptInboundStreamOpening(last)
+
+  test "invalid parity and zero do not change opening history":
+    for role in SessionRole:
+      let session = establishedSession(role)
+      let first = remoteStreamId(role, 0)
+      check not session.acceptInboundStreamOpening(0)
+      check not session.acceptInboundStreamOpening(first + 1)
+      check session.acceptInboundStreamOpening(first)
+
 suite "MixTransport sessions":
   test "initiator sessions retain both destination and pseudonymous identity":
     let

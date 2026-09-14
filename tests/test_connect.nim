@@ -406,6 +406,56 @@ proc establishSessionAndStream(
   )
 
 suite "MixTransport session and stream handshakes":
+  test "recipient reuses its anonymous session and opens bidirectional streams":
+    proc run() {.async.} =
+      let
+        nodes = createMixNodes(5)
+        initiator = newMixTransport(nodes[0])
+        recipient = newMixTransport(nodes[^1])
+        invocations = newAsyncQueue[ProtocolInvocation]()
+        requests = newAsyncQueue[seq[byte]]()
+        keepRunning = newAsyncEvent()
+      nodes[0].switch.mount(
+        newTestProtocol(TestCodec, invocations, requests, keepRunning)
+      )
+      for node in nodes:
+        await node.switch.start()
+        await node.start()
+      defer:
+        await recipient.stop()
+        await initiator.stop()
+        for node in nodes:
+          await node.stop()
+          await node.switch.stop()
+      (await initiator.start()).expect("start initiator")
+      (await recipient.start()).expect("start recipient")
+      let session =
+        (await initiator.connect(nodes[^1].switch.peerInfo.peerId)).expect("connect")
+      let reverseSession = recipient.sessions.get(session.sessionId).get()
+      doAssert (await recipient.connect(reverseSession.peerId)).get() == reverseSession
+      for attempt in 0 ..< 2:
+        let stream = (await recipient.dial(reverseSession.peerId, TestCodec)).expect(
+          "recipient dial"
+        )
+        doAssert stream.streamId mod 2 == 0
+        let invoked = invocations.get()
+        doAssert await invoked.withTimeout(TestOperationTimeout)
+        doAssert TransportStream((await invoked).stream).streamId == stream.streamId
+        await stream.writeLp(TestRequest)
+        let request = requests.get()
+        doAssert await request.withTimeout(TestOperationTimeout)
+        doAssert (await request) == TestRequest.toBytes
+        let response = stream.readLp(1024)
+        doAssert await response.withTimeout(TestOperationTimeout)
+        doAssert (await response) == TestResponse.toBytes
+      let rejected = await recipient.dial(reverseSession.peerId, UnsupportedCodec)
+      doAssert rejected.isErr
+      doAssert rejected.error == "requested protocol is not supported"
+      doAssert recipient.sessions.len == 1
+      doAssert initiator.sessions.len == 1
+
+    waitFor run()
+
   setup:
     updateLogLevel("INFO;trace:mix-transport")
 

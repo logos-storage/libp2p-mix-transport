@@ -160,6 +160,10 @@ proc applySurbSupplySnapshot(
     )
   )
 
+proc handleOpenStream(
+  self: MixTransport, frame: MixTransportFrame
+): Future[void] {.async: (raises: [CancelledError]).}
+
 proc handleReplyFrame(
     self: MixTransport, frame: MixTransportFrame
 ): Future[void] {.async: (raises: [CancelledError]).} =
@@ -205,6 +209,8 @@ proc handleReplyFrame(
       stream.reject(
         if rejectionReason.len == 0: UnknownStreamRejectionReason else: rejectionReason
       )
+  of FrameKind.OpenStream:
+    await self.handleOpenStream(frame)
   of FrameKind.Data:
     self.handleData(frame)
   of FrameKind.Ack:
@@ -601,6 +607,8 @@ proc sendStreamResponse(
       else:
         Opt.none(string),
   )
+  if session.role == SessionRole.Initiator:
+    return (await self.sendStreamFrame(session, response)).isOk
   session.attachSurbSupplySnapshot(response)
   let payload = response.encode().valueOr:
     return false
@@ -663,17 +671,26 @@ proc handleOpenStream(
   let session = self.sessions.get(frame.sessionId).valueOr:
     debug "Dropping OpenStream frame for unknown session", sessionId = frame.sessionId
     return
-  if session.role != SessionRole.Recipient:
-    debug "Dropping OpenStream frame for session with unexpected role",
+  if (
+    session.role == SessionRole.Recipient and
+    frame.surbs.len < DefaultReplySurbRedundancy
+  ) or (session.role == SessionRole.Initiator and frame.surbs.len != 0):
+    debug "Dropping OpenStream with invalid SURBs for session role",
       sessionId = frame.sessionId, sessionRole = session.role
     return
   if session.state != SessionState.Established:
     debug "Dropping OpenStream frame because session is not established",
       sessionId = frame.sessionId, sessionState = session.state
     return
+  # Record the attempt before any await or protocol rejection. Removing its
+  # stream later must not make a redundant OpenStream acceptable again.
+  if not session.acceptInboundStreamOpening(frame.streamId.get()):
+    debug "Dropping duplicate, old or invalid OpenStream",
+      sessionId = frame.sessionId, streamId = frame.streamId.get()
+    return
 
   var replyBatch = newSeqOfCap[SURB](DefaultReplySurbRedundancy)
-  for index in 0 ..< DefaultReplySurbRedundancy:
+  for index in 0 ..< min(frame.surbs.len, DefaultReplySurbRedundancy):
     let surb = frame.surbs[index].deserializeSurb().valueOr:
       return
     replyBatch.add(surb)
@@ -792,6 +809,8 @@ proc handleDelivery(
     await self.handleConnect(frame)
   of FrameKind.OpenStream:
     await self.handleOpenStream(frame)
+  of FrameKind.StreamAck, FrameKind.StreamReject:
+    await self.handleReplyFrame(frame)
   of FrameKind.Data:
     self.handleData(frame)
   of FrameKind.Ack:
@@ -1132,6 +1151,10 @@ proc connectInternal(
 proc getExisting(
     self: MixTransport, destination: PeerId
 ): Opt[TransportSession] {.nimcall, gcsafe.} =
+  self.sessions.get(destination).withValue(existing):
+    if existing.role == SessionRole.Recipient and
+        existing.state == SessionState.Established:
+      return Opt.some(existing)
   self.sessions.getByDestination(destination).withValue(existing):
     if existing.state == SessionState.Established:
       return Opt.some(existing)
@@ -1213,33 +1236,19 @@ proc connect*(
 
   ok(session)
 
-proc dial*(
-    self: MixTransport, destination: PeerId, addrs: seq[MultiAddress], codec: string
-): Future[Result[TransportStream, string]] {.async: (raises: [CancelledError]).} =
-  if not self.started:
-    return err("MixTransport is not started")
-  if codec.len == 0:
-    return err("stream codec must not be empty")
-  if codec.len > MaxCodecBytes:
-    return err("stream codec is too long")
-
-  let session = (await self.connect(destination, addrs)).valueOr:
-    return err(error)
-  let stream = session.addOutboundStream(codec).valueOr:
-    return err(error)
-  var keepStream = false
-  defer:
-    if not keepStream:
-      discard session.removeStream(stream.streamId)
-      await noCancel stream.shutdown()
-
+proc sendOpenStream(
+    self: MixTransport, session: TransportSession, stream: TransportStream
+): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
   var frame = MixTransportFrame(
     version: MixTransportVersion,
     sessionId: session.sessionId,
     kind: FrameKind.OpenStream,
     streamId: Opt.some(stream.streamId),
-    codec: Opt.some(codec),
+    codec: Opt.some(stream.codec),
   )
+  if session.role == SessionRole.Recipient:
+    return await self.sendStreamFrame(session, frame)
+  let destination = session.destination.get()
   let
     suppliedCount = min(
       MaxOpenStreamSurbs - DefaultReplySurbRedundancy, session.availableSurbSupplySlots
@@ -1281,6 +1290,31 @@ proc dial*(
     session.scheduleSurbSupplyRetransmission(
       sequence, suppliedCount, self.surbSupplyRetransmissionTimeout
     )
+
+  ok()
+
+proc dial*(
+    self: MixTransport, destination: PeerId, addrs: seq[MultiAddress], codec: string
+): Future[Result[TransportStream, string]] {.async: (raises: [CancelledError]).} =
+  if not self.started:
+    return err("MixTransport is not started")
+  if codec.len == 0:
+    return err("stream codec must not be empty")
+  if codec.len > MaxCodecBytes:
+    return err("stream codec is too long")
+
+  let session = (await self.connect(destination, addrs)).valueOr:
+    return err(error)
+  let stream = session.addOutboundStream(codec).valueOr:
+    return err(error)
+  var keepStream = false
+  defer:
+    if not keepStream:
+      discard session.removeStream(stream.streamId)
+      await noCancel stream.shutdown()
+
+  (await self.sendOpenStream(session, stream)).isOkOr:
+    return err(error)
 
   if not await stream.waitUntilResolved().withTimeout(self.streamOpenTimeout):
     return err("MixTransport stream opening timed out")
