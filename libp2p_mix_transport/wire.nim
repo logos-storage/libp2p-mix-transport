@@ -146,9 +146,10 @@ proc validateFrame(
       frame.surbSupplyLimit.isSome
     mayCarrySurbSupplyState =
       frame.kind in {
-        FrameKind.ConnectAck, FrameKind.StreamAck, FrameKind.StreamReject,
-        FrameKind.Data, FrameKind.Ack, FrameKind.CloseStream, FrameKind.ResetStream,
-        FrameKind.Disconnect, FrameKind.ResetSession, FrameKind.SurbStatus,
+        FrameKind.ConnectAck, FrameKind.OpenStream, FrameKind.StreamAck,
+        FrameKind.StreamReject, FrameKind.Data, FrameKind.Ack, FrameKind.CloseStream,
+        FrameKind.ResetStream, FrameKind.Disconnect, FrameKind.ResetSession,
+        FrameKind.SurbStatus,
       }
 
   require frame.streamId.isSome == isStreamFrame,
@@ -208,8 +209,8 @@ proc validateFrame(
     require carriesSurbSupplyState, "frame must provide SURB supply state"
   of FrameKind.OpenStream:
     require frame.codec.get().len > 0, "application codec must not be empty"
-    require frame.surbs.len >= DefaultReplySurbRedundancy,
-      "open stream must provide one reply redundancy batch"
+    require frame.surbs.len == 0 or frame.surbs.len >= DefaultReplySurbRedundancy,
+      "open stream must provide no SURBs or one complete reply redundancy batch"
     require frame.surbs.len <= MaxOpenStreamSurbs, "open stream provides too many SURBs"
   of FrameKind.Data:
     require frame.sequence.get() > 0, "data sequence must not be zero"

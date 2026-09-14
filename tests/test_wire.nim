@@ -228,6 +228,8 @@ suite "MixTransport wire format":
       codec: Opt.some(newString(MaxCodecBytes)),
     )
 
+    check frame.encode().isOk
+    frame.surbs = @[newSeq[byte](SurbSize)]
     check frame.encode().isErr
 
     frame.surbs = newSeq[seq[byte]](MaxOpenStreamSurbs)

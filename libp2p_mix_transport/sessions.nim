@@ -19,6 +19,10 @@ logScope:
 
 const DefaultRecipientSurbCapacity* = 16
 
+# Retain the most recent 1024 remote allocation positions (128 bytes/session).
+# Older positions remain inadmissible after their individual bits are forgotten.
+const InboundOpeningWindow* = 1024
+
 export DefaultReplySurbRedundancy
 
 type
@@ -74,6 +78,8 @@ type
     unansweredSurbStatusProbes: int
     streams: Table[StreamId, TransportStream]
     nextOutboundStreamId: Opt[StreamId]
+    inboundOpeningBase: StreamId
+    inboundOpeningBitmap: array[InboundOpeningWindow div 8, byte]
 
   SessionStore* = ref object
     bySessionId: Table[PeerId, TransportSession]
@@ -597,6 +603,34 @@ func isValidInboundStreamId(session: TransportSession, streamId: StreamId): bool
     streamId mod 2 == 0
   of SessionRole.Recipient:
     streamId mod 2 == 1
+
+proc acceptInboundStreamOpening*(session: TransportSession, streamId: StreamId): bool =
+  ## Record an opening attempt before protocol dispatch, including attempts
+  ## that will be rejected. This history survives removal of individual streams.
+  if session.state != SessionState.Established or
+      not session.isValidInboundStreamId(streamId):
+    return false
+  # Both odd and even allocation sequences become positions 0, 1, 2, ...
+  let position = (streamId - 1) div 2
+  if position < session.inboundOpeningBase:
+    return false
+  let window = StreamId(InboundOpeningWindow)
+  if position - session.inboundOpeningBase >= window:
+    let newBase = position - window + 1
+    let forgotten = min(newBase - session.inboundOpeningBase, window)
+    for offset in 0 ..< int(forgotten):
+      let slot = int((session.inboundOpeningBase + StreamId(offset)) mod window)
+      session.inboundOpeningBitmap[slot div 8] =
+        session.inboundOpeningBitmap[slot div 8] and not byte(1 shl (slot mod 8))
+    session.inboundOpeningBase = newBase
+  let
+    slot = int(position mod window)
+    mask = byte(1 shl (slot mod 8))
+  if (session.inboundOpeningBitmap[slot div 8] and mask) != 0:
+    return false
+  session.inboundOpeningBitmap[slot div 8] =
+    session.inboundOpeningBitmap[slot div 8] or mask
+  true
 
 proc getStream*(session: TransportSession, streamId: StreamId): Opt[TransportStream] =
   session.streams.withValue(streamId, stream):

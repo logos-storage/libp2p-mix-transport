@@ -5,6 +5,8 @@ Mix protocol. It is under active development.
 
 ## Building
 
+Both endpoints can open streams within an established session. For the recipient's anonymous-peer lookup and reverse stream-opening exchange, see [Recipient-originated streams](docs/recipient-streams.md).
+
 The project requires Nim 2.2.4 or newer, Nimble and Git. From a fresh clone:
 
 ```bash
