@@ -3,6 +3,30 @@
 `libp2p_mix_transport` provides a generic byte-stream transport over the libp2p
 Mix protocol. It is under active development.
 
+## Experimental concurrent SURB copies
+
+The experiment branch supports `-d:mixExperimentConcurrentDataCopies`. Without
+this define, redundant sends remain sequential. With it, the recipient starts
+both redundant copies of each reverse Data frame before awaiting their completion.
+Each copy retains its normal Mix sender delay. The next chunk waits for both
+sends, and control frames remain sequential. Cancellation cancels and drains
+the started sends.
+
+This is a per-batch bound, not a global send-queue limit. The experiment does not
+establish overload safety or equivalent anonymity properties: packet spacing
+changes even though each packet retains its sampled delay.
+
+Run the test suite with and without the define:
+
+```bash
+make test NIMFLAGS="-d:disableMarchNative"
+make test NIMFLAGS="-d:disableMarchNative -d:mixExperimentConcurrentDataCopies"
+```
+
+`tests/test_surb_copy_sending.nim` is included in the normal test entry point.
+The define must also be supplied when compiling a consuming application such as
+Storage; enabling it only when compiling tests does not change an existing binary.
+
 ## Building
 
 Both endpoints can open streams within an established session. For the recipient's anonymous-peer lookup and reverse stream-opening exchange, see [Recipient-originated streams](docs/recipient-streams.md).
