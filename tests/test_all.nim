@@ -10,4 +10,5 @@ import ./test_connect
 import ./test_reply_credentials
 import ./test_sessions
 import ./test_streams
+import ./test_surb_copy_sending
 import ./test_wire

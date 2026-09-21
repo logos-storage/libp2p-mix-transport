@@ -224,15 +224,32 @@ proc handleReplyFrame(
     discard
 
 proc sendWithSurbRedundancyBatch(
-    self: MixTransport, surbs: sink seq[SURB], payload: sink seq[byte]
+    self: MixTransport, surbs: sink seq[SURB], payload: sink seq[byte],
+    concurrentCopies = false,
 ): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
   var sent = false
-  for surb in surbs.mitems:
-    # Each SURB is consumed once, but every redundant packet needs the same
-    # payload. Passing payload without move lets Nim copy it for each send.
-    traceOutbound(surb, payload)
-    if (await self.surbSender(move(surb), payload)).isOk:
-      sent = true
+  if concurrentCopies:
+    var sends: seq[Future[Result[void, string]].Raising([CancelledError])]
+    try:
+      for surb in surbs.mitems:
+        traceOutbound(surb, payload)
+        sends.add(self.surbSender(move(surb), payload))
+      for sending in sends:
+        if (await sending).isOk:
+          sent = true
+    finally:
+      # Own all started sends through completion, including on cancellation.
+      for sending in sends:
+        if not sending.finished:
+          sending.cancelSoon()
+      await noCancel allFutures(sends)
+  else:
+    for surb in surbs.mitems:
+      # Each SURB is consumed once, but every redundant packet needs the same
+      # payload. Passing payload without move lets Nim copy it for each send.
+      traceOutbound(surb, payload)
+      if (await self.surbSender(move(surb), payload)).isOk:
+        sent = true
 
   if not sent:
     return err("could not send through any SURB in the redundancy batch")
@@ -284,7 +301,11 @@ proc sendStreamFrame(
     session.attachSurbSupplySnapshot(replyFrame)
     let payload = replyFrame.encode().valueOr:
       return err("could not encode " & $frame.kind & " frame: " & error)
-    (await self.sendWithSurbRedundancyBatch(replyBatch, payload)).isOkOr:
+    # Lab-only comparison: overlap the two Data-copy sender holds without
+    # changing control-frame ordering or allowing multiple chunks to submit.
+    let concurrentCopies =
+      defined(mixExperimentConcurrentDataCopies) and frame.kind == FrameKind.Data
+    (await self.sendWithSurbRedundancyBatch(replyBatch, payload, concurrentCopies)).isOkOr:
       return err("could not send " & $frame.kind & " frame: " & error)
   ok()
 
