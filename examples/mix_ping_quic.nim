@@ -12,15 +12,9 @@
 
 import chronicles, chronos, results
 import std/[strformat, sequtils, sugar]
-import libp2p/[
-    protocols/ping,
-    peerid,
-    multiaddress,
-    switch,
-    builders,
-    crypto/crypto,
-    crypto/secp,
-  ]
+import
+  libp2p/
+    [protocols/ping, peerid, multiaddress, switch, builders, crypto/crypto, crypto/secp]
 import libp2p_mix
 import libp2p_mix/mix_protocol
 import libp2p_mix/curve25519
@@ -62,7 +56,6 @@ proc createSwitch(
     .withQuicTransport()
     .build()
 
-
 proc mixPingSimulation() {.async: (raises: [Exception]).} =
   let mixNodeInfos = generateLocalQuicMixNodeInfos(NumMixNodes)
   var switches: seq[Switch] = @[]
@@ -78,7 +71,7 @@ proc mixPingSimulation() {.async: (raises: [Exception]).} =
       listenAddrs = switch.peerInfo.listenAddrs
 
     switches.add(switch)
-  
+
   defer:
     await switches.mapIt(it.stop()).allFutures()
 
@@ -92,7 +85,7 @@ proc mixPingSimulation() {.async: (raises: [Exception]).} =
         nodeInfo.libp2pPubKey,
         nodeInfo.libp2pPrivKey,
       )
-  
+
   # Mount Mix protocols using the resolved, dialable node addresses.
   for i, nodeInfo in resolvedInfos:
     var switch = switches[i]
@@ -110,8 +103,7 @@ proc mixPingSimulation() {.async: (raises: [Exception]).} =
     mixProtos.add(proto)
 
   # Create a destination node (not part of the mix network)
-  let destNode =
-    createSwitch(MultiAddress.init("/ip4/0.0.0.0/udp/0/quic-v1").tryGet())
+  let destNode = createSwitch(MultiAddress.init("/ip4/0.0.0.0/udp/0/quic-v1").tryGet())
   defer:
     await destNode.stop()
 

@@ -1,0 +1,299 @@
+# SPDX-License-Identifier: MIT
+
+{.used.}
+
+import std/unittest
+
+import chronos, results
+import libp2p/[crypto/crypto, peerid]
+import
+  libp2p_mix/
+    [curve25519, delay, mix_message, padding, serialization, sphinx, tag_manager]
+import stew/endians2
+
+import libp2p_mix_transport/reply_credentials
+
+proc randomSessionId(rng: Rng): PeerId =
+  PeerId.random(rng).expect("could not generate session identifier")
+
+type TestReply = object
+  surb: SURB
+  credential: ReplyCredential
+  privateKey: FieldElement
+
+proc createReply(rng: Rng): TestReply =
+  # The original sender's Mix key pair. The return path ends at this node.
+  let (privateKey, publicKey) =
+    generateKeyPair().expect("could not generate Mix key pair")
+  var identifier: SURBIdentifier
+  rng.generate(identifier)
+
+  # MixProtocol.createSurb normally creates this one-time public SURB and its
+  # private credential on the original sender. A one-hop path keeps the test
+  # focused: the recipient sends directly back to the original sender.
+  let created = createSURB(
+      @[publicKey], @[NoDelay], @[Hop.init(newSeq[byte](AddrSize))], identifier, rng
+    )
+    .expect("could not create test SURB")
+  TestReply(surb: created.surb, credential: created.credential, privateKey: privateKey)
+
+proc rawReply(testReply: TestReply, message: Message): RawSurbReply =
+  # The recipient normally calls MixProtocol.sendWithSurb, which builds this
+  # packet with useSURB and sends it to the first return-path Mix node.
+  var tagManager = TagManager.new(autoStart = false)
+  let
+    packet = useSURB(testReply.surb, message)
+
+    # Every return-path node normally reaches processSphinxPacket through
+    # MixProtocol.handleMixMessages. Our only hop is the original sender, so
+    # it immediately recognizes Reply and exposes the raw encrypted payload.
+    processed = processSphinxPacket(packet, testReply.privateKey, tagManager).expect(
+        "could not process test reply"
+      )
+
+  doAssert processed.status == ProcessingStatus.Reply
+
+  # This is the RawSurbReply that Mix normally offers to MixTransport's
+  # registered raw reply handler on the original sender.
+  RawSurbReply(
+    identifier: testReply.credential.identifier, encryptedPayload: processed.delta_prime
+  )
+
+proc replyMessage(payload: seq[byte]): Message =
+  # Reproduce the empty-codec Mix envelope and Sphinx-sized padding normally
+  # applied by MixProtocol.sendWithSurb before useSURB is called.
+  MixMessage.init(payload, "").serialize().addPadding().expect(
+    "could not pad test reply"
+  )
+
+suite "MixTransport reply credentials":
+  test "consuming one reply credential leaves other credentials active":
+    let
+      rng = newRng()
+      store = ReplyCredentialStore.new()
+      first = createReply(rng).credential
+      second = createReply(rng).credential
+      sessionId = randomSessionId(rng)
+
+    store.add(sessionId, [first, second]).expect("could not add reply credentials")
+
+    # Supplying SURBs registers their credentials independently. A redundancy
+    # batch is formed later by the recipient and is unknown to this store.
+    check:
+      store.len == 2
+      store.get(first.identifier).isSome
+      store.get(second.identifier).isSome
+
+    store.consume(first)
+
+    check:
+      store.len == 1
+      store.retiredLen == 1
+      store.get(first.identifier).isNone
+      store.get(second.identifier).isSome
+      store.isRetiredIdentifier(first.identifier)
+      not store.isRetiredIdentifier(second.identifier)
+
+    # Reusing an identifier while its tombstone is active would cause the raw
+    # reply handler to mistake a new reply for a repeated one.
+    check store.add(randomSessionId(rng), [first]).isErr
+
+    # Consuming the same credential again is harmless and does not affect an
+    # independently registered credential.
+    store.consume(first)
+    check:
+      store.len == 1
+      store.retiredLen == 1
+      store.get(second.identifier).isSome
+
+  test "capacity rejects new credentials without evicting active credentials":
+    let
+      rng = newRng()
+      store = ReplyCredentialStore.new(maxCredentials = 2)
+      sessionId = randomSessionId(rng)
+      first = createReply(rng).credential
+      second = createReply(rng).credential
+      rejected = createReply(rng).credential
+
+    check store.add(sessionId, [first, second]).isOk
+    check store.add(sessionId, [rejected]).isErr
+    check:
+      store.len == 2
+      store.get(first.identifier).isSome
+      store.get(second.identifier).isSome
+      store.get(rejected.identifier).isNone
+
+  test "removing one session preserves credentials owned by another session":
+    let
+      rng = newRng()
+      store = ReplyCredentialStore.new()
+      removedSessionId = randomSessionId(rng)
+      retainedSessionId = randomSessionId(rng)
+      removed = createReply(rng).credential
+      retained = createReply(rng).credential
+
+    store.add(removedSessionId, [removed]).expect(
+      "could not add credentials for removed session"
+    )
+    store.add(retainedSessionId, [retained]).expect(
+      "could not add credentials for retained session"
+    )
+
+    check store.removeSession(removedSessionId) == 1
+    check:
+      store.get(removed.identifier).isNone
+      store.get(retained.identifier).isSome
+      store.isRetiredIdentifier(removed.identifier)
+      not store.isRetiredIdentifier(retained.identifier)
+      store.len == 1
+
+  test "retired reply identifiers expire and remain bounded":
+    let
+      rng = newRng()
+      store = ReplyCredentialStore.new(ttl = 1.seconds, maxRetiredIdentifiers = 1)
+      first = createReply(rng).credential
+      second = createReply(rng).credential
+      createdAt = Moment.now()
+      sessionId = randomSessionId(rng)
+
+    store.add(sessionId, [first, second], createdAt).expect(
+      "could not add reply credentials"
+    )
+    store.consume([first, second], createdAt)
+
+    # The bound keeps only one tombstone. Which identifier remains depends on
+    # hash-table iteration order, but either retained entry still suppresses a
+    # repeated reply until the original credential expires.
+    check:
+      store.len == 0
+      store.retiredLen == 1
+      store.isRetiredIdentifier(first.identifier, createdAt) !=
+        store.isRetiredIdentifier(second.identifier, createdAt)
+
+    # Querying after expiry is pure: an expired identifier is no longer
+    # considered retired, but storage cleanup remains explicit.
+    check:
+      not store.isRetiredIdentifier(first.identifier, createdAt + 1.seconds)
+      not store.isRetiredIdentifier(second.identifier, createdAt + 1.seconds)
+      store.retiredLen == 1
+      store.purgeExpired(createdAt + 1.seconds) == 1
+      store.retiredLen == 0
+
+  test "expired credentials are invisible before they are purged":
+    let
+      rng = newRng()
+      store = ReplyCredentialStore.new(ttl = 1.seconds)
+      credential = createReply(rng).credential
+      createdAt = Moment.now()
+
+    store.add(randomSessionId(rng), [credential], createdAt).expect(
+      "could not add reply credential"
+    )
+
+    check:
+      store.get(credential.identifier, createdAt).isSome
+      store.get(credential.identifier, createdAt + 1.seconds).isNone
+      store.len == 1
+      store.purgeExpired(createdAt + 1.seconds) == 1
+      store.len == 0
+
+  test "an unknown reply remains available to the embedded Mix path":
+    let
+      rng = newRng()
+      store = ReplyCredentialStore.new()
+      unknown = createReply(rng)
+      recovered = store.recoverReply(unknown.rawReply(replyMessage(@[1'u8]))).expect(
+          "unknown replies are not recovery errors"
+        )
+
+    # This transport never registered the credential, so its handler will
+    # return Unhandled and allow Mix's embedded reply path to inspect it.
+    check:
+      recovered.isNone
+      store.len == 0
+
+  test "each valid redundant reply consumes only its matching credential":
+    let
+      rng = newRng()
+      store = ReplyCredentialStore.new()
+      sessionId = randomSessionId(rng)
+      first = createReply(rng)
+      second = createReply(rng)
+      payload = @[1'u8, 2, 3]
+
+    store.add(sessionId, [first.credential, second.credential]).expect(
+      "could not add reply credentials"
+    )
+
+    # The recipient replies through the first public SURB. The original
+    # sender recovers the payload with its matching private credential.
+    let recovered = store
+      .recoverReply(first.rawReply(replyMessage(payload)))
+      .expect("could not recover reply")
+      .get()
+
+    check:
+      recovered.sessionId == sessionId
+      recovered.payload == payload
+      store.len == 1
+      store.get(first.credential.identifier).isNone
+      store.get(second.credential.identifier).isSome
+
+    # Transport frame semantics suppress the second logical delivery after it
+    # is recovered. The credential store still processes each SURB separately.
+    let redundant = store
+      .recoverReply(second.rawReply(replyMessage(payload)))
+      .expect("could not recover redundant reply")
+      .get()
+    check:
+      redundant.payload == payload
+      store.len == 0
+
+  test "invalid Sphinx recovery keeps the matching credential available":
+    let
+      rng = newRng()
+      store = ReplyCredentialStore.new()
+      sessionId = randomSessionId(rng)
+      first = createReply(rng)
+      second = createReply(rng)
+
+    store.add(sessionId, [first.credential, second.credential]).expect(
+      "could not add reply credentials"
+    )
+
+    let invalid = RawSurbReply(
+      identifier: first.credential.identifier,
+      encryptedPayload: newSeq[byte](PayloadSize),
+    )
+
+    # Cryptographic recovery failed before decoding payload.
+    # Keep the matching credential because a later packet using the same SURB
+    # may be valid. The other credential remains independent as well.
+    check store.recoverReply(invalid).isErr
+    check:
+      store.get(first.credential.identifier).isSome
+      store.get(second.credential.identifier).isSome
+
+  test "an invalid Mix payload consumes only the matching credential":
+    let
+      rng = newRng()
+      store = ReplyCredentialStore.new()
+      sessionId = randomSessionId(rng)
+      first = createReply(rng)
+      second = createReply(rng)
+
+    store.add(sessionId, [first.credential, second.credential]).expect(
+      "could not add reply credentials"
+    )
+
+    let invalidMessage = @(uint16(DataSize + 1).toBytesBE()) & newSeq[byte](DataSize)
+
+    # Sphinx recovery succeeds, but the recipient supplied a malformed Mix
+    # payload. This SURB cannot produce a different plaintext later, so its
+    # credential is consumed. The store does not know which other SURBs the
+    # recipient selected for the same temporary redundancy batch.
+    check store.recoverReply(first.rawReply(invalidMessage)).isErr
+    check:
+      store.len == 1
+      store.get(first.credential.identifier).isNone
+      store.get(second.credential.identifier).isSome
