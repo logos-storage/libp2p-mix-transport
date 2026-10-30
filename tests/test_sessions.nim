@@ -182,6 +182,7 @@ suite "MixTransport sessions":
     check:
       session.receivedSurbCount == 6
       session.surbSupplySnapshot().receiveBase == 6
+      session.surbSupplySnapshot().supplyLimit == 6
       session.acceptSurbSupply(6, SURB()) == SurbSupplyDisposition.OutsideWindow
 
     # Consuming two stored SURBs grants exactly two new absolute supply slots.

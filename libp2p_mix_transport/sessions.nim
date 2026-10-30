@@ -285,11 +285,8 @@ proc initializeSurbSupply*(session: TransportSession): Result[void, string] =
     return err("only recipient sessions advertise SURB supply state")
   if session.surbSupplyInitialized:
     return err("SURB supply state is already initialized")
-  if session.receivedSurbs.len > session.recipientSurbCapacity:
-    return err("recipient SURB capacity is already exceeded")
-
-  session.surbSupplyLimit =
-    SurbSupplySequence(session.recipientSurbCapacity - session.receivedSurbs.len)
+  # Numbered supply starts at zero, before any initial SURBs are accepted.
+  session.surbSupplyLimit = SurbSupplySequence(session.recipientSurbCapacity)
   session.surbSupplyInitialized = true
   ok()
 
