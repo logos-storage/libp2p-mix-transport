@@ -224,7 +224,9 @@ proc handleReplyFrame(
     discard
 
 proc sendWithSurbRedundancyBatch(
-    self: MixTransport, surbs: sink seq[SURB], payload: sink seq[byte],
+    self: MixTransport,
+    surbs: sink seq[SURB],
+    payload: sink seq[byte],
     concurrentCopies = false,
 ): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
   var sent = false
@@ -301,10 +303,9 @@ proc sendStreamFrame(
     session.attachSurbSupplySnapshot(replyFrame)
     let payload = replyFrame.encode().valueOr:
       return err("could not encode " & $frame.kind & " frame: " & error)
-    # Lab-only comparison: overlap the two Data-copy sender holds without
-    # changing control-frame ordering or allowing multiple chunks to submit.
-    let concurrentCopies =
-      defined(mixExperimentConcurrentDataCopies) and frame.kind == FrameKind.Data
+    # Overlap redundant Data sends while keeping control copies sequential.
+    # The reply-send lock covers the whole batch, including both completions.
+    let concurrentCopies = frame.kind == FrameKind.Data
     (await self.sendWithSurbRedundancyBatch(replyBatch, payload, concurrentCopies)).isOkOr:
       return err("could not send " & $frame.kind & " frame: " & error)
   ok()
