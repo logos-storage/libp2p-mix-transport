@@ -202,7 +202,7 @@ These files and directories are local artifacts and should not be committed:
 
 ## Dependency Cache Troubleshooting
 
-The Mix dependency currently follows a mutable Git branch. Nimble can keep using an older checkout from its global `pkgcache` after that branch advances, even when the project-local `nimbledeps/` directory is rebuilt.
+The Mix dependency is pinned to commit `863569fad40835608af2538db10d1ca79e850212` from the under-review [Mix PR #47](https://github.com/logos-co/nim-libp2p-mix/pull/47). This is a temporary prerelease pin; `libp2p` remains pinned to `2.4.1`. If dependency resolution appears stale after changing the pin, inspect Nimble's global `pkgcache` as well as the project-local `nimbledeps/` directory.
 
 First inspect the cached Mix checkouts:
 
