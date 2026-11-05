@@ -3,6 +3,23 @@
 `libp2p_mix_transport` provides a generic byte-stream transport over the libp2p
 Mix protocol. It is under active development.
 
+## Concurrent redundant Data sends
+
+The recipient sends the two redundant copies of each reverse Data frame
+concurrently by default. Each copy uses a distinct SURB and retains its normal
+Mix sender delay. Both sends finish before the next frame can use the session's
+reply-send lock. Control-frame copies remain sequential. Cancellation cancels
+and drains the started sends.
+
+Concurrency is bounded per redundancy batch, rather than globally across
+sessions. The recorded experiment does not establish overload safety or
+equivalent anonymity properties: packet spacing changes even though each
+packet retains its sampled delay.
+
+No compile flag is required. Rebuild consuming applications such as Storage
+to use this behavior. The normal test suite includes Data concurrency,
+control-frame ordering, and cancellation checks.
+
 ## Building
 
 Both endpoints can open streams within an established session. For the recipient's anonymous-peer lookup and reverse stream-opening exchange, see [Recipient-originated streams](docs/recipient-streams.md).
