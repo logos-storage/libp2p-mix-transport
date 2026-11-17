@@ -20,6 +20,10 @@ type
     credential*: ReplyCredential
     sessionId*: PeerId
     expiresAt*: Moment
+    encodedSurb: seq[byte]
+    dispatchBefore: Opt[Moment]
+    holdTime: Duration
+    transitAllowance: Duration
 
   RecoveredReply* = object
     sessionId*: PeerId
@@ -27,6 +31,7 @@ type
 
   ReplyCredentialStore* = ref object
     credentials: Table[SURBIdentifier, StoredReplyCredential]
+    encodedIdentifiers: Table[seq[byte], SURBIdentifier]
     retiredIdentifiers: Table[SURBIdentifier, Moment]
     ttl: Duration
     maxCredentials: int
@@ -40,8 +45,43 @@ func retiredLen*(store: ReplyCredentialStore): int =
 
 proc wipeAndRemove(store: ReplyCredentialStore, identifier: SURBIdentifier) =
   store.credentials.withValue(identifier, stored):
+    store.encodedIdentifiers.del(stored.encodedSurb)
     stored.credential.wipe()
   store.credentials.del(identifier)
+
+proc nextExpiry*(store: ReplyCredentialStore): Opt[Moment] =
+  for stored in store.credentials.values:
+    if result.isNone or stored.expiresAt < result.get():
+      result = Opt.some(stored.expiresAt)
+
+proc holdingBudgetMillis*(
+    store: ReplyCredentialStore, encoded: seq[byte], now = Moment.now()
+): uint64 =
+  let id = store.encodedIdentifiers.getOrDefault(encoded)
+  store.credentials.withValue(id, stored):
+    if stored.dispatchBefore.isSome and now >= stored.dispatchBefore.get():
+      return 0
+    let remaining =
+      min(stored.holdTime, stored.expiresAt - now - stored.transitAllowance)
+    if remaining > ZeroDuration:
+      return uint64(remaining.milliseconds)
+  0
+
+proc setSurbBounds*(
+    store: ReplyCredentialStore,
+    identifier: SURBIdentifier,
+    built: SurbBuild,
+    encoded: seq[byte],
+) =
+  store.credentials.withValue(identifier, stored):
+    stored.encodedSurb = encoded
+    stored.dispatchBefore = built.dispatchBefore
+    # Two transit bounds cover delivery of the supply and the later reply.
+    stored.transitAllowance = built.replyTransitAllowance.get(2.minutes)
+    stored.holdTime = built.replyHoldTime.get(store.ttl)
+    if built.credentialsExpireAt.isSome:
+      stored.expiresAt = min(stored.expiresAt, built.credentialsExpireAt.get())
+    store.encodedIdentifiers[encoded] = identifier
 
 proc purgeExpired*(store: ReplyCredentialStore, now: Moment = Moment.now()): int =
   var
@@ -192,6 +232,7 @@ proc clear*(store: ReplyCredentialStore) =
   for stored in store.credentials.values:
     stored.credential.wipe()
   store.credentials.clear()
+  store.encodedIdentifiers.clear()
   store.retiredIdentifiers.clear()
 
 proc new*(
@@ -206,6 +247,7 @@ proc new*(
     "maximum retired reply identifiers must be positive"
   T(
     credentials: initTable[SURBIdentifier, StoredReplyCredential](),
+    encodedIdentifiers: initTable[seq[byte], SURBIdentifier](),
     retiredIdentifiers: initTable[SURBIdentifier, Moment](),
     ttl: ttl,
     maxCredentials: maxCredentials,

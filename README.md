@@ -265,3 +265,38 @@ make example
 
 If `nimble setup -l` reports that it cannot determine the VCS revision, make at
 least one Git commit first, then rerun the command.
+
+## Key rotation and reply inventory
+
+Transport frame version 4 adds a remaining holding time for every supplied reply
+block (SURB). Both endpoints must use version 4; version 3 frames are rejected.
+The canonical Mix SURB bytes and Mix packet format are unchanged.
+
+The initiator retains Mix's dispatch deadline and credential expiry. Before each
+send or retry it calculates a holding budget, capped by the remaining credential
+lifetime minus the configured allowance for supply and reply transit. The peer
+uses that duration on its own monotonic clock; no absolute clock values are sent.
+This relies on the same bounded record age and packet transit assumptions as Mix
+key rotation. A rotating node must use a relay pool that tracks record age.
+MixTransport rejects reply blocks from a rotating node when Mix cannot supply
+the dispatch and credential deadlines. A reply that exceeds the transit allowance
+can arrive after a relay has destroyed its key or the initiator has wiped its
+credential.
+
+The recipient removes expired blocks before taking a reply batch and during idle
+maintenance. Each removed block frees one supply slot. Sequence tracking survives
+expiry, so duplicates cannot revive a discarded block or return its slot twice.
+A retry whose path is no longer safe carries a zero holding budget: the receiver
+records the missing sequence and immediately frees the slot. This lets later
+supplies advance without using the old path.
+
+The existing status probe carries freshly built reply blocks, allowing an idle
+session with empty inventory to report its free slots. Replenishment still needs
+fresh relay records. Discovery must publish rotated records into the Mix node
+pool; Transport does not implement discovery. Unresponsive sessions retain the
+existing bounded status-probe shutdown behavior.
+
+Credentials are wiped on expiry, consumption, session removal and shutdown.
+Expiry is checked before lookup and send; background maintenance also runs while
+sessions are idle. A block taken from the queue retains its deadline until the
+actual send call, including between redundant copies.
