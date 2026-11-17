@@ -95,6 +95,8 @@ suite "MixTransport lifecycle":
 
     # The first transport acquires both Mix plug-in registrations.
     check waitFor(first.start()).isOk
+    check not first.expiryTask.isNil
+    check not first.expiryTask.finished
 
     # Starting an already started transport is idempotent.
     check waitFor(first.start()).isOk
@@ -103,7 +105,10 @@ suite "MixTransport lifecycle":
     check waitFor(second.start()).isErr
 
     # Stopping the owner releases both registrations for another transport.
+    let expiryTask = first.expiryTask
     waitFor(first.stop())
+    check expiryTask.finished
+    check first.expiryTask.isNil
     check waitFor(second.start()).isOk
 
     waitFor(second.stop())

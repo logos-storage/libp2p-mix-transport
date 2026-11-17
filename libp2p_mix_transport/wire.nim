@@ -17,7 +17,7 @@ type
 
 const
   MixTransportCodec* = "/libp2p/mix-transport/1.0.0"
-  MixTransportVersion* = 3'u32
+  MixTransportVersion* = 4'u32
   MaxCodecBytes* = 255
   MaxStreamRejectionReasonBytes* = 255
   ReceiveWindowChunks* = 256
@@ -102,6 +102,7 @@ type
     surbs* {.fieldNumber: 14.}: seq[seq[byte]]
     rejectionReason* {.fieldNumber: 15.}: Opt[string]
     finalSequence* {.fieldNumber: 16, fixed.}: Opt[SequenceNumber]
+    surbHoldMillis* {.fieldNumber: 17, fixed.}: seq[uint64]
 
 template require(condition: bool, message: string): untyped =
   if not condition:
@@ -127,6 +128,10 @@ proc validateFrame(
   require frame.rejectionReason.isNone or
     frame.rejectionReason.get().len <= MaxStreamRejectionReasonBytes,
     "stream rejection reason is too long"
+  require frame.surbHoldMillis.len == frame.surbs.len,
+    "every SURB needs a remaining holding budget"
+  for budget in frame.surbHoldMillis:
+    require budget <= 30'u64 * 60 * 1000, "SURB holding budget exceeds maximum"
   frame.surbs.validateSurbs(requireValidSurbEncoding).isOkOr:
     return err(error)
 

@@ -102,3 +102,30 @@ suite "Redundant SURB sends":
     waitFor checkCopies(FrameKind.Data, cancel = true)
   test "control copies remain sequential":
     waitFor checkCopies(FrameKind.Ack)
+
+  test "a control copy that expires while the first send waits is skipped":
+    proc run() {.async.} =
+      let transport = MixTransport()
+      let gate = newAsyncEvent()
+      var sends = 0
+      transport.surbSender = proc(
+          surb: sink SURB, payload: sink seq[byte]
+      ): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
+        inc sends
+        await gate.wait()
+        return ok()
+      let deadline = Moment.now() + 20.milliseconds
+      let sending = transport.sendWithSurbRedundancyBatch(
+        @[
+          TimedSurb(surb: SURB(), expiresAt: deadline),
+          TimedSurb(surb: SURB(), expiresAt: deadline),
+        ],
+        @[1.byte],
+      )
+      doAssert sends == 1
+      await sleepAsync(30.milliseconds)
+      gate.fire()
+      doAssert (await sending).isOk
+      doAssert sends == 1
+
+    waitFor run()

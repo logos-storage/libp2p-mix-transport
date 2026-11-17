@@ -9,9 +9,10 @@ import libp2p/[crypto/crypto, peerid]
 import
   libp2p_mix/
     [curve25519, delay, mix_message, padding, serialization, sphinx, tag_manager]
-from libp2p_mix import recoverReply
 import stew/endians2
 
+import libp2p_mix
+import libp2p_mix/key_rotation
 import libp2p_mix_transport/reply_credentials
 
 proc randomSessionId(rng: Rng): PeerId =
@@ -77,7 +78,11 @@ proc replyMessage(payload: seq[byte]): Message =
 suite "MixTransport reply credentials":
   test "removing a credential wipes it even while a caller holds its entry":
     type Removal = enum
-      Consume, RemoveSession, PurgeExpired, Clear
+      Consume
+      RemoveSession
+      PurgeExpired
+      Clear
+
     for removal in Removal:
       checkpoint $removal
       let
@@ -345,3 +350,101 @@ suite "MixTransport reply credentials":
       store.len == 1
       store.get(first.identifier).isNone
       store.get(second.identifier).isSome
+
+  test "rotation bounds shrink on retries and expired credentials cannot recover":
+    let rng = newRng()
+    var reply = createReply(rng)
+    let store = ReplyCredentialStore.new()
+    let now = Moment.now()
+    # A stable map key is sufficient here; the one-hop crypto fixture is not
+    # a canonical three-hop wire SURB.
+    let encoded = @[1.byte]
+    var credentials = [move(reply.credential)]
+    store.add(randomSessionId(rng), credentials, now).expect("credential")
+    let built = SurbBuild(
+      surb: reply.surb,
+      dispatchBefore: Opt.some(now + 5.seconds),
+      credentialsExpireAt: Opt.some(now + 3.seconds),
+      replyHoldTime: Opt.some(10.seconds),
+      replyTransitAllowance: Opt.some(200.milliseconds),
+    )
+    store.setSurbBounds(reply.identifier, built, encoded)
+    check store.holdingBudgetMillis(encoded, now) == 2800
+    check store.holdingBudgetMillis(encoded, now + 1.seconds) == 1800
+    check store.holdingBudgetMillis(encoded, now + 3.seconds) == 0
+    check store.get(reply.identifier, now + 3.seconds).isNone
+    check store.purgeExpired(now + 3.seconds) == 1
+    check store.holdingBudgetMillis(encoded, now) == 0
+    check store.recoverReply(reply.rawReply(replyMessage(@[42.byte]))).get().isNone
+
+  test "dispatch deadline rejects retransmission even while credential is retained":
+    let rng = newRng()
+    var reply = createReply(rng)
+    let store = ReplyCredentialStore.new()
+    let now = Moment.now()
+    # A stable map key is sufficient here; the one-hop crypto fixture is not
+    # a canonical three-hop wire SURB.
+    let encoded = @[1.byte]
+    var credentials = [move(reply.credential)]
+    store.add(randomSessionId(rng), credentials, now).expect("credential")
+    store.setSurbBounds(
+      reply.identifier,
+      SurbBuild(
+        surb: reply.surb,
+        dispatchBefore: Opt.some(now + 1.seconds),
+        credentialsExpireAt: Opt.some(now + 10.seconds),
+        replyHoldTime: Opt.some(5.seconds),
+        replyTransitAllowance: Opt.some(200.milliseconds),
+      ),
+      encoded,
+    )
+    check store.holdingBudgetMillis(encoded, now + 999.milliseconds) == 5000
+    check store.holdingBudgetMillis(encoded, now + 1.seconds) == 0
+    check store.get(reply.identifier, now + 1.seconds).isSome
+
+  test "a real SURB reply survives grace but cannot use a destroyed key":
+    let rng = newRng()
+    let config = KeyRotationConfig
+      .init(
+        rotationInterval = 1.seconds,
+        graceWindow = 3.seconds,
+        replacedRecordLifetime = ZeroDuration,
+        maxTransit = 100.milliseconds,
+      )
+      .expect("rotation config")
+    let ring = MixKeyRing.new(config, rng, replayTableCapacity = 1024)
+    defer:
+      waitFor ring.stop()
+    let now = Moment.now()
+    ring.update(now)
+    let oldKey = ring.candidates(now)[0]
+    var built = createSURB(
+      @[oldKey.publicKey],
+      @[NoDelay],
+      @[Hop.init(newSeq[byte](AddrSize))],
+      rng.generate(SURBIdentifier),
+      rng,
+    )
+    require built.isOk
+    let store = ReplyCredentialStore.new()
+    defer:
+      store.clear()
+    let id = built.get().credential.identifier
+    var credentials = [move(built.get().credential)]
+    store.add(randomSessionId(rng), credentials).expect("credential")
+    let packet = useSURB(built.get().surb, replyMessage(@[42.byte]))
+    ring.update(now + 1.seconds)
+    var matched = matchKey(packet, ring.candidates(now + 2.seconds)).expect("match")
+    check matched.status == KeyMatched
+    let processed = processSphinxPacket(packet, matched).expect("grace reply")
+    check processed.status == ProcessingStatus.Reply
+    let recovered = store
+      .recoverReply(
+        RawSurbReply(identifier: id, encryptedPayload: processed.delta_prime)
+      )
+      .expect("recover")
+      .expect("owned reply")
+    check recovered.payload == @[42.byte]
+    ring.update(now + 4.seconds)
+    check oldKey.isDestroyed
+    check matchKey(packet, ring.candidates(now + 4.seconds)).get().status == NoKeyMatched
