@@ -11,7 +11,7 @@ entryPoints = @[
 
 requires "nim >= 2.2.4"
 requires "libp2p == 2.4.1"
-requires "https://github.com/logos-co/nim-libp2p-mix.git#9bbb68c44520086b0214d5fcfb22dc038f76aca9"
+requires "https://github.com/logos-co/nim-libp2p-mix.git#541a2cef958c21d356b87722b9da2a25c1bcead0"
 requires "chronicles >= 0.11.0"
 requires "chronos >= 4.2.2"
 requires "protobuf_serialization >= 0.5.3"
