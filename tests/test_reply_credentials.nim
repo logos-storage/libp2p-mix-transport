@@ -9,6 +9,7 @@ import libp2p/[crypto/crypto, peerid]
 import
   libp2p_mix/
     [curve25519, delay, mix_message, padding, serialization, sphinx, tag_manager]
+from libp2p_mix import recoverReply
 import stew/endians2
 
 import libp2p_mix_transport/reply_credentials
@@ -74,6 +75,35 @@ proc replyMessage(payload: seq[byte]): Message =
   )
 
 suite "MixTransport reply credentials":
+  test "removing a credential wipes it even while a caller holds its entry":
+    type Removal = enum
+      Consume, RemoveSession, PurgeExpired, Clear
+    for removal in Removal:
+      checkpoint $removal
+      let
+        rng = newRng()
+        store = ReplyCredentialStore.new(ttl = 1.minutes)
+        sessionId = randomSessionId(rng)
+        createdAt = Moment.now()
+        payload = @[1'u8, 2, 3]
+      var reply = createReply(rng)
+      let raw = reply.rawReply(replyMessage(payload))
+      var credentials = [move(reply.credential)]
+      require store.add(sessionId, credentials, createdAt).isOk
+      let held = store.get(reply.identifier, createdAt).get()
+      require recoverReply(held.credential, raw).get() == payload
+
+      case removal
+      of Consume:
+        store.consume(reply.identifier, createdAt)
+      of RemoveSession:
+        check store.removeSession(sessionId) == 1
+      of PurgeExpired:
+        check store.purgeExpired(createdAt + 1.minutes) == 1
+      of Clear:
+        store.clear()
+      check recoverReply(held.credential, raw).isErr
+
   test "consuming one reply credential leaves other credentials active":
     var
       rng = newRng()

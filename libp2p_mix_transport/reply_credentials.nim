@@ -16,6 +16,7 @@ const
 
 type
   StoredReplyCredential* = ref object
+    ## References share one store-owned credential, which is wiped on removal.
     credential*: ReplyCredential
     sessionId*: PeerId
     expiresAt*: Moment
@@ -99,7 +100,8 @@ proc add*(
     credentials: var openArray[ReplyCredential],
     now: Moment = Moment.now(),
 ): Result[void, string] =
-  ## Transfer ownership only after validating the entire batch.
+  ## On success, moves each credential out of the caller's mutable array.
+  ## A rejected batch leaves the caller with ownership of every credential.
   if credentials.len == 0:
     return err("reply credentials must not be empty")
 
@@ -127,6 +129,8 @@ proc add*(
 proc get*(
     store: ReplyCredentialStore, identifier: SURBIdentifier, now: Moment = Moment.now()
 ): Opt[StoredReplyCredential] =
+  ## Returns a reference to the store's entry. Holding it does not extend the
+  ## credential's lifetime beyond removal from the store.
   store.credentials.withValue(identifier, stored):
     if stored.expiresAt > now:
       return Opt.some(stored[])
