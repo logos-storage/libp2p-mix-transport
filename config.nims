@@ -1,3 +1,4 @@
+switch("mm", "refc")
 switch("nimcache", "nimcache")
 switch("path", thisDir())
 

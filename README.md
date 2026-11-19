@@ -24,7 +24,7 @@ control-frame ordering, and cancellation checks.
 
 Both endpoints can open streams within an established session. For the recipient's anonymous-peer lookup and reverse stream-opening exchange, see [Recipient-originated streams](docs/recipient-streams.md).
 
-The project requires Nim 2.2.4 or newer, Nimble and Git. From a fresh clone:
+The project requires Nim 2.2.10 or newer, Nimble and Git. From a fresh clone:
 
 ```bash
 make setup NIMBLE_FLAGS="-y"
@@ -188,6 +188,7 @@ $$
 
 ## Local Files
 
+Standalone builds and tests use the `refc` memory manager.
 The repository uses `config.nims` to keep Nim build output in the local
 `nimcache/` directory and to include `nimble.paths` when it exists.
 
@@ -202,7 +203,7 @@ These files and directories are local artifacts and should not be committed:
 
 ## Dependency Cache Troubleshooting
 
-The Mix dependency is pinned to commit `863569fad40835608af2538db10d1ca79e850212` from the under-review [Mix PR #47](https://github.com/logos-co/nim-libp2p-mix/pull/47). This is a temporary prerelease pin; `libp2p` remains pinned to `2.4.1`. If dependency resolution appears stale after changing the pin, inspect Nimble's global `pkgcache` as well as the project-local `nimbledeps/` directory.
+The Mix dependency is pinned to commit `b8ae1569ebc39cd2147956a2f717a5952357d7e4` from the under-review [Mix PR #47](https://github.com/logos-co/nim-libp2p-mix/pull/47). This is a temporary prerelease pin; `libp2p` remains pinned to `2.4.1`. If dependency resolution appears stale after changing the pin, inspect Nimble's global `pkgcache` as well as the project-local `nimbledeps/` directory.
 
 First inspect the cached Mix checkouts:
 

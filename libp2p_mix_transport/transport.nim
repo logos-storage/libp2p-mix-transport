@@ -69,7 +69,7 @@ type
 
 type PreparedReplySurbs = object
   encoded: seq[seq[byte]]
-  credentials: seq[ReplyCredential]
+  identifiers: seq[SURBIdentifier]
 
 proc handleData(self: MixTransport, frame: MixTransportFrame) {.gcsafe, raises: [].}
 proc handleAcknowledgement(
@@ -928,24 +928,35 @@ proc createReplySurbs(
   let mixDestination = MixDestination.exitNode(destination)
   var prepared = PreparedReplySurbs(
     encoded: newSeqOfCap[seq[byte]](count),
-    credentials: newSeqOfCap[ReplyCredential](count),
+    identifiers: newSeqOfCap[SURBIdentifier](count),
   )
 
+  var credentials = newSeqOfCap[ReplyCredential](count)
+  defer:
+    for credential in credentials.mitems:
+      credential.wipe()
   for _ in 0 ..< count:
-    var created = self.mix.createSurb(mixDestination).valueOr:
-      return err("could not create SURB: " & error)
-    prepared.encoded.add(created.surb.serializeSurb())
-    prepared.credentials.add(created.credential)
+    var created = self.mix.createSurb(mixDestination)
+    if created.isErr:
+      return err("could not create SURB: " & created.error)
+    defer:
+      created.get().credential.wipe()
+    let encoded = created.get().surb.serializeSurb().valueOr:
+        return err("could not serialize SURB: " & error)
+    prepared.encoded.add(encoded)
+    prepared.identifiers.add(created.get().credential.identifier)
+    credentials.add(move(created.get().credential))
 
-  self.replyCredentials.add(sessionId, prepared.credentials).isOkOr:
+  self.replyCredentials.add(sessionId, credentials).isOkOr:
     return err("could not register reply credentials: " & error)
 
   ok(prepared)
 
 proc retireReplyCredentials(
-    self: MixTransport, credentials: openArray[ReplyCredential]
+    self: MixTransport, identifiers: openArray[SURBIdentifier]
 ) =
-  self.replyCredentials.consume(credentials)
+  for identifier in identifiers:
+    self.replyCredentials.consume(identifier)
 
 proc sendSurbSupply(
     self: MixTransport,
@@ -976,13 +987,8 @@ proc createAndSendSurbSupply(
   let prepared = self.createReplySurbs(destination, session.sessionId, count).valueOr:
     debug "Could not create SURB supply", sessionId = session.sessionId, error
     return false
-  var credentialIdentifiers = newSeqOfCap[SURBIdentifier](prepared.credentials.len)
-  for credential in prepared.credentials:
-    credentialIdentifiers.add(credential.identifier)
-  let firstSequence = session.registerSurbSupply(
-    prepared.encoded, credentialIdentifiers
-  ).valueOr:
-    self.retireReplyCredentials(prepared.credentials)
+  let firstSequence = session.registerSurbSupply(prepared.encoded, prepared.identifiers).valueOr:
+    self.retireReplyCredentials(prepared.identifiers)
     debug "Could not register SURB supply", sessionId = session.sessionId, error
     return false
   await self.sendSurbSupply(session, firstSequence, prepared.encoded)
@@ -1014,7 +1020,7 @@ proc sendSurbStatusProbe(
     surbs: prepared.encoded,
   )
   (await self.sendStreamFrame(session, probe)).isOkOr:
-    self.retireReplyCredentials(prepared.credentials)
+    self.retireReplyCredentials(prepared.identifiers)
     return
 
 proc runSurbSupplier(
@@ -1114,12 +1120,11 @@ proc createConnectFrame(
 
   let suppliedCount = surbCount - DefaultReplySurbRedundancy
   if suppliedCount > 0:
-    var credentialIdentifiers = newSeqOfCap[SURBIdentifier](suppliedCount)
-    for index in DefaultReplySurbRedundancy ..< prepared.credentials.len:
-      credentialIdentifiers.add(prepared.credentials[index].identifier)
     let firstSequence = session.registerInitialSurbSupply(
       prepared.encoded.toOpenArray(DefaultReplySurbRedundancy, prepared.encoded.high),
-      credentialIdentifiers,
+      prepared.identifiers.toOpenArray(
+        DefaultReplySurbRedundancy, prepared.identifiers.high
+      ),
     ).valueOr:
       return err("could not register initial SURB supply: " & error)
     frame.firstSurbSequence = Opt.some(firstSequence)
@@ -1284,17 +1289,16 @@ proc sendOpenStream(
   var keepReplyCredentials = false
   defer:
     if not keepReplyCredentials:
-      self.retireReplyCredentials(prepared.credentials)
+      self.retireReplyCredentials(prepared.identifiers)
       firstSupplySequence.withValue(sequence):
         session.removePendingSurbSupply(sequence, suppliedCount)
 
   if suppliedCount > 0:
-    var credentialIdentifiers = newSeqOfCap[SURBIdentifier](suppliedCount)
-    for index in DefaultReplySurbRedundancy ..< prepared.credentials.len:
-      credentialIdentifiers.add(prepared.credentials[index].identifier)
     let firstSequence = session.registerSurbSupply(
       prepared.encoded.toOpenArray(DefaultReplySurbRedundancy, prepared.encoded.high),
-      credentialIdentifiers,
+      prepared.identifiers.toOpenArray(
+        DefaultReplySurbRedundancy, prepared.identifiers.high
+      ),
     ).valueOr:
       return err("could not register OpenStream SURB supply: " & error)
     firstSupplySequence = Opt.some(firstSequence)

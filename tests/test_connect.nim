@@ -607,7 +607,11 @@ suite "MixTransport session and stream handshakes":
       sessionId: session.sessionId,
       kind: FrameKind.SurbSupply,
       firstSurbSequence: Opt.some(SurbSupplySequence(0)),
-      surbs: @[testSurb(1).serializeSurb(), @[0'u8], testSurb(2).serializeSurb()],
+      surbs: @[
+        testSurb(1).serializeSurb().expect("valid test SURB"),
+        @[0'u8],
+        testSurb(2).serializeSurb().expect("valid test SURB"),
+      ],
     )
 
     # Invoke the same delivery callback that Mix uses for proactive supply.

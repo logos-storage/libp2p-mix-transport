@@ -197,16 +197,16 @@ suite "MixTransport wire format":
   test "each SURB uses the canonical Mix serialization boundary":
     let
       original = @[testSurb(1), testSurb(2)]
-      firstEncoded = original[0].serializeSurb()
-      secondEncoded = original[1].serializeSurb()
+      firstEncoded = original[0].serializeSurb().expect("valid test SURB")
+      secondEncoded = original[1].serializeSurb().expect("valid test SURB")
       firstDecoded =
         firstEncoded.deserializeSurb().expect("could not decode first SURB")
       secondDecoded =
         secondEncoded.deserializeSurb().expect("could not decode second SURB")
 
     check:
-      firstDecoded.serializeSurb() == firstEncoded
-      secondDecoded.serializeSurb() == secondEncoded
+      firstDecoded.serializeSurb().expect("valid test SURB") == firstEncoded
+      secondDecoded.serializeSurb().expect("valid test SURB") == secondEncoded
       @[0'u8].deserializeSurb().isErr
 
   test "frame fields must agree with their declared kind - e.g. ConnectAck should not include payload":

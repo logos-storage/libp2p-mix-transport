@@ -17,25 +17,32 @@ proc randomSessionId(rng: Rng): PeerId =
   PeerId.random(rng).expect("could not generate session identifier")
 
 type TestReply = object
+  identifier: SURBIdentifier
   surb: SURB
   credential: ReplyCredential
   privateKey: FieldElement
 
-proc createReply(rng: Rng): TestReply =
+proc createReply(rng: Rng, identifier: SURBIdentifier): TestReply =
   # The original sender's Mix key pair. The return path ends at this node.
   let (privateKey, publicKey) =
     generateKeyPair().expect("could not generate Mix key pair")
-  var identifier: SURBIdentifier
-  rng.generate(identifier)
 
   # MixProtocol.createSurb normally creates this one-time public SURB and its
   # private credential on the original sender. A one-hop path keeps the test
   # focused: the recipient sends directly back to the original sender.
-  let created = createSURB(
-      @[publicKey], @[NoDelay], @[Hop.init(newSeq[byte](AddrSize))], identifier, rng
-    )
-    .expect("could not create test SURB")
-  TestReply(surb: created.surb, credential: created.credential, privateKey: privateKey)
+  var created = createSURB(
+    @[publicKey], @[NoDelay], @[Hop.init(newSeq[byte](AddrSize))], identifier, rng
+  )
+  doAssert created.isOk
+  TestReply(
+    identifier: identifier,
+    surb: created.get().surb,
+    credential: move(created.get().credential),
+    privateKey: privateKey,
+  )
+
+proc createReply(rng: Rng): TestReply =
+  createReply(rng, rng.generate(SURBIdentifier))
 
 proc rawReply(testReply: TestReply, message: Message): RawSurbReply =
   # The recipient normally calls MixProtocol.sendWithSurb, which builds this
@@ -56,7 +63,7 @@ proc rawReply(testReply: TestReply, message: Message): RawSurbReply =
   # This is the RawSurbReply that Mix normally offers to MixTransport's
   # registered raw reply handler on the original sender.
   RawSurbReply(
-    identifier: testReply.credential.identifier, encryptedPayload: processed.delta_prime
+    identifier: testReply.identifier, encryptedPayload: processed.delta_prime
   )
 
 proc replyMessage(payload: seq[byte]): Message =
@@ -68,14 +75,15 @@ proc replyMessage(payload: seq[byte]): Message =
 
 suite "MixTransport reply credentials":
   test "consuming one reply credential leaves other credentials active":
-    let
+    var
       rng = newRng()
       store = ReplyCredentialStore.new()
-      first = createReply(rng).credential
-      second = createReply(rng).credential
+      first = createReply(rng)
+      second = createReply(rng)
       sessionId = randomSessionId(rng)
 
-    store.add(sessionId, [first, second]).expect("could not add reply credentials")
+    var credentials = [move(first.credential), move(second.credential)]
+    store.add(sessionId, credentials).expect("could not add reply credentials")
 
     # Supplying SURBs registers their credentials independently. A redundancy
     # batch is formed later by the recipient and is unknown to this store.
@@ -84,7 +92,7 @@ suite "MixTransport reply credentials":
       store.get(first.identifier).isSome
       store.get(second.identifier).isSome
 
-    store.consume(first)
+    store.consume(first.identifier)
 
     check:
       store.len == 1
@@ -96,27 +104,31 @@ suite "MixTransport reply credentials":
 
     # Reusing an identifier while its tombstone is active would cause the raw
     # reply handler to mistake a new reply for a repeated one.
-    check store.add(randomSessionId(rng), [first]).isErr
+    var duplicate = createReply(rng, first.identifier)
+    var duplicateCredentials = [move(duplicate.credential)]
+    check store.add(randomSessionId(rng), duplicateCredentials).isErr
 
     # Consuming the same credential again is harmless and does not affect an
     # independently registered credential.
-    store.consume(first)
+    store.consume(first.identifier)
     check:
       store.len == 1
       store.retiredLen == 1
       store.get(second.identifier).isSome
 
   test "capacity rejects new credentials without evicting active credentials":
-    let
+    var
       rng = newRng()
       store = ReplyCredentialStore.new(maxCredentials = 2)
       sessionId = randomSessionId(rng)
-      first = createReply(rng).credential
-      second = createReply(rng).credential
-      rejected = createReply(rng).credential
+      first = createReply(rng)
+      second = createReply(rng)
+      rejected = createReply(rng)
 
-    check store.add(sessionId, [first, second]).isOk
-    check store.add(sessionId, [rejected]).isErr
+    var credentials = [move(first.credential), move(second.credential)]
+    check store.add(sessionId, credentials).isOk
+    var rejectedCredentials = [move(rejected.credential)]
+    check store.add(sessionId, rejectedCredentials).isErr
     check:
       store.len == 2
       store.get(first.identifier).isSome
@@ -124,18 +136,20 @@ suite "MixTransport reply credentials":
       store.get(rejected.identifier).isNone
 
   test "removing one session preserves credentials owned by another session":
-    let
+    var
       rng = newRng()
       store = ReplyCredentialStore.new()
       removedSessionId = randomSessionId(rng)
       retainedSessionId = randomSessionId(rng)
-      removed = createReply(rng).credential
-      retained = createReply(rng).credential
+      removed = createReply(rng)
+      retained = createReply(rng)
 
-    store.add(removedSessionId, [removed]).expect(
+    var removedCredentials = [move(removed.credential)]
+    store.add(removedSessionId, removedCredentials).expect(
       "could not add credentials for removed session"
     )
-    store.add(retainedSessionId, [retained]).expect(
+    var retainedCredentials = [move(retained.credential)]
+    store.add(retainedSessionId, retainedCredentials).expect(
       "could not add credentials for retained session"
     )
 
@@ -148,18 +162,20 @@ suite "MixTransport reply credentials":
       store.len == 1
 
   test "retired reply identifiers expire and remain bounded":
-    let
+    var
       rng = newRng()
       store = ReplyCredentialStore.new(ttl = 1.seconds, maxRetiredIdentifiers = 1)
-      first = createReply(rng).credential
-      second = createReply(rng).credential
+      first = createReply(rng)
+      second = createReply(rng)
       createdAt = Moment.now()
       sessionId = randomSessionId(rng)
 
-    store.add(sessionId, [first, second], createdAt).expect(
+    var credentials = [move(first.credential), move(second.credential)]
+    store.add(sessionId, credentials, createdAt).expect(
       "could not add reply credentials"
     )
-    store.consume([first, second], createdAt)
+    store.consume(first.identifier, createdAt)
+    store.consume(second.identifier, createdAt)
 
     # The bound keeps only one tombstone. Which identifier remains depends on
     # hash-table iteration order, but either retained entry still suppresses a
@@ -180,13 +196,14 @@ suite "MixTransport reply credentials":
       store.retiredLen == 0
 
   test "expired credentials are invisible before they are purged":
-    let
+    var
       rng = newRng()
       store = ReplyCredentialStore.new(ttl = 1.seconds)
-      credential = createReply(rng).credential
+      credential = createReply(rng)
       createdAt = Moment.now()
 
-    store.add(randomSessionId(rng), [credential], createdAt).expect(
+    var credentials = [move(credential.credential)]
+    store.add(randomSessionId(rng), credentials, createdAt).expect(
       "could not add reply credential"
     )
 
@@ -198,7 +215,7 @@ suite "MixTransport reply credentials":
       store.len == 0
 
   test "an unknown reply remains available to the embedded Mix path":
-    let
+    var
       rng = newRng()
       store = ReplyCredentialStore.new()
       unknown = createReply(rng)
@@ -213,7 +230,7 @@ suite "MixTransport reply credentials":
       store.len == 0
 
   test "each valid redundant reply consumes only its matching credential":
-    let
+    var
       rng = newRng()
       store = ReplyCredentialStore.new()
       sessionId = randomSessionId(rng)
@@ -221,9 +238,8 @@ suite "MixTransport reply credentials":
       second = createReply(rng)
       payload = @[1'u8, 2, 3]
 
-    store.add(sessionId, [first.credential, second.credential]).expect(
-      "could not add reply credentials"
-    )
+    var credentials = [move(first.credential), move(second.credential)]
+    store.add(sessionId, credentials).expect("could not add reply credentials")
 
     # The recipient replies through the first public SURB. The original
     # sender recovers the payload with its matching private credential.
@@ -236,8 +252,8 @@ suite "MixTransport reply credentials":
       recovered.sessionId == sessionId
       recovered.payload == payload
       store.len == 1
-      store.get(first.credential.identifier).isNone
-      store.get(second.credential.identifier).isSome
+      store.get(first.identifier).isNone
+      store.get(second.identifier).isSome
 
     # Transport frame semantics suppress the second logical delivery after it
     # is recovered. The credential store still processes each SURB separately.
@@ -250,20 +266,18 @@ suite "MixTransport reply credentials":
       store.len == 0
 
   test "invalid Sphinx recovery keeps the matching credential available":
-    let
+    var
       rng = newRng()
       store = ReplyCredentialStore.new()
       sessionId = randomSessionId(rng)
       first = createReply(rng)
       second = createReply(rng)
 
-    store.add(sessionId, [first.credential, second.credential]).expect(
-      "could not add reply credentials"
-    )
+    var credentials = [move(first.credential), move(second.credential)]
+    store.add(sessionId, credentials).expect("could not add reply credentials")
 
     let invalid = RawSurbReply(
-      identifier: first.credential.identifier,
-      encryptedPayload: newSeq[byte](PayloadSize),
+      identifier: first.identifier, encryptedPayload: newSeq[byte](PayloadSize)
     )
 
     # Cryptographic recovery failed before decoding payload.
@@ -271,20 +285,24 @@ suite "MixTransport reply credentials":
     # may be valid. The other credential remains independent as well.
     check store.recoverReply(invalid).isErr
     check:
-      store.get(first.credential.identifier).isSome
-      store.get(second.credential.identifier).isSome
+      store.get(first.identifier).isSome
+      store.get(second.identifier).isSome
+
+    let payload = @[42.byte]
+    let recovered =
+      store.recoverReply(first.rawReply(replyMessage(payload))).get().get()
+    check recovered.payload == payload
 
   test "an invalid Mix payload consumes only the matching credential":
-    let
+    var
       rng = newRng()
       store = ReplyCredentialStore.new()
       sessionId = randomSessionId(rng)
       first = createReply(rng)
       second = createReply(rng)
 
-    store.add(sessionId, [first.credential, second.credential]).expect(
-      "could not add reply credentials"
-    )
+    var credentials = [move(first.credential), move(second.credential)]
+    store.add(sessionId, credentials).expect("could not add reply credentials")
 
     let invalidMessage = @(uint16(DataSize + 1).toBytesBE()) & newSeq[byte](DataSize)
 
@@ -295,5 +313,5 @@ suite "MixTransport reply credentials":
     check store.recoverReply(first.rawReply(invalidMessage)).isErr
     check:
       store.len == 1
-      store.get(first.credential.identifier).isNone
-      store.get(second.credential.identifier).isSome
+      store.get(first.identifier).isNone
+      store.get(second.identifier).isSome
