@@ -15,7 +15,8 @@ const
   DefaultMaxRetiredReplyIdentifiers* = 100_000
 
 type
-  StoredReplyCredential* = object
+  StoredReplyCredential* = ref object
+    ## References share one store-owned credential, which is wiped on removal.
     credential*: ReplyCredential
     sessionId*: PeerId
     expiresAt*: Moment
@@ -37,6 +38,11 @@ func len*(store: ReplyCredentialStore): int =
 func retiredLen*(store: ReplyCredentialStore): int =
   store.retiredIdentifiers.len
 
+proc wipeAndRemove(store: ReplyCredentialStore, identifier: SURBIdentifier) =
+  store.credentials.withValue(identifier, stored):
+    stored.credential.wipe()
+  store.credentials.del(identifier)
+
 proc purgeExpired*(store: ReplyCredentialStore, now: Moment = Moment.now()): int =
   var
     expiredCredentials: seq[SURBIdentifier]
@@ -49,7 +55,7 @@ proc purgeExpired*(store: ReplyCredentialStore, now: Moment = Moment.now()): int
       expiredRetiredIdentifiers.add(identifier)
 
   for identifier in expiredCredentials:
-    store.credentials.del(identifier)
+    store.wipeAndRemove(identifier)
   for identifier in expiredRetiredIdentifiers:
     store.retiredIdentifiers.del(identifier)
   expiredCredentials.len + expiredRetiredIdentifiers.len
@@ -91,9 +97,11 @@ func isRetiredIdentifier*(
 proc add*(
     store: ReplyCredentialStore,
     sessionId: PeerId,
-    credentials: openArray[ReplyCredential],
+    credentials: var openArray[ReplyCredential],
     now: Moment = Moment.now(),
 ): Result[void, string] =
+  ## On success, moves each credential out of the caller's mutable array.
+  ## A rejected batch leaves the caller with ownership of every credential.
   if credentials.len == 0:
     return err("reply credentials must not be empty")
 
@@ -111,15 +119,18 @@ proc add*(
       return err("reply credential identifier is already registered")
     identifiers.incl(identifier)
 
-  for credential in credentials:
-    store.credentials[credential.identifier] = StoredReplyCredential(
-      credential: credential, sessionId: sessionId, expiresAt: now + store.ttl
+  for credential in credentials.mitems:
+    let identifier = credential.identifier
+    store.credentials[identifier] = StoredReplyCredential(
+      credential: move(credential), sessionId: sessionId, expiresAt: now + store.ttl
     )
   ok()
 
 proc get*(
     store: ReplyCredentialStore, identifier: SURBIdentifier, now: Moment = Moment.now()
 ): Opt[StoredReplyCredential] =
+  ## Returns a reference to the store's entry. Holding it does not extend the
+  ## credential's lifetime beyond removal from the store.
   store.credentials.withValue(identifier, stored):
     if stored.expiresAt > now:
       return Opt.some(stored[])
@@ -133,7 +144,7 @@ proc consume*(
     return
 
   let expiresAt = store.credentials.getOrDefault(identifier).expiresAt
-  store.credentials.del(identifier)
+  store.wipeAndRemove(identifier)
   store.rememberRetiredIdentifier(identifier, expiresAt, now)
 
 proc consume*(
@@ -159,7 +170,7 @@ proc removeSession*(store: ReplyCredentialStore, sessionId: PeerId): int =
       removed.add((identifier, stored.expiresAt))
 
   for (identifier, expiresAt) in removed:
-    store.credentials.del(identifier)
+    store.wipeAndRemove(identifier)
     store.rememberRetiredIdentifier(identifier, expiresAt, now)
   removed.len
 
@@ -178,6 +189,8 @@ proc recoverReply*(
   ok(Opt.some(RecoveredReply(sessionId: stored.sessionId, payload: payload)))
 
 proc clear*(store: ReplyCredentialStore) =
+  for stored in store.credentials.values:
+    stored.credential.wipe()
   store.credentials.clear()
   store.retiredIdentifiers.clear()
 

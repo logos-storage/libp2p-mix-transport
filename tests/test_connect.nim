@@ -19,6 +19,7 @@ import
     utils/opt,
   ]
 import libp2p_mix
+from libp2p_mix/key_rotation import update, stop
 import libp2p_mix/pool
 import libp2p_mix/delay_strategy
 import libp2p_mix/serialization
@@ -26,7 +27,7 @@ import libp2p_mix/curve25519
 import protobuf_serialization
 
 import libp2p_mix_transport
-import libp2p_mix_transport/connect_attempts
+import libp2p_mix_transport/[connect_attempts, reply_credentials]
 import libp2p_mix_transport/transport {.all.}
 
 import ./logging
@@ -34,7 +35,7 @@ import ./logging
 privateAccess(MixProtocol)
 privateAccess(MixTransport)
 
-proc createMixNodes(count: int): seq[MixProtocol] =
+proc createMixNodes(count: int, initiatorRing = Opt.none(MixKeyRing)): seq[MixProtocol] =
   # Every node is a normal Mix relay. The first and last nodes will also run
   # MixTransport, while the middle nodes provide independent forward and
   # return paths for the actual handshake.
@@ -42,7 +43,7 @@ proc createMixNodes(count: int): seq[MixProtocol] =
     rng = newRng()
     nodeInfos = MixNodeInfo.generateRandomMany(count, rng)
 
-  for nodeInfo in nodeInfos:
+  for i, nodeInfo in nodeInfos:
     let
       privateKey = PrivateKey(scheme: Secp256k1, skkey: nodeInfo.libp2pPrivKey)
       switch = SwitchBuilder
@@ -57,6 +58,7 @@ proc createMixNodes(count: int): seq[MixProtocol] =
       mix = MixProtocol.new(
         nodeInfo,
         switch,
+        keyRing = (if i == 0: initiatorRing else: Opt.none(MixKeyRing)),
         # Cryptographic routing remains real, but deterministic zero delays
         # keep this transport test focused on delivery rather than timing.
         delayStrategy = Opt.some(DelayStrategy(NoSamplingDelayStrategy.new(rng))),
@@ -406,6 +408,36 @@ proc establishSessionAndStream(
   )
 
 suite "MixTransport session and stream handshakes":
+  test "reply SURBs with key rotation are rejected with or without path deadlines":
+    let
+      ring = MixKeyRing.new(KeyRotationConfig.init().get(), newRng(), 16)
+      nodes = createMixNodes(5, Opt.some(ring))
+      mix = nodes[0]
+      transport = newMixTransport(mix)
+      destination = nodes[^1].switch.peerInfo.peerId
+    ring.update()
+    defer:
+      waitFor ring.stop()
+
+    for hasDeadlines in [true, false]:
+      if not hasDeadlines:
+        # Keep the same path records, but use a pool without record aging.
+        mix.nodePool = MixNodePool.new(mix.switch.peerStore)
+      var built = mix.createSurb(MixDestination.exitNode(destination))
+      require built.isOk
+      defer:
+        built.get().credential.wipe()
+      check:
+        built.get().dispatchBefore.isSome == hasDeadlines
+        built.get().credentialsExpireAt.isSome == hasDeadlines
+        built.get().replyHoldTime.isSome
+        built.get().replyTransitAllowance.isSome
+      let prepared = transport.createReplySurbs(destination, destination, 1)
+      require prepared.isErr
+      check:
+        prepared.error == "Mix key rotation is not supported by this MixTransport version"
+        transport.replyCredentials.len == 0
+
   test "recipient reuses its anonymous session and opens bidirectional streams":
     proc run() {.async.} =
       let
@@ -607,7 +639,11 @@ suite "MixTransport session and stream handshakes":
       sessionId: session.sessionId,
       kind: FrameKind.SurbSupply,
       firstSurbSequence: Opt.some(SurbSupplySequence(0)),
-      surbs: @[testSurb(1).serializeSurb(), @[0'u8], testSurb(2).serializeSurb()],
+      surbs: @[
+        testSurb(1).serializeSurb().expect("valid test SURB"),
+        @[0'u8],
+        testSurb(2).serializeSurb().expect("valid test SURB"),
+      ],
     )
 
     # Invoke the same delivery callback that Mix uses for proactive supply.

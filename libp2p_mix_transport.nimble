@@ -9,9 +9,9 @@ entryPoints = @[
   "examples/mix_ping_quic.nim",
 ]
 
-requires "nim >= 2.2.4"
-requires "libp2p == 2.4.1"
-requires "https://github.com/logos-co/nim-libp2p-mix.git#863569fad40835608af2538db10d1ca79e850212"
+requires "nim >= 2.2.10"
+requires "libp2p >= 2.4.0"
+requires "https://github.com/logos-co/nim-libp2p-mix.git#c4ea3f72afd5be3551bbfbeebb719437d40dc6f0"
 requires "chronicles >= 0.11.0"
 requires "chronos >= 4.2.2"
 requires "protobuf_serialization >= 0.5.3"
