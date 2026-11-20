@@ -46,6 +46,10 @@ type
     acknowledgementBitmap*: seq[byte]
     supplyLimit*: SurbSupplySequence
 
+  TimedSurb* = object
+    surb*: SURB
+    expiresAt*: Moment
+
   PendingSurbSupply = object
     encodedSurb: seq[byte]
     credentialIdentifier: SURBIdentifier
@@ -59,7 +63,7 @@ type
     established: AsyncEvent
     closedEvent: AsyncEvent
     remoteDisconnectRequested: bool
-    receivedSurbs: Deque[SURB]
+    receivedSurbs: Deque[TimedSurb]
     recipientSurbCapacity: int
     surbSupplyInitialized: bool
     surbSupplyReceiveBase: SurbSupplySequence
@@ -98,7 +102,31 @@ func role*(session: TransportSession): SessionRole =
 func state*(session: TransportSession): SessionState =
   session.state
 
-func receivedSurbCount*(session: TransportSession): int =
+proc purgeExpiredSurbs*(session: TransportSession, now = Moment.now()): int =
+  var kept = initDeque[TimedSurb]()
+  while session.receivedSurbs.len > 0:
+    var entry = session.receivedSurbs.popFirst()
+    if entry.expiresAt <= now:
+      inc result
+    else:
+      kept.addLast(move(entry))
+  session.receivedSurbs = move(kept)
+  if result > 0:
+    if session.surbSupplyInitialized:
+      # Never reuse sequence numbers if the credit counter is exhausted.
+      session.surbSupplyLimit +=
+        SurbSupplySequence(
+          min(uint64(result), uint64(SurbSupplySequence.high - session.surbSupplyLimit))
+        )
+    session.replyCapacityStateChanged.fire()
+
+proc nextInventoryExpiry*(session: TransportSession): Opt[Moment] =
+  for entry in session.receivedSurbs.items:
+    if result.isNone or entry.expiresAt < result.get():
+      result = Opt.some(entry.expiresAt)
+
+proc receivedSurbCount*(session: TransportSession): int =
+  discard session.purgeExpiredSurbs()
   session.receivedSurbs.len
 
 func recipientSurbCapacity*(session: TransportSession): int =
@@ -157,7 +185,7 @@ proc addInitiatorSession*(
     state: SessionState.Pending,
     established: newAsyncEvent(),
     closedEvent: newAsyncEvent(),
-    receivedSurbs: initDeque[SURB](),
+    receivedSurbs: initDeque[TimedSurb](),
     recipientSurbCapacity: store.recipientSurbCapacity,
     surbSupplyAcknowledgementBitmap: newSeq[byte](SurbSupplyAckBitmapBytes),
     replyCapacityStateChanged: newAsyncEvent(),
@@ -189,7 +217,7 @@ proc addRecipientSession*(
     state: SessionState.Pending,
     established: newAsyncEvent(),
     closedEvent: newAsyncEvent(),
-    receivedSurbs: initDeque[SURB](),
+    receivedSurbs: initDeque[TimedSurb](),
     recipientSurbCapacity: store.recipientSurbCapacity,
     surbSupplyAcknowledgementBitmap: newSeq[byte](SurbSupplyAckBitmapBytes),
     replyCapacityStateChanged: newAsyncEvent(),
@@ -235,14 +263,17 @@ proc addReceivedSurbs*(
     return err("recipient SURB capacity would be exceeded")
 
   for surb in surbs.mitems:
-    session.receivedSurbs.addLast(move(surb))
+    session.receivedSurbs.addLast(
+      TimedSurb(surb: move(surb), expiresAt: Moment.now() + 30.minutes)
+    )
   if surbs.len > 0:
     session.replyCapacityStateChanged.fire()
   ok()
 
 proc takeReceivedSurbs*(
     session: TransportSession, count: int
-): Result[seq[SURB], string] =
+): Result[seq[TimedSurb], string] =
+  discard session.purgeExpiredSurbs()
   if count <= 0:
     return err("SURB count must be positive")
   if session.receivedSurbs.len < count:
@@ -251,7 +282,7 @@ proc takeReceivedSurbs*(
       uint64(session.surbSupplyLimit) + uint64(count) > uint64(SurbSupplySequence.high):
     return err("SURB supply credit space is exhausted")
 
-  var surbs = newSeqOfCap[SURB](count)
+  var surbs = newSeqOfCap[TimedSurb](count)
   for _ in 0 ..< count:
     surbs.add(session.receivedSurbs.popFirst())
   if session.surbSupplyInitialized:
@@ -291,6 +322,7 @@ proc initializeSurbSupply*(session: TransportSession): Result[void, string] =
   ok()
 
 proc surbSupplySnapshot*(session: TransportSession): SurbSupplySnapshot =
+  discard session.purgeExpiredSurbs()
   doAssert session.role == SessionRole.Recipient
   doAssert session.surbSupplyInitialized
   SurbSupplySnapshot(
@@ -300,11 +332,15 @@ proc surbSupplySnapshot*(session: TransportSession): SurbSupplySnapshot =
   )
 
 proc acceptSurbSupply*(
-    session: TransportSession, sequence: SurbSupplySequence, surb: sink SURB
+    session: TransportSession,
+    sequence: SurbSupplySequence,
+    surb: sink SURB,
+    expiresAt: Moment = Moment.now() + 30.minutes,
 ): SurbSupplyDisposition =
   doAssert session.role == SessionRole.Recipient
   doAssert session.surbSupplyInitialized
 
+  discard session.purgeExpiredSurbs()
   if sequence < session.surbSupplyReceiveBase:
     return SurbSupplyDisposition.Duplicate
   if sequence >= session.surbSupplyLimit:
@@ -318,12 +354,13 @@ proc acceptSurbSupply*(
   if session.receivedSurbs.len >= session.recipientSurbCapacity:
     return SurbSupplyDisposition.AtCapacity
 
-  session.receivedSurbs.addLast(move(surb))
+  session.receivedSurbs.addLast(TimedSurb(surb: move(surb), expiresAt: expiresAt))
   session.surbSupplyAcknowledgementBitmap.setBitmapBit(offset)
   while session.surbSupplyAcknowledgementBitmap.bitmapContains(0):
     doAssert session.surbSupplyReceiveBase < SurbSupplySequence.high
     session.shiftSupplyBitmap()
     inc session.surbSupplyReceiveBase
+  discard session.purgeExpiredSurbs()
   session.replyCapacityStateChanged.fire()
   SurbSupplyDisposition.Accepted
 
@@ -746,3 +783,7 @@ proc newSessionStore*(
   )
 
 {.pop.}
+
+proc activeSessions*(store: SessionStore): seq[TransportSession] =
+  for session in store.bySessionId.values:
+    result.add(session)

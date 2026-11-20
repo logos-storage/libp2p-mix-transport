@@ -492,3 +492,31 @@ suite "MixTransport sessions":
     check:
       session.state == SessionState.Closed
       waitingForEstablishment.finished
+
+  test "expired inventory frees each slot once and duplicates cannot revive it":
+    let session = establishedSession(SessionRole.Recipient)
+    session.initializeSurbSupply().expect("supply")
+    let initial = session.surbSupplySnapshot().supplyLimit
+    let deadline = Moment.now() + 1.seconds
+    check session.acceptSurbSupply(0, SURB(), deadline) == SurbSupplyDisposition.Accepted
+    check session.purgeExpiredSurbs(deadline - 1.nanoseconds) == 0
+    check session.purgeExpiredSurbs(deadline) == 1
+    check session.surbSupplySnapshot().supplyLimit == initial + 1
+    check session.purgeExpiredSurbs(deadline + 1.seconds) == 0
+    check session.acceptSurbSupply(0, SURB(), deadline + 1.hours) ==
+      SurbSupplyDisposition.Duplicate
+    check session.receivedSurbCount == 0
+    check session.surbSupplySnapshot().supplyLimit == initial + 1
+
+  test "expired supply closes a missing sequence without reviving its path":
+    let session = establishedSession(SessionRole.Recipient)
+    session.initializeSurbSupply().expect("supply")
+    let initial = session.surbSupplySnapshot().supplyLimit
+    check session.acceptSurbSupply(1, SURB()) == SurbSupplyDisposition.Accepted
+    check session.surbSupplySnapshot().receiveBase == 0
+    check session.acceptSurbSupply(0, SURB(), Moment.now()) ==
+      SurbSupplyDisposition.Accepted
+    check session.surbSupplySnapshot().receiveBase == 2
+    check session.receivedSurbCount == 1
+    check session.surbSupplySnapshot().supplyLimit == initial + 1
+    check session.acceptSurbSupply(0, SURB()) == SurbSupplyDisposition.Duplicate

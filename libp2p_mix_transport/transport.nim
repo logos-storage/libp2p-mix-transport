@@ -52,6 +52,8 @@ type
     addressDestinations: Table[PeerId, MixPubInfo]
     surbSender: SurbSender
     replyCredentials: ReplyCredentialStore
+    expiryTask: Future[void].Raising([CancelledError])
+    expiryChanged: AsyncEvent
     sessions: SessionStore
     sessionEventHandlers: OrderedSet[SessionEventHandler]
     publishedSessionIds: HashSet[PeerId]
@@ -225,7 +227,7 @@ proc handleReplyFrame(
 
 proc sendWithSurbRedundancyBatch(
     self: MixTransport,
-    surbs: sink seq[SURB],
+    surbs: sink seq[TimedSurb],
     payload: sink seq[byte],
     concurrentCopies = false,
 ): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
@@ -234,8 +236,10 @@ proc sendWithSurbRedundancyBatch(
     var sends: seq[Future[Result[void, string]].Raising([CancelledError])]
     try:
       for surb in surbs.mitems:
-        traceOutbound(surb, payload)
-        sends.add(self.surbSender(move(surb), payload))
+        if surb.expiresAt <= Moment.now():
+          continue
+        traceOutbound(surb.surb, payload)
+        sends.add(self.surbSender(move(surb.surb), payload))
       for sending in sends:
         if (await sending).isOk:
           sent = true
@@ -247,10 +251,12 @@ proc sendWithSurbRedundancyBatch(
       await noCancel allFutures(sends)
   else:
     for surb in surbs.mitems:
+      if surb.expiresAt <= Moment.now():
+        continue
       # Each SURB is consumed once, but every redundant packet needs the same
       # payload. Passing payload without move lets Nim copy it for each send.
-      traceOutbound(surb, payload)
-      if (await self.surbSender(move(surb), payload)).isOk:
+      traceOutbound(surb.surb, payload)
+      if (await self.surbSender(move(surb.surb), payload)).isOk:
         sent = true
 
   if not sent:
@@ -272,8 +278,27 @@ proc sendToDestination(
     self: MixTransport, destination: PeerId, sessionId: PeerId, payload: sink seq[byte]
 ): Future[Result[void, string]] {.async: (raw: true, raises: [CancelledError]).} =
   self.addressDestinations.withValue(sessionId, info):
-    return self.mix.send(info[], MixTransportCodec, move(payload))
+    var current = info[]
+    # Keep the explicit address, but use a newly discovered key when available.
+    self.mix.nodePool.get(destination).withValue(record):
+      current.mixPubKey = record.mixPubKey
+    return self.mix.send(current, MixTransportCodec, move(payload))
   self.mix.send(MixDestination.exitNode(destination), MixTransportCodec, move(payload))
+
+proc withSurbBudgets(self: MixTransport, frame: MixTransportFrame): MixTransportFrame =
+  result = frame
+  result.surbHoldMillis = @[]
+  for encoded in frame.surbs:
+    result.surbHoldMillis.add(self.replyCredentials.holdingBudgetMillis(encoded))
+
+proc receivedSurb(frame: MixTransportFrame, index: int): Result[TimedSurb, string] =
+  let surb = ?frame.surbs[index].deserializeSurb()
+  ok(
+    TimedSurb(
+      surb: surb,
+      expiresAt: Moment.now() + chronos.milliseconds(int64(frame.surbHoldMillis[index])),
+    )
+  )
 
 proc sendStreamFrame(
     self: MixTransport, session: TransportSession, frame: MixTransportFrame
@@ -283,8 +308,8 @@ proc sendStreamFrame(
 
   case session.role
   of SessionRole.Initiator:
-    let payload = frame.encode().valueOr:
-      return err("could not encode " & $frame.kind & " frame: " & error)
+    let payload = self.withSurbBudgets(frame).encode().valueOr:
+        return err("could not encode " & $frame.kind & " frame: " & error)
 
     traceOutbound(frame)
     let destination = session.destination.valueOr:
@@ -317,8 +342,8 @@ proc sendTeardownFrame(
   # for reply SURBs merely to report that its local stream has already closed.
   case session.role
   of SessionRole.Initiator:
-    let payload = frame.encode().valueOr:
-      return false
+    let payload = self.withSurbBudgets(frame).encode().valueOr:
+        return false
     let destination = session.destination.valueOr:
       return false
     return (
@@ -589,16 +614,16 @@ proc handleSurbSupply(
     return
 
   let firstSequence = frame.firstSurbSequence.get()
-  for index, encodedSurb in frame.surbs:
+  for index in 0 ..< frame.surbs.len:
     let sequence = firstSequence + SurbSupplySequence(index)
-    let surb = encodedSurb.deserializeSurb().valueOr:
+    let surb = frame.receivedSurb(index).valueOr:
       continue
-    discard session.acceptSurbSupply(sequence, surb)
+    discard session.acceptSurbSupply(sequence, surb.surb, surb.expiresAt)
 
 proc sendStreamResponse(
     self: MixTransport,
     session: TransportSession,
-    replyBatch: sink seq[SURB],
+    replyBatch: sink seq[TimedSurb],
     streamId: StreamId,
     kind: FrameKind,
     rejectionReason = "",
@@ -646,9 +671,9 @@ proc handleConnect(
     trace "session already exists, ignoring connect"
     return
 
-  var replyBatch = newSeqOfCap[SURB](DefaultReplySurbRedundancy)
+  var replyBatch = newSeqOfCap[TimedSurb](DefaultReplySurbRedundancy)
   for index in 0 ..< DefaultReplySurbRedundancy:
-    let surb = frame.surbs[index].deserializeSurb().valueOr:
+    let surb = frame.receivedSurb(index).valueOr:
       return
     replyBatch.add(surb)
   let session = self.sessions.addRecipientSession(frame.sessionId).valueOr:
@@ -665,11 +690,11 @@ proc handleConnect(
   if frame.surbs.len > DefaultReplySurbRedundancy:
     let firstSequence = frame.firstSurbSequence.get()
     for index in DefaultReplySurbRedundancy ..< frame.surbs.len:
-      let surb = frame.surbs[index].deserializeSurb().valueOr:
+      let surb = frame.receivedSurb(index).valueOr:
         continue
       let sequence =
         firstSequence + SurbSupplySequence(index - DefaultReplySurbRedundancy)
-      discard session.acceptSurbSupply(sequence, surb)
+      discard session.acceptSurbSupply(sequence, surb.surb, surb.expiresAt)
   var acknowledgement = MixTransportFrame(
     version: MixTransportVersion, sessionId: frame.sessionId, kind: FrameKind.ConnectAck
   )
@@ -711,19 +736,19 @@ proc handleOpenStream(
       sessionId = frame.sessionId, streamId = frame.streamId.get()
     return
 
-  var replyBatch = newSeqOfCap[SURB](DefaultReplySurbRedundancy)
+  var replyBatch = newSeqOfCap[TimedSurb](DefaultReplySurbRedundancy)
   for index in 0 ..< min(frame.surbs.len, DefaultReplySurbRedundancy):
-    let surb = frame.surbs[index].deserializeSurb().valueOr:
+    let surb = frame.receivedSurb(index).valueOr:
       return
     replyBatch.add(surb)
   if frame.surbs.len > DefaultReplySurbRedundancy:
     let firstSequence = frame.firstSurbSequence.get()
     for index in DefaultReplySurbRedundancy ..< frame.surbs.len:
-      let surb = frame.surbs[index].deserializeSurb().valueOr:
+      let surb = frame.receivedSurb(index).valueOr:
         continue
       let sequence =
         firstSequence + SurbSupplySequence(index - DefaultReplySurbRedundancy)
-      discard session.acceptSurbSupply(sequence, surb)
+      discard session.acceptSurbSupply(sequence, surb.surb, surb.expiresAt)
 
   let protocol = self.mix.switch.ms.lookupProtocol(frame.codec.get()).valueOr:
     discard await self.sendStreamResponse(
@@ -795,9 +820,9 @@ proc handleSurbStatusProbe(
   if session.role != SessionRole.Recipient or session.state != SessionState.Established:
     return
 
-  var replyBatch = newSeqOfCap[SURB](DefaultReplySurbRedundancy)
-  for encodedSurb in frame.surbs:
-    let surb = encodedSurb.deserializeSurb().valueOr:
+  var replyBatch = newSeqOfCap[TimedSurb](DefaultReplySurbRedundancy)
+  for index in 0 ..< frame.surbs.len:
+    let surb = frame.receivedSurb(index).valueOr:
       continue
     replyBatch.add(surb)
     if replyBatch.len == DefaultReplySurbRedundancy:
@@ -907,6 +932,7 @@ proc newMixTransport*(
     mix: mix,
     surbSender: surbSender,
     replyCredentials: ReplyCredentialStore.new(),
+    expiryChanged: newAsyncEvent(),
     sessions: newSessionStore(recipientSurbCapacity),
     sessionEventHandlers: initOrderedSet[SessionEventHandler](),
     publishedSessionIds: initHashSet[PeerId](),
@@ -931,7 +957,9 @@ proc createReplySurbs(
     identifiers: newSeqOfCap[SURBIdentifier](count),
   )
 
-  var credentials = newSeqOfCap[ReplyCredential](count)
+  var
+    builds = newSeqOfCap[SurbBuild](count)
+    credentials = newSeqOfCap[ReplyCredential](count)
   defer:
     for credential in credentials.mitems:
       credential.wipe()
@@ -941,18 +969,25 @@ proc createReplySurbs(
       return err("could not create SURB: " & created.error)
     defer:
       created.get().credential.wipe()
-    # Mix attaches these timing constraints only when it uses a key ring.
-    if created.get().dispatchBefore.isSome or created.get().credentialsExpireAt.isSome or
-        created.get().replyHoldTime.isSome or created.get().replyTransitAllowance.isSome:
-      return err("Mix key rotation is not supported by this MixTransport version")
+    # A rotating node with an unaged pool cannot bound when this path expires.
+    if created.get().replyHoldTime.isSome and (
+      created.get().dispatchBefore.isNone or created.get().credentialsExpireAt.isNone
+    ):
+      return err("Mix key rotation requires reply-path record deadlines")
     let encoded = created.get().surb.serializeSurb().valueOr:
         return err("could not serialize SURB: " & error)
     prepared.encoded.add(encoded)
     prepared.identifiers.add(created.get().credential.identifier)
     credentials.add(move(created.get().credential))
+    builds.add(move(created.get()))
 
   self.replyCredentials.add(sessionId, credentials).isOkOr:
     return err("could not register reply credentials: " & error)
+  for index in 0 ..< builds.len:
+    self.replyCredentials.setSurbBounds(
+      prepared.identifiers[index], builds[index], prepared.encoded[index]
+    )
+  self.expiryChanged.fire()
 
   ok(prepared)
 
@@ -1075,11 +1110,9 @@ proc runSurbSupplier(
     if retransmission.isSome:
       let value = retransmission.get()
       discard self.replyCredentials.purgeExpired()
-      if self.replyCredentials.get(value.credentialIdentifier).isNone:
-        session.removePendingSurbSupply(value.sequence)
-        debug "Discarding pending SURB supply without an active reply credential",
-          sessionId = session.sessionId, sequence = value.sequence
-        continue
+      # Keep retransmitting an expired allocation with a zero holding budget
+      # until acknowledged. This closes gaps in the receiver's sequence window
+      # without making the old reply path usable again.
       await self.retransmitSurbSupply(session, value.sequence, value.encodedSurb)
       continue
 
@@ -1157,8 +1190,8 @@ proc connectInternal(
 
   let frame = self.createConnectFrame(destination, session).valueOr:
     return err(error)
-  let payload = frame.encode().valueOr:
-    return err("could not encode Connect frame: " & error)
+  let payload = self.withSurbBudgets(frame).encode().valueOr:
+      return err("could not encode Connect frame: " & error)
 
   traceOutbound(frame)
   (await self.sendToDestination(destination, session.sessionId, payload)).isOkOr:
@@ -1308,8 +1341,8 @@ proc sendOpenStream(
     firstSupplySequence = Opt.some(firstSequence)
     frame.firstSurbSequence = firstSupplySequence
 
-  let payload = frame.encode().valueOr:
-    return err("could not encode OpenStream frame: " & error)
+  let payload = self.withSurbBudgets(frame).encode().valueOr:
+      return err("could not encode OpenStream frame: " & error)
 
   traceOutbound(frame)
   (await self.sendToDestination(destination, session.sessionId, payload)).isOkOr:
@@ -1398,6 +1431,23 @@ proc resetSession*(
   discard await self.sendTeardownFrame(session, frame)
   await self.removeAndShutdownSession(session)
 
+proc runExpiryMaintenance(self: MixTransport) {.async: (raises: [CancelledError]).} =
+  while true:
+    self.expiryChanged.clear()
+    discard self.replyCredentials.purgeExpired()
+    var next = self.replyCredentials.nextExpiry()
+    for session in self.sessions.activeSessions():
+      discard session.purgeExpiredSurbs()
+      let deadline = session.nextInventoryExpiry()
+      if deadline.isSome and (next.isNone or deadline.get() < next.get()):
+        next = deadline
+    # New received inventory may arrive without touching the credential store.
+    # Re-evaluate at least every 100ms; reads and sends also enforce deadlines.
+    var delay = 100.milliseconds
+    if next.isSome:
+      delay = min(delay, max(1.milliseconds, next.get() - Moment.now()))
+    discard await self.expiryChanged.wait().withTimeout(delay)
+
 proc start*(
     self: MixTransport
 ): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
@@ -1422,6 +1472,7 @@ proc start*(
     return err(error)
 
   self.started = true
+  self.expiryTask = self.runExpiryMaintenance()
   ok()
 
 proc stop*(self: MixTransport): Future[void] {.async: (raises: [CancelledError]).} =
@@ -1446,6 +1497,9 @@ proc stop*(self: MixTransport): Future[void] {.async: (raises: [CancelledError])
     shutdownTasks.add(self.removeAndShutdownSession(session))
   if shutdownTasks.len > 0:
     checkFutures(await allFinished(shutdownTasks))
+  if not self.expiryTask.isNil:
+    await self.expiryTask.cancelAndWait()
+    self.expiryTask = nil
   self.replyCredentials.clear()
   self.started = false
 

@@ -2,7 +2,7 @@
 
 {.used.}
 
-import std/unittest
+import std/[unittest, sequtils]
 
 import results
 import libp2p/[crypto/crypto, peerid]
@@ -121,6 +121,7 @@ suite "MixTransport wire format":
       kind: FrameKind.SurbSupply,
       firstSurbSequence: Opt.some(SurbSupplySequence(42)),
       surbs: @[newSeq[byte](SurbSize), newSeq[byte](SurbSize)],
+      surbHoldMillis: @[1000'u64, 1000'u64],
     )
 
     let decoded = MixTransportFrame
@@ -138,6 +139,7 @@ suite "MixTransport wire format":
       kind: FrameKind.Connect,
       firstSurbSequence: Opt.some(SurbSupplySequence(0)),
       surbs: newSeq[seq[byte]](MaxConnectSurbs),
+      surbHoldMillis: newSeqWith(MaxConnectSurbs, 1000'u64),
     )
     for surb in frame.surbs.mitems:
       surb = newSeq[byte](SurbSize)
@@ -154,6 +156,7 @@ suite "MixTransport wire format":
       kind: FrameKind.SurbSupply,
       firstSurbSequence: Opt.some(SurbSupplySequence(0)),
       surbs: newSeq[seq[byte]](MaxSurbSupplyPerFrame),
+      surbHoldMillis: newSeqWith(MaxSurbSupplyPerFrame, 1000'u64),
     )
     for surb in frame.surbs.mitems:
       surb = newSeq[byte](SurbSize)
@@ -233,6 +236,7 @@ suite "MixTransport wire format":
     check frame.encode().isErr
 
     frame.surbs = newSeq[seq[byte]](MaxOpenStreamSurbs)
+    frame.surbHoldMillis = newSeqWith(MaxOpenStreamSurbs, 1000'u64)
     frame.firstSurbSequence = Opt.some(SurbSupplySequence(0))
     for surb in frame.surbs.mitems:
       surb = newSeq[byte](SurbSize)
@@ -320,3 +324,24 @@ suite "MixTransport wire format":
     check:
       MixTransportFrame.decode(@[0xff'u8]).isErr
       MixTransportFrame.decode(@[]).isErr
+
+  test "SURB holding budgets are mandatory and bounded":
+    var frame = MixTransportFrame(
+      version: MixTransportVersion,
+      sessionId: randomSessionId(),
+      kind: FrameKind.SurbStatusProbe,
+      surbs: @[
+        testSurb(1).serializeSurb().expect("valid test SURB"),
+        testSurb(2).serializeSurb().expect("valid test SURB"),
+      ],
+    )
+    check frame.encode().isErr
+    frame.surbHoldMillis = @[0'u64, 1000'u64]
+    let encoded = frame.encode().expect("bounded budgets")
+    check MixTransportFrame.decode(encoded).get().surbHoldMillis == frame.surbHoldMillis
+    frame.surbHoldMillis[1] = uint64.high
+    check frame.encode().isErr
+    frame.surbHoldMillis[1] = 1000
+    frame.version = 3
+    check frame.encode().isErr
+    check MixTransportFrame.decode(Protobuf.encode(frame)).isErr
