@@ -461,7 +461,7 @@ proc takeDueSurbSupplyRetransmission*(
     selectedDeadline = Opt.none(Moment)
 
   for sequence, pending in session.pendingSurbSupply:
-    pending.nextRetransmissionAt.withValue(deadline):
+    pending.nextRetransmissionAt.ifValue(deadline):
       if deadline > now:
         continue
       if selectedDeadline.isNone or deadline < selectedDeadline.get() or
@@ -500,7 +500,7 @@ proc removePendingSurbSupply*(session: TransportSession, sequence: SurbSupplySeq
 func earliestSurbSupplyRetransmission*(session: TransportSession): Opt[Moment] =
   var earliest = Opt.none(Moment)
   for pending in session.pendingSurbSupply.values:
-    pending.nextRetransmissionAt.withValue(deadline):
+    pending.nextRetransmissionAt.ifValue(deadline):
       if earliest.isNone or deadline < earliest.get():
         earliest = Opt.some(deadline)
   earliest
@@ -582,7 +582,7 @@ func unansweredSurbStatusProbeCount*(session: TransportSession): int =
 func timeUntilSurbStatusProbe*(
     session: TransportSession, now: Moment = Moment.now()
 ): Opt[Duration] =
-  session.nextSurbStatusProbeAt.withValue(deadline):
+  session.nextSurbStatusProbeAt.ifValue(deadline):
     return Opt.some(
       if deadline <= now:
         ZeroDuration
@@ -718,7 +718,7 @@ proc remove*(store: SessionStore, sessionId: PeerId): Opt[TransportSession] =
     sessionId = session.sessionId, role = session.role, state = session.state
 
   store.bySessionId.del(sessionId)
-  session.destination.withValue(destination):
+  session.destination.ifValue(destination):
     store.byDestination.del(destination)
   Opt.some(session)
 

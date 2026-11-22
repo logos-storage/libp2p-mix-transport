@@ -3,6 +3,7 @@
 import std/random
 import std/times
 import std/strformat
+import std/sugar
 
 import pkg/chronos
 import pkg/chronicles
@@ -269,7 +270,8 @@ proc init*(
     listenPort: uint,
     maxConnections: int,
 ): Result[Node, string] =
-  let listenAddress = ?MultiAddress.init(fmt"/ip4/{listenIp}/tcp/{listenPort}")
+  let listenAddress =
+    ?MultiAddress.init(fmt"/ip4/{listenIp}/tcp/{listenPort}").mapErr(x => $x)
   let
     rng = newRng()
     delayStrategy =

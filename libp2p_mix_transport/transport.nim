@@ -857,7 +857,7 @@ proc handleRawSurbReply(
   let recovered = self.replyCredentials.recoverReply(reply).valueOr:
     return RawSurbReplyDisposition.Handled
 
-  recovered.withValue(value):
+  recovered.ifValue(value):
     let frame = MixTransportFrame.decode(value.payload).valueOr:
       return RawSurbReplyDisposition.Handled
     if frame.sessionId == value.sessionId:
@@ -1084,18 +1084,18 @@ proc runSurbSupplier(
       continue
 
     var waitTime = Opt.none(Duration)
-    session.earliestSurbSupplyRetransmission().withValue(deadline):
+    session.earliestSurbSupplyRetransmission().ifValue(deadline):
       waitTime = Opt.some(
         if deadline <= Moment.now():
           ZeroDuration
         else:
           deadline - Moment.now()
       )
-    probeWait.withValue(value):
+    probeWait.ifValue(value):
       if waitTime.isNone or value < waitTime.get():
         waitTime = Opt.some(value)
 
-    waitTime.withValue(value):
+    waitTime.ifValue(value):
       if value <= ZeroDuration:
         continue
       discard await session.waitForSurbSupplyStateChange().withTimeout(value)
@@ -1145,7 +1145,7 @@ proc connectInternal(
   let session = self.sessions.addInitiatorSession(destination, sessionId).valueOr:
     return err(error)
 
-  info.withValue(value):
+  info.ifValue(value):
     self.addressDestinations[sessionId] = value
 
   var keepSession = false
@@ -1182,11 +1182,11 @@ proc connectInternal(
 proc getExisting(
     self: MixTransport, destination: PeerId
 ): Opt[TransportSession] {.nimcall, gcsafe.} =
-  self.sessions.get(destination).withValue(existing):
+  self.sessions.get(destination).ifValue(existing):
     if existing.role == SessionRole.Recipient and
         existing.state == SessionState.Established:
       return Opt.some(existing)
-  self.sessions.getByDestination(destination).withValue(existing):
+  self.sessions.getByDestination(destination).ifValue(existing):
     if existing.state == SessionState.Established:
       return Opt.some(existing)
   return Opt.none(TransportSession)
@@ -1294,7 +1294,7 @@ proc sendOpenStream(
   defer:
     if not keepReplyCredentials:
       self.retireReplyCredentials(prepared.identifiers)
-      firstSupplySequence.withValue(sequence):
+      firstSupplySequence.ifValue(sequence):
         session.removePendingSurbSupply(sequence, suppliedCount)
 
   if suppliedCount > 0:
@@ -1316,7 +1316,7 @@ proc sendOpenStream(
     return err("could not send OpenStream frame: " & error)
 
   keepReplyCredentials = true
-  firstSupplySequence.withValue(sequence):
+  firstSupplySequence.ifValue(sequence):
     session.scheduleSurbSupplyRetransmission(
       sequence, suppliedCount, self.surbSupplyRetransmissionTimeout
     )

@@ -102,7 +102,7 @@ proc connect*[K, T](
   while true:
     await coordinator.lock.acquire()
 
-    getExisting(key).withValue(existing):
+    getExisting(key).ifValue(existing):
       coordinator.releaseLock()
       return ok((existing, true))
 
