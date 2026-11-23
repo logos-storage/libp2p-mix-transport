@@ -55,9 +55,10 @@ jobs:
           nim --version
           nimble --version
           make setup NIMBLE_FLAGS="$NIMBLE_FLAGS"
+          grep -F '/libp2p-${{ matrix.libp2p }}-' nimble.paths
 
       - name: Test
-        run: make test NIMBLE_FLAGS="$NIMBLE_FLAGS"
+        run: nim c -r --styleCheck:usages --styleCheck:error tests/test_all.nim
 
       - name: Build examples
         run: make example NIMBLE_FLAGS="$NIMBLE_FLAGS"
