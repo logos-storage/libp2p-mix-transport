@@ -857,7 +857,8 @@ proc handleRawSurbReply(
   let recovered = self.replyCredentials.recoverReply(reply).valueOr:
     return RawSurbReplyDisposition.Handled
 
-  recovered.withValue(value):
+  if recovered.isSome:
+    let value = recovered.get()
     let frame = MixTransportFrame.decode(value.payload).valueOr:
       return RawSurbReplyDisposition.Handled
     if frame.sessionId == value.sessionId:
@@ -880,6 +881,8 @@ proc newMixTransport*(
     recipientSurbCapacity = DefaultRecipientSurbCapacity,
 ): MixTransport =
   doAssert not mix.isNil, "MixProtocol must not be nil"
+  doAssert not mix.keyRotationEnabled(),
+    "Mix key rotation is not supported by this MixTransport version"
   doAssert connectTimeout > ZeroDuration, "connect timeout must be positive"
   doAssert streamOpenTimeout > ZeroDuration, "stream open timeout must be positive"
   doAssert dataRetransmissionTimeout > ZeroDuration,
@@ -941,10 +944,6 @@ proc createReplySurbs(
       return err("could not create SURB: " & created.error)
     defer:
       created.get().credential.wipe()
-    # Mix attaches these timing constraints only when it uses a key ring.
-    if created.get().dispatchBefore.isSome or created.get().credentialsExpireAt.isSome or
-        created.get().replyHoldTime.isSome or created.get().replyTransitAllowance.isSome:
-      return err("Mix key rotation is not supported by this MixTransport version")
     let encoded = created.get().surb.serializeSurb().valueOr:
         return err("could not serialize SURB: " & error)
     prepared.encoded.add(encoded)
@@ -1084,18 +1083,22 @@ proc runSurbSupplier(
       continue
 
     var waitTime = Opt.none(Duration)
-    session.earliestSurbSupplyRetransmission().withValue(deadline):
+    let earliestDeadline = session.earliestSurbSupplyRetransmission()
+    if earliestDeadline.isSome:
+      let deadline = earliestDeadline.get()
       waitTime = Opt.some(
         if deadline <= Moment.now():
           ZeroDuration
         else:
           deadline - Moment.now()
       )
-    probeWait.withValue(value):
+    if probeWait.isSome:
+      let value = probeWait.get()
       if waitTime.isNone or value < waitTime.get():
         waitTime = Opt.some(value)
 
-    waitTime.withValue(value):
+    if waitTime.isSome:
+      let value = waitTime.get()
       if value <= ZeroDuration:
         continue
       discard await session.waitForSurbSupplyStateChange().withTimeout(value)
@@ -1145,8 +1148,8 @@ proc connectInternal(
   let session = self.sessions.addInitiatorSession(destination, sessionId).valueOr:
     return err(error)
 
-  info.withValue(value):
-    self.addressDestinations[sessionId] = value
+  if info.isSome:
+    self.addressDestinations[sessionId] = info.get()
 
   var keepSession = false
   defer:
@@ -1182,11 +1185,15 @@ proc connectInternal(
 proc getExisting(
     self: MixTransport, destination: PeerId
 ): Opt[TransportSession] {.nimcall, gcsafe.} =
-  self.sessions.get(destination).withValue(existing):
+  let bySessionId = self.sessions.get(destination)
+  if bySessionId.isSome:
+    let existing = bySessionId.get()
     if existing.role == SessionRole.Recipient and
         existing.state == SessionState.Established:
       return Opt.some(existing)
-  self.sessions.getByDestination(destination).withValue(existing):
+  let byDestination = self.sessions.getByDestination(destination)
+  if byDestination.isSome:
+    let existing = byDestination.get()
     if existing.state == SessionState.Established:
       return Opt.some(existing)
   return Opt.none(TransportSession)
@@ -1294,8 +1301,8 @@ proc sendOpenStream(
   defer:
     if not keepReplyCredentials:
       self.retireReplyCredentials(prepared.identifiers)
-      firstSupplySequence.withValue(sequence):
-        session.removePendingSurbSupply(sequence, suppliedCount)
+      if firstSupplySequence.isSome:
+        session.removePendingSurbSupply(firstSupplySequence.get(), suppliedCount)
 
   if suppliedCount > 0:
     let firstSequence = session.registerSurbSupply(
@@ -1316,9 +1323,9 @@ proc sendOpenStream(
     return err("could not send OpenStream frame: " & error)
 
   keepReplyCredentials = true
-  firstSupplySequence.withValue(sequence):
+  if firstSupplySequence.isSome:
     session.scheduleSurbSupplyRetransmission(
-      sequence, suppliedCount, self.surbSupplyRetransmissionTimeout
+      firstSupplySequence.get(), suppliedCount, self.surbSupplyRetransmissionTimeout
     )
 
   ok()

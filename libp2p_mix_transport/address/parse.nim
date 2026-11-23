@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 
 {.push raises: [].}
+import std/sugar
 import secp256k1
 
 import
@@ -17,7 +18,7 @@ const
 proc extract(
     address: MultiAddress
 ): Result[tuple[prefix: MultiAddress, component: MultiAddress], string] =
-  let protocols = ?address.protocols()
+  let protocols = ?address.protocols().mapErr(x => $x)
   var mixIndex = -1
   for i, protocol in protocols:
     if protocol == multiCodec("mix-transport"):
@@ -28,9 +29,9 @@ proc extract(
     return err("mix-transport protocol not found in address")
 
   let
-    prefix = ?address[0 ..< mixIndex]
-    component = ?address[mixIndex]
-  if ?prefix.len < MinPrefixLength:
+    prefix = ?address[0 ..< mixIndex].mapErr(x => $x)
+    component = ?address[mixIndex].mapErr(x => $x)
+  if ?prefix.len.mapErr(x => $x) < MinPrefixLength:
     return err("address has no transport prefix")
   ok((prefix: prefix, component: component))
 
@@ -42,7 +43,7 @@ proc fromMixAddress*(
 ): Result[MixPubInfo, string] =
   let
     (endpoint, mix) = ?extract(address)
-    payload = ?mix.protoArgument()
+    payload = ?mix.protoArgument().mapErr(x => $x)
 
   if payload.len != AddressPayloadSize:
     return err("invalid payload size")
@@ -71,9 +72,9 @@ proc toMixAddress*(info: MixPubInfo): Result[MultiAddress, string] =
   var keys: seq[byte]
   keys.add(info.libp2pPubKey.getBytes())
   keys.add(info.mixPubKey.fieldElementToBytes())
-  let component = ?MultiAddress.init(multiCodec("mix-transport"), keys)
+  let component = ?MultiAddress.init(multiCodec("mix-transport"), keys).mapErr(x => $x)
   var address = info.multiAddr
-  ?address.append(component)
+  ?address.append(component).mapErr(x => $x)
   ok(address)
 
 {.pop.}
