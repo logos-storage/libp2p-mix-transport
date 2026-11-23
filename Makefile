@@ -1,5 +1,8 @@
 .PHONY: all setup test example format clean clean-all clean-nimble-cache clean-nimbledeps
 
+NIMC ?= nim
+NIMFLAGS ?=
+STYLE_FLAGS := --styleCheck:usages --styleCheck:error
 NIMBLE_FLAGS ?=
 NIMBLE_DIR ?= $(HOME)/.nimble
 
@@ -18,10 +21,15 @@ setup:
 	$(NIMBLE) setup -l $(NIMBLE_FLAGS)
 
 test:
-	$(NIMBLE) test $(NIMBLE_FLAGS)
+	"$(NIMC)" c $(STYLE_FLAGS) $(NIMFLAGS) tests/test_all.nim
+	./tests/test_all
+	$(RM) tests/test_all
 
 example:
-	$(NIMBLE) example $(NIMBLE_FLAGS)
+	"$(NIMC)" c $(STYLE_FLAGS) $(NIMFLAGS) examples/mix_ping_tcp.nim
+	$(RM) examples/mix_ping_tcp
+	"$(NIMC)" c $(STYLE_FLAGS) $(NIMFLAGS) examples/mix_ping_quic.nim
+	$(RM) examples/mix_ping_quic
 
 format:
 	nph $(NPH_FILES)
