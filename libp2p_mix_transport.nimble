@@ -1,5 +1,5 @@
 packageName = "libp2p_mix_transport"
-version = "0.1.0"
+version = "0.1.1"
 author = "local"
 description = "Generic byte-stream transport over the libp2p Mix protocol"
 license = "MIT"
