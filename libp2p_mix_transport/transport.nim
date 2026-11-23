@@ -857,7 +857,8 @@ proc handleRawSurbReply(
   let recovered = self.replyCredentials.recoverReply(reply).valueOr:
     return RawSurbReplyDisposition.Handled
 
-  recovered.ifValue(value):
+  if recovered.isSome:
+    let value = recovered.get()
     let frame = MixTransportFrame.decode(value.payload).valueOr:
       return RawSurbReplyDisposition.Handled
     if frame.sessionId == value.sessionId:
@@ -1084,18 +1085,22 @@ proc runSurbSupplier(
       continue
 
     var waitTime = Opt.none(Duration)
-    session.earliestSurbSupplyRetransmission().ifValue(deadline):
+    let earliestDeadline = session.earliestSurbSupplyRetransmission()
+    if earliestDeadline.isSome:
+      let deadline = earliestDeadline.get()
       waitTime = Opt.some(
         if deadline <= Moment.now():
           ZeroDuration
         else:
           deadline - Moment.now()
       )
-    probeWait.ifValue(value):
+    if probeWait.isSome:
+      let value = probeWait.get()
       if waitTime.isNone or value < waitTime.get():
         waitTime = Opt.some(value)
 
-    waitTime.ifValue(value):
+    if waitTime.isSome:
+      let value = waitTime.get()
       if value <= ZeroDuration:
         continue
       discard await session.waitForSurbSupplyStateChange().withTimeout(value)
@@ -1145,8 +1150,8 @@ proc connectInternal(
   let session = self.sessions.addInitiatorSession(destination, sessionId).valueOr:
     return err(error)
 
-  info.ifValue(value):
-    self.addressDestinations[sessionId] = value
+  if info.isSome:
+    self.addressDestinations[sessionId] = info.get()
 
   var keepSession = false
   defer:
@@ -1182,11 +1187,15 @@ proc connectInternal(
 proc getExisting(
     self: MixTransport, destination: PeerId
 ): Opt[TransportSession] {.nimcall, gcsafe.} =
-  self.sessions.get(destination).ifValue(existing):
+  let bySessionId = self.sessions.get(destination)
+  if bySessionId.isSome:
+    let existing = bySessionId.get()
     if existing.role == SessionRole.Recipient and
         existing.state == SessionState.Established:
       return Opt.some(existing)
-  self.sessions.getByDestination(destination).ifValue(existing):
+  let byDestination = self.sessions.getByDestination(destination)
+  if byDestination.isSome:
+    let existing = byDestination.get()
     if existing.state == SessionState.Established:
       return Opt.some(existing)
   return Opt.none(TransportSession)
@@ -1294,8 +1303,8 @@ proc sendOpenStream(
   defer:
     if not keepReplyCredentials:
       self.retireReplyCredentials(prepared.identifiers)
-      firstSupplySequence.ifValue(sequence):
-        session.removePendingSurbSupply(sequence, suppliedCount)
+      if firstSupplySequence.isSome:
+        session.removePendingSurbSupply(firstSupplySequence.get(), suppliedCount)
 
   if suppliedCount > 0:
     let firstSequence = session.registerSurbSupply(
@@ -1316,9 +1325,9 @@ proc sendOpenStream(
     return err("could not send OpenStream frame: " & error)
 
   keepReplyCredentials = true
-  firstSupplySequence.ifValue(sequence):
+  if firstSupplySequence.isSome:
     session.scheduleSurbSupplyRetransmission(
-      sequence, suppliedCount, self.surbSupplyRetransmissionTimeout
+      firstSupplySequence.get(), suppliedCount, self.surbSupplyRetransmissionTimeout
     )
 
   ok()

@@ -203,7 +203,7 @@ These files and directories are local artifacts and should not be committed:
 
 ## Dependency Cache Troubleshooting
 
-The Mix dependency is pinned to commit `03cb2642352dc920c07c2029f79d35736c34064f` from [Mix PR #95](https://github.com/logos-co/nim-libp2p-mix/pull/95), which supports libp2p 2.5. MixTransport requires `libp2p >= 2.5.0`. If dependency resolution appears stale after changing the pin, inspect Nimble's global `pkgcache` as well as the project-local `nimbledeps/` directory.
+The Mix dependency is pinned to commit `37dede6f7e06a0eca7f67bac5feebba73bbc6205` from [Mix PR #95](https://github.com/logos-co/nim-libp2p-mix/pull/95), which supports libp2p 2.4 and 2.5. MixTransport requires `libp2p >= 2.4.0`. If dependency resolution appears stale after changing the pin, inspect Nimble's global `pkgcache` as well as the project-local `nimbledeps/` directory.
 
 First inspect the cached Mix checkouts:
 

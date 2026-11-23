@@ -102,9 +102,10 @@ proc connect*[K, T](
   while true:
     await coordinator.lock.acquire()
 
-    getExisting(key).ifValue(existing):
+    let existing = getExisting(key)
+    if existing.isSome:
       coordinator.releaseLock()
-      return ok((existing, true))
+      return ok((existing.get(), true))
 
     var
       attempt: ConnectAttempt[T]

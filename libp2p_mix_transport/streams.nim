@@ -261,7 +261,8 @@ proc takeDueOutboundRetransmission*(
     selectedDeadline = Opt.none(Moment)
 
   for sequence, chunk in stream.pendingOutbound:
-    chunk.nextRetransmissionAt.ifValue(deadline):
+    if chunk.nextRetransmissionAt.isSome:
+      let deadline = chunk.nextRetransmissionAt.get()
       if deadline > now:
         continue
       if selectedDeadline.isNone:
@@ -283,7 +284,8 @@ proc takeDueOutboundRetransmission*(
 func earliestRetransmissionDeadline*(stream: TransportStream): Opt[Moment] =
   var earliest = Opt.none(Moment)
   for chunk in stream.pendingOutbound.values:
-    chunk.nextRetransmissionAt.ifValue(deadline):
+    if chunk.nextRetransmissionAt.isSome:
+      let deadline = chunk.nextRetransmissionAt.get()
       if earliest.isNone or deadline < earliest.get():
         earliest = Opt.some(deadline)
   earliest
