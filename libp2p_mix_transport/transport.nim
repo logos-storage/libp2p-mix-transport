@@ -881,6 +881,8 @@ proc newMixTransport*(
     recipientSurbCapacity = DefaultRecipientSurbCapacity,
 ): MixTransport =
   doAssert not mix.isNil, "MixProtocol must not be nil"
+  doAssert not mix.keyRotationEnabled(),
+    "Mix key rotation is not supported by this MixTransport version"
   doAssert connectTimeout > ZeroDuration, "connect timeout must be positive"
   doAssert streamOpenTimeout > ZeroDuration, "stream open timeout must be positive"
   doAssert dataRetransmissionTimeout > ZeroDuration,
@@ -942,10 +944,6 @@ proc createReplySurbs(
       return err("could not create SURB: " & created.error)
     defer:
       created.get().credential.wipe()
-    # Mix attaches these timing constraints only when it uses a key ring.
-    if created.get().dispatchBefore.isSome or created.get().credentialsExpireAt.isSome or
-        created.get().replyHoldTime.isSome or created.get().replyTransitAllowance.isSome:
-      return err("Mix key rotation is not supported by this MixTransport version")
     let encoded = created.get().surb.serializeSurb().valueOr:
         return err("could not serialize SURB: " & error)
     prepared.encoded.add(encoded)
