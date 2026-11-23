@@ -58,7 +58,7 @@ jobs:
           grep -F '/libp2p-${{ matrix.libp2p }}-' nimble.paths
 
       - name: Test
-        run: nim c -r --styleCheck:usages --styleCheck:error tests/test_all.nim
+        run: make test
 
       - name: Build examples
-        run: make example NIMBLE_FLAGS="$NIMBLE_FLAGS"
+        run: make example
