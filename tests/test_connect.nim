@@ -19,7 +19,6 @@ import
     utils/opt,
   ]
 import libp2p_mix
-from libp2p_mix/key_rotation import update, stop
 import libp2p_mix/pool
 import libp2p_mix/delay_strategy
 import libp2p_mix/serialization
@@ -27,7 +26,7 @@ import libp2p_mix/curve25519
 import protobuf_serialization
 
 import libp2p_mix_transport
-import libp2p_mix_transport/[connect_attempts, reply_credentials]
+import libp2p_mix_transport/connect_attempts
 import libp2p_mix_transport/transport {.all.}
 
 import ./logging
@@ -408,35 +407,13 @@ proc establishSessionAndStream(
   )
 
 suite "MixTransport session and stream handshakes":
-  test "reply SURBs with key rotation are rejected with or without path deadlines":
+  test "transport construction rejects Mix key rotation":
     let
       ring = MixKeyRing.new(KeyRotationConfig.init().get(), newRng(), 16)
-      nodes = createMixNodes(5, Opt.some(ring))
-      mix = nodes[0]
-      transport = newMixTransport(mix)
-      destination = nodes[^1].switch.peerInfo.peerId
-    ring.update()
-    defer:
-      waitFor ring.stop()
+      mix = createMixNodes(1, Opt.some(ring))[0]
 
-    for hasDeadlines in [true, false]:
-      if not hasDeadlines:
-        # Keep the same path records, but use a pool without record aging.
-        mix.nodePool = MixNodePool.new(mix.switch.peerStore)
-      var built = mix.createSurb(MixDestination.exitNode(destination))
-      require built.isOk
-      defer:
-        built.get().credential.wipe()
-      check:
-        built.get().dispatchBefore.isSome == hasDeadlines
-        built.get().credentialsExpireAt.isSome == hasDeadlines
-        built.get().replyHoldTime.isSome
-        built.get().replyTransitAllowance.isSome
-      let prepared = transport.createReplySurbs(destination, destination, 1)
-      require prepared.isErr
-      check:
-        prepared.error == "Mix key rotation is not supported by this MixTransport version"
-        transport.replyCredentials.len == 0
+    expect AssertionDefect:
+      discard newMixTransport(mix)
 
   test "recipient reuses its anonymous session and opens bidirectional streams":
     proc run() {.async.} =
