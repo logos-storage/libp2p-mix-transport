@@ -20,6 +20,15 @@ No compile flag is required. Rebuild consuming applications such as Storage
 to use this behavior. The normal test suite includes Data concurrency,
 control-frame ordering, and cancellation checks.
 
+## Stream write failures
+
+A successful write means Mix accepted each Data chunk for local submission.
+If the first submission of an assigned chunk fails, the write raises a stream
+error and resets the stream. Closing or cancelling a write during an unresolved
+submission also triggers a best-effort reset. Open a new stream to retry the
+application exchange. An ordinary close after successful submissions reports
+the last assigned sequence without waiting for acknowledgements.
+
 ## Building
 
 Both endpoints can open streams within an established session. For the recipient's anonymous-peer lookup and reverse stream-opening exchange, see [Recipient-originated streams](docs/recipient-streams.md).

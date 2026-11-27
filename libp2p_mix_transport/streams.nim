@@ -61,6 +61,9 @@ type
     writeHandler: StreamWriteHandler
     teardownHandler: StreamTeardownHandler
     suppressRemoteTeardown: bool
+    firstSubmission: Future[Result[void, string]].Raising([CancelledError])
+    gracefulRemoteClose: bool
+    incompleteRemoteClose: bool
     remoteReset: bool
     remoteCloseFinalSequence: Opt[SequenceNumber]
     writeLock: AsyncLock
@@ -108,6 +111,9 @@ func nextOutboundSequence*(stream: TransportStream): SequenceNumber =
 func finalOutboundSequence*(stream: TransportStream): SequenceNumber =
   stream.nextOutboundSequence - 1
 
+func hasRemoteClose*(stream: TransportStream): bool =
+  stream.remoteCloseFinalSequence.isSome
+
 func remoteCloseReady*(stream: TransportStream): bool =
   stream.remoteCloseFinalSequence.isSome and
     stream.receiveBase > stream.remoteCloseFinalSequence.get()
@@ -124,6 +130,19 @@ func bitmapContains(bitmap: openArray[byte], offset: SequenceNumber): bool =
     byteIndex = int(offset div 8)
     bitIndex = int(offset mod 8)
   (bitmap[byteIndex] and (1'u8 shl bitIndex)) != 0
+
+func missingRemoteData*(stream: TransportStream): bool =
+  let boundary = stream.remoteCloseFinalSequence.valueOr:
+    return false
+  if boundary < stream.receiveBase:
+    return false
+  let lastOffset = boundary - stream.receiveBase
+  if lastOffset >= SequenceNumber(ReceiveWindowChunks):
+    return true
+  for offset in SequenceNumber(0) .. lastOffset:
+    if not stream.acknowledgementBitmap.bitmapContains(offset):
+      return true
+  false
 
 proc setBitmapBit(bitmap: var seq[byte], offset: SequenceNumber) =
   let
@@ -304,6 +323,29 @@ proc cancelOutbound*(stream: TransportStream, sequence: SequenceNumber) =
     stream.sendStateChanged.fire()
     stream.retransmissionStateChanged.fire()
 
+proc submitOutbound*(
+    stream: TransportStream,
+    sequence: SequenceNumber,
+    submission: Future[Result[void, string]].Raising([CancelledError]),
+) {.async: (raises: [CancelledError, LPStreamError]).} =
+  # Writes are serialized. A concurrent close can cancel a stalled submission
+  # and reset the stream instead of promising an unresolved Data sequence.
+  stream.firstSubmission = submission
+  var submitted = false
+  try:
+    (await submission).isOkOr:
+      raise newException(LPStreamError, error)
+    submitted = true
+  except CancelledError as exc:
+    if stream.closed:
+      raise newLPStreamClosedError()
+    raise exc
+  finally:
+    stream.firstSubmission = nil
+    if not submitted:
+      stream.cancelOutbound(sequence)
+      await stream.reset()
+
 proc applyAcknowledgement*(
     stream: TransportStream, receiveBase: SequenceNumber, bitmap: openArray[byte]
 ): bool =
@@ -351,8 +393,23 @@ proc receiveRemoteClose*(
     return err("remote close changed the final sequence")
   if finalSequence + 1 < stream.receiveBase:
     return err("remote close precedes already delivered Data")
-  stream.remoteCloseFinalSequence = Opt.some(finalSequence)
+  if not stream.hasRemoteClose:
+    stream.remoteCloseFinalSequence = Opt.some(finalSequence)
+    stream.dataAvailable.fire()
   ok(stream.remoteCloseReady)
+
+proc markGracefulRemoteClose*(stream: TransportStream) =
+  stream.gracefulRemoteClose = true
+
+func remoteReadEnded*(stream: TransportStream): bool =
+  stream.gracefulRemoteClose or stream.incompleteRemoteClose
+
+proc takeHandlerTask*(stream: TransportStream): Future[void].Raising([CancelledError]) =
+  result = stream.handlerTask
+  stream.handlerTask = nil
+
+proc markIncompleteRemoteClose*(stream: TransportStream) =
+  stream.incompleteRemoteClose = true
 
 proc receiveRemoteReset*(stream: TransportStream) =
   stream.remoteReset = true
@@ -396,7 +453,9 @@ proc cancelAndWaitForStreamTasks*(
   await noCancel stream.streamTasks.cancelAndWait()
   stream.streamTasks.setLen(0)
 
-proc shutdown*(stream: TransportStream): Future[void] {.async: (raises: []).} =
+proc shutdown*(
+    stream: TransportStream, waitForHandler = true
+): Future[void] {.async: (raises: []).} =
   # Keep a local reference because a cancelled handler clears the field while
   # completing its own cleanup.
   trace "shutting down stream", sessionId = stream.sessionId, streamId = stream.streamId
@@ -404,7 +463,10 @@ proc shutdown*(stream: TransportStream): Future[void] {.async: (raises: []).} =
   await stream.close()
   await stream.cancelAndWaitForStreamTasks()
   if not handlerTask.isNil:
-    await noCancel handlerTask.cancelAndWait()
+    if waitForHandler:
+      await noCancel handlerTask.cancelAndWait()
+    else:
+      handlerTask.cancelSoon()
   stream.handlerTask = nil
 
 method write*(
@@ -424,14 +486,18 @@ method write*(
 method readOnce*(
     stream: TransportStream, pbytes: pointer, nbytes: int
 ): Future[int] {.async: (raises: [CancelledError, LPStreamError]).} =
-  # BufferStream represents every close as EOF. Preserve libp2p's stronger
-  # contract by exposing a remote ResetStream as LPStreamResetError to direct
-  # readers and to readExactly/readLine/readLp, which all build on readOnce.
-  if stream.remoteReset:
-    raise newLPStreamResetError()
+  template checkTermination() =
+    if stream.remoteReset:
+      raise newLPStreamResetError()
+    if stream.incompleteRemoteClose:
+      raise newLPStreamIncompleteError()
+
+  checkTermination()
+  defer:
+    if stream.gracefulRemoteClose and stream.readQueue.empty():
+      stream.isEof = true
   let bytesRead = await procCall BufferStream(stream).readOnce(pbytes, nbytes)
-  if stream.remoteReset:
-    raise newLPStreamResetError()
+  checkTermination()
   bytesRead
 
 method getWrapped*(stream: TransportStream): Connection =
@@ -445,11 +511,29 @@ proc closeTransportStream(
   stream.sendStateChanged.fire()
   stream.retransmissionStateChanged.fire()
   stream.resolved.fire()
+  let interruptedSubmission = not stream.firstSubmission.isNil
+  if interruptedSubmission:
+    stream.firstSubmission.cancelSoon()
   stream.streamTasks.cancelSoon()
-  await procCall BufferStream(stream).closeImpl()
+  if stream.gracefulRemoteClose:
+    # BufferStream.closeImpl clears unread bytes. Close the connection while
+    # keeping the ordered buffer readable. Once its queue empties, readOnce
+    # consumes any buffered tail and returns EOF.
+    if stream.readQueue.empty():
+      stream.isEof = true
+      if stream.reading:
+        try:
+          await noCancel stream.pushEof()
+        except LPStreamError as exc:
+          raiseAssert "could not wake the final read: " & exc.msg
+    await procCall Connection(stream).closeImpl()
+  else:
+    await procCall BufferStream(stream).closeImpl()
 
   if not stream.suppressRemoteTeardown and not stream.teardownHandler.isNil:
-    await stream.teardownHandler(reset, stream.finalOutboundSequence)
+    await stream.teardownHandler(
+      reset or interruptedSubmission, stream.finalOutboundSequence
+    )
   if not stream.handlerTask.isNil:
     stream.handlerTask.cancelSoon()
 

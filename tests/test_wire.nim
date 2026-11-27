@@ -50,6 +50,21 @@ suite "MixTransport wire format":
       decoded.sequence == frame.sequence
       decoded.payload == frame.payload
 
+  test "a duplicate scalar sequence uses the last value on the wire":
+    let frame = MixTransportFrame(
+      version: MixTransportVersion,
+      sessionId: randomSessionId(),
+      kind: FrameKind.Data,
+      streamId: Opt.some(StreamId(1)),
+      sequence: Opt.some(SequenceNumber(4)),
+      payload: Opt.some(@[1'u8]),
+    )
+    var encoded = frame.encode().expect("could not encode Data")
+    # Field 5, wire type 5 (fixed32), followed by 5 in little-endian order.
+    encoded.add([0x2d'u8, 5, 0, 0, 0])
+    let decoded = MixTransportFrame.decode(encoded).expect("could not decode Data")
+    check decoded.sequence == Opt.some(SequenceNumber(5))
+
   test "fixed Data identifiers give every frame the same payload capacity":
     let
       sessionId = randomSessionId()

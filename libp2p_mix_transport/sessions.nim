@@ -56,6 +56,7 @@ type
     destination: Opt[PeerId]
     role: SessionRole
     state: SessionState
+    handlersAborted: bool
     established: AsyncEvent
     closedEvent: AsyncEvent
     remoteDisconnectRequested: bool
@@ -221,6 +222,12 @@ proc waitUntilClosed*(
 
 proc requestRemoteDisconnect*(session: TransportSession) =
   session.remoteDisconnectRequested = true
+
+func handlersAborted*(session: TransportSession): bool =
+  session.handlersAborted
+
+proc markHandlersAborted*(session: TransportSession) =
+  session.handlersAborted = true
 
 proc receiveRemoteReset*(session: TransportSession) =
   for stream in session.streams.values:
@@ -696,7 +703,9 @@ proc takeStreams*(session: TransportSession): seq[TransportStream] =
     result.add(stream)
   session.streams.clear()
 
-proc shutdown*(session: TransportSession): Future[void] {.async: (raises: []).} =
+proc shutdown*(
+    session: TransportSession, waitForHandlers = true
+): Future[void] {.async: (raises: []).} =
   session.state = SessionState.Closed
   session.established.fire()
   session.replyCapacityStateChanged.fire()
@@ -709,7 +718,7 @@ proc shutdown*(session: TransportSession): Future[void] {.async: (raises: []).} 
   var shutdownTasks = newSeqOfCap[Future[void].Raising([])](streams.len)
   for stream in streams:
     stream.suppressRemoteTeardown()
-    shutdownTasks.add(stream.shutdown())
+    shutdownTasks.add(stream.shutdown(waitForHandlers))
   await noCancel shutdownTasks.allFutures()
   session.closedEvent.fire()
 
