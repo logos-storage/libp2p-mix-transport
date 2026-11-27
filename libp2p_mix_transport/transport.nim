@@ -19,6 +19,7 @@ logScope:
 const
   DefaultConnectTimeout* = 30.seconds
   DefaultStreamOpenTimeout* = 30.seconds
+  DefaultStreamCloseTimeout* = 2.minutes
   DefaultDataRetransmissionTimeout* = 30.seconds
   DefaultSurbSupplyRetransmissionTimeout* = 30.seconds
   DefaultReverseActivityTimeout* = 2.minutes
@@ -57,6 +58,7 @@ type
     publishedSessionIds: HashSet[PeerId]
     connectTimeout: Duration
     streamOpenTimeout: Duration
+    streamCloseTimeout: Duration
     connectAttempts: ConnectAttemptCoordinator[PeerId, TransportSession]
     dataRetransmissionTimeout: Duration
     surbSupplyRetransmissionTimeout: Duration
@@ -133,7 +135,10 @@ proc runProtocolHandler(
   defer:
     stream.clearHandlerTask()
     await noCancel stream.close()
-    await noCancel stream.cancelAndWaitForStreamTasks()
+    # Remote completion has already cancelled stream work. That work may
+    # itself be shutting down the session and waiting for this handler.
+    if not stream.remoteReadEnded:
+      await noCancel stream.cancelAndWaitForStreamTasks()
     protocol.releaseIncoming(stream.peerId)
     discard session.removeStream(stream.streamId)
 
@@ -163,6 +168,10 @@ proc applySurbSupplySnapshot(
 proc handleOpenStream(
   self: MixTransport, frame: MixTransportFrame
 ): Future[void] {.async: (raises: [CancelledError]).}
+
+proc startCloseTimer(
+  self: MixTransport, session: TransportSession, stream: TransportStream
+) {.gcsafe.}
 
 proc handleReplyFrame(
     self: MixTransport, frame: MixTransportFrame
@@ -204,6 +213,7 @@ proc handleReplyFrame(
       return
     if frame.kind == FrameKind.StreamAck:
       stream.establish()
+      self.startCloseTimer(session, stream)
     else:
       let rejectionReason = frame.rejectionReason.get("")
       stream.reject(
@@ -364,9 +374,7 @@ proc writeStream(
       sequence: Opt.some(reservedSequence),
       payload: Opt.some(move(chunk)),
     )
-    (await self.sendStreamFrame(session, frame)).isOkOr:
-      stream.cancelOutbound(reservedSequence)
-      raise newException(LPStreamError, error)
+    await stream.submitOutbound(reservedSequence, self.sendStreamFrame(session, frame))
     if self.dataRetransmissionsEnabled:
       stream.scheduleOutboundRetransmission(
         reservedSequence, self.dataRetransmissionTimeout
@@ -383,17 +391,36 @@ proc finishRemoteStream(
     self: MixTransport, session: TransportSession, stream: TransportStream
 ): Future[void] {.async: (raises: []).} =
   stream.suppressRemoteTeardown()
+  if stream.remoteReadEnded:
+    # Let the handler observe the terminal read. Session shutdown still owns
+    # a handler that remains alive after its stream leaves the session.
+    session.retainClosingHandler(stream.takeHandlerTask())
   discard session.removeStream(stream.streamId)
   await stream.close()
   if session.remoteDisconnectRequested and session.streamCount == 0:
     await noCancel self.finishRemoteSession(session)
+
+proc startCloseTimer(
+    self: MixTransport, session: TransportSession, stream: TransportStream
+) =
+  if not stream.missingRemoteData:
+    return
+
+  proc expire() {.async: (raises: [CancelledError]).} =
+    await sleepAsync(self.streamCloseTimeout)
+    # A chunk blocked on application backpressure is already in the bitmap.
+    if not stream.closed and stream.missingRemoteData:
+      stream.markIncompleteRemoteClose()
+      await noCancel self.finishRemoteStream(session, stream)
+
+  stream.trackStreamTask(expire())
 
 proc runInboundDelivery(
     self: MixTransport, session: TransportSession, stream: TransportStream
 ) {.async: (raises: [CancelledError]).} =
   while not stream.closed:
     stream.clearInboundDataAvailable()
-    while true:
+    while not stream.remoteCloseReady:
       var inbound = stream.takeNextInbound().valueOr:
         break
       try:
@@ -401,9 +428,10 @@ proc runInboundDelivery(
       except LPStreamError:
         return
       stream.advanceReceiveWindow(inbound.sequence)
-      if stream.remoteCloseReady:
-        await noCancel self.finishRemoteStream(session, stream)
-        return
+    if stream.remoteCloseReady:
+      stream.markGracefulRemoteClose()
+      await noCancel self.finishRemoteStream(session, stream)
+      return
     await stream.waitForInboundData()
 
 proc runAcknowledgements(
@@ -557,12 +585,13 @@ proc handleTeardownFrame(
       stream.receiveRemoteReset()
       await noCancel self.finishRemoteStream(session, stream)
       return
-    let ready = stream.receiveRemoteClose(frame.finalSequence.get()).valueOr:
+    let firstClose = not stream.hasRemoteClose
+    discard stream.receiveRemoteClose(frame.finalSequence.get()).valueOr:
       debug "Dropping invalid CloseStream frame",
         sessionId = frame.sessionId, streamId = frame.streamId.get(), error
       return
-    if ready:
-      await noCancel self.finishRemoteStream(session, stream)
+    if firstClose and stream.state == StreamState.Established:
+      self.startCloseTimer(session, stream)
   of FrameKind.Disconnect:
     session.requestRemoteDisconnect()
     if session.streamCount == 0:
@@ -782,7 +811,10 @@ proc handleOpenStream(
   # If the handler dies immediately, don't set it: the cleanup in
   # runProtocolHandler has already run, and will fail to clear it.
   if not handlerTask.finished:
-    stream.setHandlerTask(handlerTask)
+    if stream.remoteReadEnded:
+      session.retainClosingHandler(handlerTask)
+    else:
+      stream.setHandlerTask(handlerTask)
 
   keepStream = true
   keepReservation = true
@@ -879,12 +911,14 @@ proc newMixTransport*(
     surbReplenishmentLowWatermark = DefaultSurbReplenishmentLowWatermark,
     enableDataRetransmissions = true,
     recipientSurbCapacity = DefaultRecipientSurbCapacity,
+    streamCloseTimeout = DefaultStreamCloseTimeout,
 ): MixTransport =
   doAssert not mix.isNil, "MixProtocol must not be nil"
   doAssert not mix.keyRotationEnabled(),
     "Mix key rotation is not supported by this MixTransport version"
   doAssert connectTimeout > ZeroDuration, "connect timeout must be positive"
   doAssert streamOpenTimeout > ZeroDuration, "stream open timeout must be positive"
+  doAssert streamCloseTimeout > ZeroDuration, "stream close timeout must be positive"
   doAssert dataRetransmissionTimeout > ZeroDuration,
     "Data retransmission timeout must be positive"
   doAssert surbSupplyRetransmissionTimeout > ZeroDuration,
@@ -915,6 +949,7 @@ proc newMixTransport*(
     publishedSessionIds: initHashSet[PeerId](),
     connectTimeout: connectTimeout,
     streamOpenTimeout: streamOpenTimeout,
+    streamCloseTimeout: streamCloseTimeout,
     connectAttempts: newConnectAttemptCoordinator[PeerId, TransportSession](),
     dataRetransmissionTimeout: dataRetransmissionTimeout,
     surbSupplyRetransmissionTimeout: surbSupplyRetransmissionTimeout,

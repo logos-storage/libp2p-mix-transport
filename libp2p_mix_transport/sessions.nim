@@ -7,7 +7,7 @@ import std/[deques, tables]
 import chronicles, chronos
 import results
 import libp2p/peerid
-import libp2p/utils/opt
+import libp2p/utils/[future, opt]
 import libp2p_mix
 import ./streams
 from ./wire import
@@ -73,6 +73,7 @@ type
     nextSurbSupplySequence: Opt[SurbSupplySequence]
     pendingSurbSupply: Table[SurbSupplySequence, PendingSurbSupply]
     surbSupplyStateChanged: AsyncEvent
+    retiredHandlers: seq[Future[void].Raising([CancelledError])]
     surbSupplierTask: Future[void].Raising([CancelledError])
     nextSurbStatusProbeAt: Opt[Moment]
     unansweredSurbStatusProbes: int
@@ -696,6 +697,16 @@ proc takeStreams*(session: TransportSession): seq[TransportStream] =
     result.add(stream)
   session.streams.clear()
 
+proc retainClosingHandler*(
+    session: TransportSession, handler: Future[void].Raising([CancelledError])
+) =
+  if handler.isNil or handler.finished:
+    return
+  if session.state == SessionState.Closed:
+    handler.cancelSoon()
+  else:
+    session.retiredHandlers.trackFut(handler)
+
 proc shutdown*(session: TransportSession): Future[void] {.async: (raises: []).} =
   session.state = SessionState.Closed
   session.established.fire()
@@ -711,6 +722,8 @@ proc shutdown*(session: TransportSession): Future[void] {.async: (raises: []).} 
     stream.suppressRemoteTeardown()
     shutdownTasks.add(stream.shutdown())
   await noCancel shutdownTasks.allFutures()
+  await noCancel session.retiredHandlers.cancelAndWait()
+  session.retiredHandlers.setLen(0)
   session.closedEvent.fire()
 
 proc remove*(store: SessionStore, sessionId: PeerId): Opt[TransportSession] =

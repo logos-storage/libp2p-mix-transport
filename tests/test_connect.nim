@@ -34,7 +34,9 @@ import ./logging
 privateAccess(MixProtocol)
 privateAccess(MixTransport)
 
-proc createMixNodes(count: int, initiatorRing = Opt.none(MixKeyRing)): seq[MixProtocol] =
+proc createMixNodes(
+    count: int, initiatorRing = Opt.none(MixKeyRing)
+): seq[MixProtocol] =
   # Every node is a normal Mix relay. The first and last nodes will also run
   # MixTransport, while the middle nodes provide independent forward and
   # return paths for the actual handshake.
@@ -930,3 +932,282 @@ suite "connect behavior under multiple callers":
       stream.closed
     expect LPStreamResetError:
       discard waitFor pendingRead
+
+suite "MixTransport stream closure":
+  proc recipientEndpoint(): Future[(MixTransport, TransportSession)] {.async.} =
+    let
+      mix = createMixNodes(1)[0]
+      transport = newMixTransport(
+        mix, streamOpenTimeout = 200.milliseconds, streamCloseTimeout = 25.milliseconds
+      )
+      session = transport.sessions
+        .addRecipientSession(
+          PeerId.random(mix.rng).expect("could not generate session identifier")
+        )
+        .expect("could not add recipient session")
+    session.establish()
+    session.initializeSurbSupply().expect("could not initialize SURB supply")
+    session.addReceivedSurbs(newSeq[SURB](16)).expect("could not supply reply blocks")
+    transport.surbSender = proc(
+        surb: sink SURB, payload: sink seq[byte]
+    ): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
+      ok()
+    (await transport.start()).expect("could not start transport")
+    (transport, session)
+
+  proc deliver(
+      transport: MixTransport,
+      session: TransportSession,
+      kind: FrameKind,
+      finalSequence: SequenceNumber = 0,
+  ) {.async.} =
+    var frame = MixTransportFrame(
+      version: MixTransportVersion,
+      sessionId: session.sessionId,
+      kind: kind,
+      streamId: Opt.some(StreamId(2)),
+    )
+    if kind == FrameKind.CloseStream:
+      frame.finalSequence = Opt.some(finalSequence)
+    await transport.handleReplyFrame(frame)
+
+  for ackFirst in [false, true]:
+    test "dial returns an empty accepted stream, ack first = " & $ackFirst:
+      let (transport, session) = waitFor recipientEndpoint()
+      defer:
+        waitFor transport.stop()
+      let opening = transport.dial(session.sessionId, TestCodec)
+      if ackFirst:
+        waitFor transport.deliver(session, FrameKind.StreamAck)
+        waitFor transport.deliver(session, FrameKind.CloseStream)
+      else:
+        waitFor transport.deliver(session, FrameKind.CloseStream)
+        check not opening.finished
+        waitFor transport.deliver(session, FrameKind.StreamAck)
+      let stream = (waitFor opening.wait(1.seconds)).expect("opening should succeed")
+      var value: byte
+      check (waitFor stream.readOnce(addr value, 1).wait(1.seconds)) == 0
+      check session.streamCount == 0
+
+  test "a graceful close alone cannot resolve the pending open":
+    let (transport, session) = waitFor recipientEndpoint()
+    defer:
+      waitFor transport.stop()
+    let opening = transport.dial(session.sessionId, TestCodec)
+    waitFor transport.deliver(session, FrameKind.CloseStream)
+    check (waitFor opening.wait(1.seconds)).error ==
+      "MixTransport stream opening timed out"
+    check session.streamCount == 0
+
+  for refusal in [FrameKind.ResetStream, FrameKind.StreamReject]:
+    test "a pending close still permits opening failure via " & $refusal:
+      let (transport, session) = waitFor recipientEndpoint()
+      defer:
+        waitFor transport.stop()
+      let opening = transport.dial(session.sessionId, TestCodec)
+      waitFor transport.deliver(session, FrameKind.CloseStream)
+      waitFor transport.deliver(session, refusal)
+      let failure = waitFor opening.wait(1.seconds)
+      if refusal == FrameKind.ResetStream:
+        check failure.error == "MixTransport stream closed while opening"
+      else:
+        check failure.error == UnknownStreamRejectionReason
+      check session.streamCount == 0
+
+  test "Data arriving before acceptance leaves a gap through a pending close":
+    let (transport, session) = waitFor recipientEndpoint()
+    defer:
+      waitFor transport.stop()
+    let opening = transport.dial(session.sessionId, TestCodec)
+    waitFor transport.deliver(session, FrameKind.CloseStream, 1)
+    transport.handleData(
+      MixTransportFrame(
+        version: MixTransportVersion,
+        sessionId: session.sessionId,
+        kind: FrameKind.Data,
+        streamId: Opt.some(StreamId(2)),
+        sequence: Opt.some(SequenceNumber(1)),
+        payload: Opt.some(@[1'u8]),
+      )
+    )
+    waitFor sleepAsync(50.milliseconds)
+    check not opening.finished
+    waitFor transport.deliver(session, FrameKind.StreamAck)
+    let stream = (waitFor opening).expect("opening should succeed")
+    var value: byte
+    expect LPStreamIncompleteError:
+      discard waitFor stream.readOnce(addr value, 1).wait(1.seconds)
+
+  test "a persistent close gap wakes a blocked reader with an incomplete-stream error":
+    let (transport, session) = waitFor recipientEndpoint()
+    defer:
+      waitFor transport.stop()
+    let opening = transport.dial(session.sessionId, TestCodec)
+    waitFor transport.deliver(session, FrameKind.StreamAck)
+    let stream = (waitFor opening).expect("opening should succeed")
+    var value: byte
+    let reading = stream.readOnce(addr value, 1)
+    waitFor transport.deliver(session, FrameKind.CloseStream, 1)
+    expect LPStreamIncompleteError:
+      discard waitFor reading.wait(1.seconds)
+    expect LPStreamIncompleteError:
+      discard waitFor stream.readOnce(addr value, 1)
+    check session.streamCount == 0
+
+  test "a resolved close gap preserves all final bytes for a slow reader":
+    let (transport, session) = waitFor recipientEndpoint()
+    defer:
+      waitFor transport.stop()
+    let opening = transport.dial(session.sessionId, TestCodec)
+    waitFor transport.deliver(session, FrameKind.CloseStream, 2)
+    waitFor transport.deliver(session, FrameKind.StreamAck)
+    let stream = (waitFor opening).expect("opening should succeed")
+    check stream.receiveData(2, @[3'u8, 4]) == InboundDataDisposition.Accepted
+    check stream.receiveData(1, @[1'u8, 2]) == InboundDataDisposition.Accepted
+    waitFor sleepAsync(50.milliseconds)
+    var value: byte
+    for expected in 1'u8 .. 4:
+      check (waitFor stream.readOnce(addr value, 1).wait(1.seconds)) == 1
+      check value == expected
+    check (waitFor stream.readOnce(addr value, 1).wait(1.seconds)) == 0
+    waitFor stream.join().wait(1.seconds)
+    check session.streamCount == 0
+
+  test "graceful close releases the stream before the last buffered bytes are read":
+    let (transport, session) = waitFor recipientEndpoint()
+    defer:
+      waitFor transport.stop()
+    let opening = transport.dial(session.sessionId, TestCodec)
+    waitFor transport.deliver(session, FrameKind.StreamAck)
+    let stream = (waitFor opening).expect("opening should succeed")
+    check stream.receiveData(1, @[1'u8, 2]) == InboundDataDisposition.Accepted
+    waitFor transport.deliver(session, FrameKind.CloseStream, 1)
+    waitFor stream.join().wait(1.seconds)
+    check session.streamCount == 0
+    var value: byte
+    for expected in 1'u8 .. 2:
+      check (waitFor stream.readOnce(addr value, 1).wait(1.seconds)) == 1
+      check value == expected
+    check (waitFor stream.readOnce(addr value, 1).wait(1.seconds)) == 0
+
+  test "a close gap still expires while earlier chunks fill the application buffer":
+    let (transport, session) = waitFor recipientEndpoint()
+    defer:
+      waitFor transport.stop()
+    let opening = transport.dial(session.sessionId, TestCodec)
+    waitFor transport.deliver(session, FrameKind.StreamAck)
+    let stream = (waitFor opening).expect("opening should succeed")
+    check stream.receiveData(1, @[1'u8]) == InboundDataDisposition.Accepted
+    check stream.receiveData(2, @[2'u8]) == InboundDataDisposition.Accepted
+    waitFor transport.deliver(session, FrameKind.CloseStream, 3)
+    waitFor stream.join().wait(1.seconds)
+    var value: byte
+    expect LPStreamIncompleteError:
+      discard waitFor stream.readOnce(addr value, 1)
+    check session.streamCount == 0
+
+  test "a failed Data submission resets the stream and prevents an ordinary close":
+    let (transport, session) = waitFor recipientEndpoint()
+    defer:
+      waitFor transport.stop()
+    var submitted: set[FrameKind]
+    transport.surbSender = proc(
+        surb: sink SURB, payload: sink seq[byte]
+    ): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
+      let frame = MixTransportFrame.decode(payload).expect("could not decode frame")
+      submitted.incl(frame.kind)
+      if frame.kind == FrameKind.Data:
+        return err("test submission failure")
+      ok()
+    let opening = transport.dial(session.sessionId, TestCodec)
+    waitFor transport.deliver(session, FrameKind.StreamAck)
+    let stream = (waitFor opening).expect("opening should succeed")
+    expect LPStreamError:
+      waitFor stream.write(@[1'u8]).wait(1.seconds)
+    waitFor stream.close()
+    check:
+      stream.closed
+      stream.finalOutboundSequence == 1
+      stream.pendingOutboundCount == 0
+      session.streamCount == 0
+      FrameKind.Data in submitted
+      FrameKind.ResetStream in submitted
+      FrameKind.CloseStream notin submitted
+
+  test "closing a stream cancels an unresolved first submission and sends a reset":
+    proc run() {.async: (handleException: true).} =
+      let (transport, session) = await recipientEndpoint()
+      defer:
+        await transport.stop()
+      let blocked = newAsyncEvent()
+      var resets = 0
+      transport.surbSender = proc(
+          surb: sink SURB, payload: sink seq[byte]
+      ): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
+        let frame = MixTransportFrame.decode(payload).expect("could not decode frame")
+        case frame.kind
+        of FrameKind.Data:
+          await blocked.wait()
+        of FrameKind.ResetStream:
+          inc resets
+        else:
+          discard
+        ok()
+      let opening = transport.dial(session.sessionId, TestCodec)
+      await transport.deliver(session, FrameKind.StreamAck)
+      let stream = (await opening).expect("opening should succeed")
+      let writing = stream.write(@[1'u8])
+      check not writing.finished
+      await stream.close().wait(1.seconds)
+      expect LPStreamClosedError:
+        await writing.wait(1.seconds)
+      check resets == DefaultReplySurbRedundancy
+
+    waitFor run()
+
+  test "a handler can drain a retired stream until session shutdown":
+    proc run() {.async: (handleException: true).} =
+      let (transport, session) = await recipientEndpoint()
+      defer:
+        await transport.stop()
+      let
+        stream = session.addInboundStream(1, TestCodec).expect("could not add stream")
+        startReading = newAsyncEvent()
+        drained = newAsyncEvent()
+        idle = newAsyncEvent()
+      let consume: LPProtoHandler = proc(
+          conn: Stream, codec: string
+      ): Future[void] {.async: (raises: [CancelledError]).} =
+        await startReading.wait()
+        try:
+          var value: byte
+          doAssert (await conn.readOnce(addr value, 1)) == 1 and value == 7
+          doAssert (await conn.readOnce(addr value, 1)) == 0
+        except LPStreamError as exc:
+          raiseAssert exc.msg
+        drained.fire()
+        await idle.wait()
+      let protocol = LPProtocol.new(@[TestCodec], consume)
+      check protocol.reserveIncoming(session.peerId)
+      stream.establish()
+      transport.configureStream(session, stream)
+      let handler = runProtocolHandler(session, stream, protocol)
+      stream.setHandlerTask(handler)
+      check stream.receiveData(1, @[7'u8]) == InboundDataDisposition.Accepted
+      await transport.handleTeardownFrame(
+        MixTransportFrame(
+          version: MixTransportVersion,
+          sessionId: session.sessionId,
+          streamId: Opt.some(stream.streamId),
+          kind: FrameKind.CloseStream,
+          finalSequence: Opt.some(SequenceNumber(1)),
+        )
+      )
+      await stream.join().wait(1.seconds)
+      check session.streamCount == 0
+      startReading.fire()
+      await drained.wait().wait(1.seconds)
+      await transport.stop().wait(1.seconds)
+      check handler.cancelled
+
+    waitFor run()
