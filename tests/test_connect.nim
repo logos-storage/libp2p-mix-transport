@@ -1165,49 +1165,152 @@ suite "MixTransport stream closure":
 
     waitFor run()
 
-  test "a handler can drain a retired stream until session shutdown":
+  proc startInboundHandler(
+      transport: MixTransport, session: TransportSession, consume: LPProtoHandler
+  ): tuple[stream: TransportStream, task: Future[void].Raising([CancelledError])] =
+    let
+      stream = session.addInboundStream(1, TestCodec).expect("could not add stream")
+      protocol = LPProtocol.new(@[TestCodec], consume)
+    doAssert protocol.reserveIncoming(session.peerId)
+    stream.establish()
+    transport.configureStream(session, stream)
+    let task = transport.runProtocolHandler(session, stream, protocol)
+    stream.setHandlerTask(task)
+    (stream, task)
+
+  proc receiveTeardown(
+      transport: MixTransport, session: TransportSession, kind: FrameKind
+  ) {.async: (raises: [CancelledError]).} =
+    var frame = MixTransportFrame(
+      version: MixTransportVersion, sessionId: session.sessionId, kind: kind
+    )
+    if kind == FrameKind.CloseStream:
+      frame.streamId = Opt.some(StreamId(1))
+      frame.finalSequence = Opt.some(SequenceNumber(1))
+    await transport.handleTeardownFrame(frame)
+
+  proc readFinalChunk(conn: Stream) {.async: (raises: [CancelledError]).} =
+    var value: byte
+    try:
+      doAssert (await conn.readOnce(addr value, 1)) == 1 and value == 7
+      doAssert (await conn.readOnce(addr value, 1)) == 0
+    except LPStreamError as exc:
+      raiseAssert exc.msg
+
+  for disconnectFirst in [false, true]:
+    test "handler drains after remote Disconnect, disconnect first = " & $disconnectFirst:
+      proc run(disconnectFirst: bool) {.async: (handleException: true).} =
+        let (transport, session) = await recipientEndpoint()
+        defer:
+          await transport.stop()
+        let startReading = newAsyncEvent()
+        let drained = newAsyncEvent()
+        let keepRunning = newAsyncEvent()
+        let consume: LPProtoHandler = proc(
+            conn: Stream, codec: string
+        ) {.async: (raises: [CancelledError]).} =
+          await startReading.wait()
+          await readFinalChunk(conn)
+          drained.fire()
+          if disconnectFirst:
+            await keepRunning.wait()
+        let (stream, handler) = transport.startInboundHandler(session, consume)
+        check stream.receiveData(1, @[7'u8]) == InboundDataDisposition.Accepted
+        if disconnectFirst:
+          await transport.receiveTeardown(session, FrameKind.Disconnect)
+        await transport.receiveTeardown(session, FrameKind.CloseStream)
+        await stream.join().wait(1.seconds)
+        if not disconnectFirst:
+          await transport.receiveTeardown(session, FrameKind.Disconnect)
+        await session.waitUntilClosed().wait(1.seconds)
+        check transport.sessions.get(session.sessionId).isNone
+        check transport.closingHandlers.len == 1
+        startReading.fire()
+        await drained.wait().wait(1.seconds)
+        if disconnectFirst:
+          await transport.stop().wait(1.seconds)
+        await allFutures(handler).wait(1.seconds)
+        check handler.cancelled == disconnectFirst
+        check transport.closingHandlers.len == 0
+
+      waitFor run(disconnectFirst)
+
+  type HandlerTeardown = enum
+    DisconnectSession
+    ResetSession
+    StopTransport
+
+  for operation in HandlerTeardown:
+    test "a handler can tear down its own session after EOF via " & $operation:
+      proc run(operation: HandlerTeardown) {.async: (handleException: true).} =
+        let (transport, session) = await recipientEndpoint()
+        defer:
+          await transport.stop()
+        let returned = newAsyncEvent()
+        let consume: LPProtoHandler = proc(
+            conn: Stream, codec: string
+        ) {.async: (raises: [CancelledError]).} =
+          await readFinalChunk(conn)
+          case operation
+          of DisconnectSession:
+            (await noCancel transport.disconnect(session)).expect(
+              "could not disconnect"
+            )
+          of ResetSession:
+            await noCancel transport.resetSession(session)
+          of StopTransport:
+            await noCancel transport.stop()
+          returned.fire()
+        let (stream, handler) = transport.startInboundHandler(session, consume)
+        check stream.receiveData(1, @[7'u8]) == InboundDataDisposition.Accepted
+        await transport.receiveTeardown(session, FrameKind.CloseStream)
+        await returned.wait().wait(1.seconds)
+        await allFutures(handler).wait(1.seconds)
+        check session.state == SessionState.Closed
+        check transport.closingHandlers.len == 0
+
+      waitFor run(operation)
+
+  for operation in [ResetSession, StopTransport]:
+    test "an active handler can abort its own session via " & $operation:
+      proc run(operation: HandlerTeardown) {.async: (handleException: true).} =
+        let (transport, session) = await recipientEndpoint()
+        defer:
+          await transport.stop()
+        let start = newAsyncEvent()
+        let returned = newAsyncEvent()
+        let consume: LPProtoHandler = proc(
+            conn: Stream, codec: string
+        ) {.async: (raises: [CancelledError]).} =
+          await start.wait()
+          if operation == ResetSession:
+            await noCancel transport.resetSession(session)
+          else:
+            await noCancel transport.stop()
+          returned.fire()
+        let (stream, handler) = transport.startInboundHandler(session, consume)
+        start.fire()
+        await returned.wait().wait(1.seconds)
+        await allFutures(handler).wait(1.seconds)
+        check stream.closed
+        check session.state == SessionState.Closed
+
+      waitFor run(operation)
+
+  test "remote ResetSession aborts an active application handler":
     proc run() {.async: (handleException: true).} =
       let (transport, session) = await recipientEndpoint()
       defer:
         await transport.stop()
-      let
-        stream = session.addInboundStream(1, TestCodec).expect("could not add stream")
-        startReading = newAsyncEvent()
-        drained = newAsyncEvent()
-        idle = newAsyncEvent()
+      let gate = newAsyncEvent()
       let consume: LPProtoHandler = proc(
           conn: Stream, codec: string
-      ): Future[void] {.async: (raises: [CancelledError]).} =
-        await startReading.wait()
-        try:
-          var value: byte
-          doAssert (await conn.readOnce(addr value, 1)) == 1 and value == 7
-          doAssert (await conn.readOnce(addr value, 1)) == 0
-        except LPStreamError as exc:
-          raiseAssert exc.msg
-        drained.fire()
-        await idle.wait()
-      let protocol = LPProtocol.new(@[TestCodec], consume)
-      check protocol.reserveIncoming(session.peerId)
-      stream.establish()
-      transport.configureStream(session, stream)
-      let handler = runProtocolHandler(session, stream, protocol)
-      stream.setHandlerTask(handler)
-      check stream.receiveData(1, @[7'u8]) == InboundDataDisposition.Accepted
-      await transport.handleTeardownFrame(
-        MixTransportFrame(
-          version: MixTransportVersion,
-          sessionId: session.sessionId,
-          streamId: Opt.some(stream.streamId),
-          kind: FrameKind.CloseStream,
-          finalSequence: Opt.some(SequenceNumber(1)),
-        )
-      )
-      await stream.join().wait(1.seconds)
-      check session.streamCount == 0
-      startReading.fire()
-      await drained.wait().wait(1.seconds)
-      await transport.stop().wait(1.seconds)
+      ) {.async: (raises: [CancelledError]).} =
+        await gate.wait()
+      let (stream, handler) = transport.startInboundHandler(session, consume)
+      await transport.receiveTeardown(session, FrameKind.ResetSession).wait(1.seconds)
       check handler.cancelled
+      check stream.closed
+      check session.state == SessionState.Closed
 
     waitFor run()

@@ -7,7 +7,7 @@ import std/[deques, tables]
 import chronicles, chronos
 import results
 import libp2p/peerid
-import libp2p/utils/[future, opt]
+import libp2p/utils/opt
 import libp2p_mix
 import ./streams
 from ./wire import
@@ -56,6 +56,7 @@ type
     destination: Opt[PeerId]
     role: SessionRole
     state: SessionState
+    handlersAborted: bool
     established: AsyncEvent
     closedEvent: AsyncEvent
     remoteDisconnectRequested: bool
@@ -73,7 +74,6 @@ type
     nextSurbSupplySequence: Opt[SurbSupplySequence]
     pendingSurbSupply: Table[SurbSupplySequence, PendingSurbSupply]
     surbSupplyStateChanged: AsyncEvent
-    retiredHandlers: seq[Future[void].Raising([CancelledError])]
     surbSupplierTask: Future[void].Raising([CancelledError])
     nextSurbStatusProbeAt: Opt[Moment]
     unansweredSurbStatusProbes: int
@@ -222,6 +222,12 @@ proc waitUntilClosed*(
 
 proc requestRemoteDisconnect*(session: TransportSession) =
   session.remoteDisconnectRequested = true
+
+func handlersAborted*(session: TransportSession): bool =
+  session.handlersAborted
+
+proc markHandlersAborted*(session: TransportSession) =
+  session.handlersAborted = true
 
 proc receiveRemoteReset*(session: TransportSession) =
   for stream in session.streams.values:
@@ -697,17 +703,9 @@ proc takeStreams*(session: TransportSession): seq[TransportStream] =
     result.add(stream)
   session.streams.clear()
 
-proc retainClosingHandler*(
-    session: TransportSession, handler: Future[void].Raising([CancelledError])
-) =
-  if handler.isNil or handler.finished:
-    return
-  if session.state == SessionState.Closed:
-    handler.cancelSoon()
-  else:
-    session.retiredHandlers.trackFut(handler)
-
-proc shutdown*(session: TransportSession): Future[void] {.async: (raises: []).} =
+proc shutdown*(
+    session: TransportSession, waitForHandlers = true
+): Future[void] {.async: (raises: []).} =
   session.state = SessionState.Closed
   session.established.fire()
   session.replyCapacityStateChanged.fire()
@@ -720,10 +718,8 @@ proc shutdown*(session: TransportSession): Future[void] {.async: (raises: []).} 
   var shutdownTasks = newSeqOfCap[Future[void].Raising([])](streams.len)
   for stream in streams:
     stream.suppressRemoteTeardown()
-    shutdownTasks.add(stream.shutdown())
+    shutdownTasks.add(stream.shutdown(waitForHandlers))
   await noCancel shutdownTasks.allFutures()
-  await noCancel session.retiredHandlers.cancelAndWait()
-  session.retiredHandlers.setLen(0)
   session.closedEvent.fire()
 
 proc remove*(store: SessionStore, sessionId: PeerId): Opt[TransportSession] =

@@ -453,7 +453,9 @@ proc cancelAndWaitForStreamTasks*(
   await noCancel stream.streamTasks.cancelAndWait()
   stream.streamTasks.setLen(0)
 
-proc shutdown*(stream: TransportStream): Future[void] {.async: (raises: []).} =
+proc shutdown*(
+    stream: TransportStream, waitForHandler = true
+): Future[void] {.async: (raises: []).} =
   # Keep a local reference because a cancelled handler clears the field while
   # completing its own cleanup.
   trace "shutting down stream", sessionId = stream.sessionId, streamId = stream.streamId
@@ -461,7 +463,10 @@ proc shutdown*(stream: TransportStream): Future[void] {.async: (raises: []).} =
   await stream.close()
   await stream.cancelAndWaitForStreamTasks()
   if not handlerTask.isNil:
-    await noCancel handlerTask.cancelAndWait()
+    if waitForHandler:
+      await noCancel handlerTask.cancelAndWait()
+    else:
+      handlerTask.cancelSoon()
   stream.handlerTask = nil
 
 method write*(

@@ -48,12 +48,16 @@ type
     gcsafe, async: (raises: [CancelledError])
   .}
 
+  ClosingHandler =
+    tuple[session: TransportSession, task: Future[void].Raising([CancelledError])]
+
   MixTransport* = ref object
     mix: MixProtocol
     addressDestinations: Table[PeerId, MixPubInfo]
     surbSender: SurbSender
     replyCredentials: ReplyCredentialStore
     sessions: SessionStore
+    closingHandlers: Table[TransportStream, ClosingHandler]
     sessionEventHandlers: OrderedSet[SessionEventHandler]
     publishedSessionIds: HashSet[PeerId]
     connectTimeout: Duration
@@ -120,23 +124,46 @@ proc publishSessionEvent(
   if handlers.len > 0:
     checkFutures(await allFinished(handlers))
 
+proc retainClosingHandler(
+    self: MixTransport,
+    session: TransportSession,
+    stream: TransportStream,
+    task: Future[void].Raising([CancelledError]),
+) =
+  if not task.isNil and not task.finished:
+    self.closingHandlers[stream] = (session, task)
+    if not self.started or session.handlersAborted:
+      task.cancelSoon()
+
+proc cancelClosingHandlers(self: MixTransport, session: TransportSession = nil) =
+  # A handler may be calling stop or resetSession itself. Request cancellation
+  # without joining application code from its own teardown operation.
+  if not session.isNil:
+    session.markHandlersAborted()
+  for handler in self.closingHandlers.values:
+    if session.isNil or handler.session == session:
+      handler.task.cancelSoon()
+
 proc removeAndShutdownSession(
-    self: MixTransport, session: TransportSession
+    self: MixTransport, session: TransportSession, waitForHandlers = true
 ) {.async: (raises: [CancelledError]).} =
   self.addressDestinations.del(session.sessionId)
   discard self.sessions.remove(session.sessionId)
   discard self.replyCredentials.removeSession(session.sessionId)
-  await session.shutdown()
+  await session.shutdown(waitForHandlers)
   await self.publishSessionEvent(session, SessionEventKind.Closed)
 
 proc runProtocolHandler(
-    session: TransportSession, stream: TransportStream, protocol: LPProtocol
+    self: MixTransport,
+    session: TransportSession,
+    stream: TransportStream,
+    protocol: LPProtocol,
 ) {.async: (raises: [CancelledError]).} =
   defer:
+    self.closingHandlers.del(stream)
     stream.clearHandlerTask()
     await noCancel stream.close()
-    # Remote completion has already cancelled stream work. That work may
-    # itself be shutting down the session and waiting for this handler.
+    # Remote completion already cancelled the stream tasks.
     if not stream.remoteReadEnded:
       await noCancel stream.cancelAndWaitForStreamTasks()
     protocol.releaseIncoming(stream.peerId)
@@ -392,9 +419,8 @@ proc finishRemoteStream(
 ): Future[void] {.async: (raises: []).} =
   stream.suppressRemoteTeardown()
   if stream.remoteReadEnded:
-    # Let the handler observe the terminal read. Session shutdown still owns
-    # a handler that remains alive after its stream leaves the session.
-    session.retainClosingHandler(stream.takeHandlerTask())
+    # A graceful session Disconnect may follow before the application reads.
+    self.retainClosingHandler(session, stream, stream.takeHandlerTask())
   discard session.removeStream(stream.streamId)
   await stream.close()
   if session.remoteDisconnectRequested and session.streamCount == 0:
@@ -599,6 +625,7 @@ proc handleTeardownFrame(
   of FrameKind.ResetSession:
     session.receiveRemoteReset()
     await noCancel self.finishRemoteSession(session)
+    self.cancelClosingHandlers(session)
   else:
     discard
 
@@ -807,12 +834,17 @@ proc handleOpenStream(
   ):
     return
 
-  let handlerTask = runProtocolHandler(session, stream, protocol)
+  # The reply submission can outlive a reset or stop. A gracefully retired
+  # stream can still have readable bytes waiting for its protocol handler.
+  if not self.started or session.handlersAborted or
+      (stream.closed and not stream.remoteReadEnded):
+    return
+  let handlerTask = self.runProtocolHandler(session, stream, protocol)
   # If the handler dies immediately, don't set it: the cleanup in
   # runProtocolHandler has already run, and will fail to clear it.
   if not handlerTask.finished:
     if stream.remoteReadEnded:
-      session.retainClosingHandler(handlerTask)
+      self.retainClosingHandler(session, stream, handlerTask)
     else:
       stream.setHandlerTask(handlerTask)
 
@@ -1081,6 +1113,7 @@ proc runSurbSupplier(
           attempts = session.unansweredSurbStatusProbeCount
         session.clearSurbSupplierTask()
         await self.removeAndShutdownSession(session)
+        self.cancelClosingHandlers(session)
         return
       session.recordSurbStatusProbeAttempt(self.surbStatusProbeRetryInterval)
       await self.sendSurbStatusProbe(session)
@@ -1438,7 +1471,8 @@ proc resetSession*(
     kind: FrameKind.ResetSession,
   )
   discard await self.sendTeardownFrame(session, frame)
-  await self.removeAndShutdownSession(session)
+  await noCancel self.removeAndShutdownSession(session, waitForHandlers = false)
+  self.cancelClosingHandlers(session)
 
 proc start*(
     self: MixTransport
@@ -1474,6 +1508,7 @@ proc stop*(self: MixTransport): Future[void] {.async: (raises: [CancelledError])
 
   let sessions = self.sessions.takeSessions()
   for session in sessions:
+    session.markHandlersAborted()
     let frame = MixTransportFrame(
       version: MixTransportVersion,
       sessionId: session.sessionId,
@@ -1485,10 +1520,11 @@ proc stop*(self: MixTransport): Future[void] {.async: (raises: [CancelledError])
   self.mix.unregisterMixDeliveryHandler(MixTransportCodec)
   var shutdownTasks = newSeqOfCap[Future[void]](sessions.len)
   for session in sessions:
-    shutdownTasks.add(self.removeAndShutdownSession(session))
+    shutdownTasks.add(self.removeAndShutdownSession(session, waitForHandlers = false))
   if shutdownTasks.len > 0:
-    checkFutures(await allFinished(shutdownTasks))
+    checkFutures(await noCancel allFinished(shutdownTasks))
   self.replyCredentials.clear()
   self.started = false
+  self.cancelClosingHandlers()
 
 {.pop.}
