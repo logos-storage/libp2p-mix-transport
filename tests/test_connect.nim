@@ -20,23 +20,23 @@ import
   ]
 import libp2p_mix
 import libp2p_mix/pool
+import libp2p_mix/key_rotation
 import libp2p_mix/delay_strategy
 import libp2p_mix/serialization
 import libp2p_mix/curve25519
 import protobuf_serialization
 
 import libp2p_mix_transport
-import libp2p_mix_transport/connect_attempts
+import libp2p_mix_transport/[connect_attempts, reply_credentials]
 import libp2p_mix_transport/transport {.all.}
 
 import ./logging
 
 privateAccess(MixProtocol)
 privateAccess(MixTransport)
+privateAccess(PreparedReplySurbs)
 
-proc createMixNodes(
-    count: int, initiatorRing = Opt.none(MixKeyRing)
-): seq[MixProtocol] =
+proc createMixNodes(count: int, rotation = false): seq[MixProtocol] =
   # Every node is a normal Mix relay. The first and last nodes will also run
   # MixTransport, while the middle nodes provide independent forward and
   # return paths for the actual handshake.
@@ -44,7 +44,22 @@ proc createMixNodes(
     rng = newRng()
     nodeInfos = MixNodeInfo.generateRandomMany(count, rng)
 
-  for i, nodeInfo in nodeInfos:
+  for nodeInfo in nodeInfos:
+    let ring =
+      if rotation:
+        let config = KeyRotationConfig
+          .init(
+            rotationInterval = 2.seconds,
+            graceWindow = 6.seconds,
+            replacedRecordLifetime = ZeroDuration,
+            maxTransit = 500.milliseconds,
+          )
+          .expect("test rotation timings")
+        let value = MixKeyRing.new(config, rng, replayTableCapacity = 1024)
+        value.update()
+        Opt.some(value)
+      else:
+        Opt.none(MixKeyRing)
     let
       privateKey = PrivateKey(scheme: Secp256k1, skkey: nodeInfo.libp2pPrivKey)
       switch = SwitchBuilder
@@ -59,15 +74,31 @@ proc createMixNodes(
       mix = MixProtocol.new(
         nodeInfo,
         switch,
-        keyRing = (if i == 0: initiatorRing else: Opt.none(MixKeyRing)),
         # Cryptographic routing remains real, but deterministic zero delays
         # keep this transport test focused on delivery rather than timing.
         delayStrategy = Opt.some(DelayStrategy(NoSamplingDelayStrategy.new(rng))),
+        keyRing = ring,
       )
 
     mix.nodePool.add(nodeInfos.includeAllExcept(nodeInfo))
     switch.mount(mix)
     result.add(mix)
+
+  if rotation:
+    # Simulate prompt publication/discovery of each new record. This test does
+    # not implement or exercise DHT discovery.
+    let nodes = result
+    proc publishRotations(owner: MixProtocol) =
+      owner.keyRing.get().setKeyHandler(
+        proc(key: FieldElement) {.gcsafe, raises: [].} =
+          let info = owner.localMixPubInfo().expect("current rotating record")
+          for peer in nodes:
+            if peer != owner:
+              peer.nodePool.add(info)
+      )
+
+    for node in nodes:
+      publishRotations(node)
 
 proc testSurb(marker: byte): SURB =
   var key = newSeq[byte](k)
@@ -161,15 +192,18 @@ type ConnectionMode {.pure.} = enum
 proc establishSessionAndStream(
     interAckDelay: Opt[Duration] = Opt.none(Duration),
     mode: ConnectionMode = ConnectionMode.PeerIdConnect,
+    rotation = false,
 ): Future[RoundTripOutcome] {.async: (raises: [CancelledError, LPError]).} =
   let
-    nodes = createMixNodes(5)
+    nodes = createMixNodes(5, rotation)
     initiatorMix = nodes[0]
     recipientMix = nodes[^1]
     initiator = newMixTransport(
       initiatorMix,
       connectTimeout = TestOperationTimeout,
       streamOpenTimeout = TestOperationTimeout,
+      reverseActivityTimeout =
+        (if rotation: 1.seconds else: DefaultReverseActivityTimeout),
     )
     initiatorSessionEvents = newAsyncQueue[SessionEvent]()
     recipientSessionEvents = newAsyncQueue[SessionEvent]()
@@ -177,7 +211,22 @@ proc establishSessionAndStream(
       recipientMix,
       connectTimeout = TestOperationTimeout,
       streamOpenTimeout = TestOperationTimeout,
+      reverseActivityTimeout =
+        (if rotation: 1.seconds else: DefaultReverseActivityTimeout),
     )
+
+  var droppedStatusCopies = 0
+  if rotation:
+    initiator.surbStatusProbeRetryInterval = 500.milliseconds
+    let originalSender = recipient.surbSender
+    recipient.surbSender = proc(
+        surb: sink SURB, payload: sink seq[byte]
+    ): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
+      if MixTransportFrame.decode(payload).get().kind == FrameKind.SurbStatus and
+          droppedStatusCopies < DefaultReplySurbRedundancy:
+        inc droppedStatusCopies
+        return ok() # Lose the first complete status response in transit.
+      return await originalSender(move(surb), move(payload))
 
   if interAckDelay.isSome:
     recipient.delayAcknowledgementCopies(interAckDelay.get())
@@ -277,6 +326,14 @@ proc establishSessionAndStream(
     session = initiator.sessions.get(initiatorStream.sessionId).expect(
         "dial did not retain the session it created"
       )
+
+  if rotation:
+    let original = initiatorMix.localMixPubInfo().expect("initial key").mixPubKey
+    # Outlast replacement plus grace for the original key and all initial SURBs.
+    await sleepAsync(9.seconds)
+    doAssert initiatorMix.localMixPubInfo().expect("rotated key").mixPubKey != original
+    doAssert session.state == SessionState.Established
+    doAssert droppedStatusCopies == DefaultReplySurbRedundancy
 
   # Once the anonymous round trip has established the session, connecting to
   # the same destination reuses its stable pseudonym instead of sending another
@@ -409,13 +466,44 @@ proc establishSessionAndStream(
   )
 
 suite "MixTransport session and stream handshakes":
-  test "transport construction rejects Mix key rotation":
+  test "rotating reply SURBs require path deadlines from the relay pool":
     let
-      ring = MixKeyRing.new(KeyRotationConfig.init().get(), newRng(), 16)
-      mix = createMixNodes(1, Opt.some(ring))[0]
+      nodes = createMixNodes(5, rotation = true)
+      mix = nodes[0]
+      transport = newMixTransport(mix)
+      destination = nodes[^1].switch.peerInfo.peerId
+    defer:
+      transport.replyCredentials.clear()
+      for node in nodes:
+        waitFor node.keyRing.get().stop()
 
-    expect AssertionDefect:
-      discard newMixTransport(mix)
+    for hasDeadlines in [true, false]:
+      if not hasDeadlines:
+        # Inject an unaged pool to exercise the missing-deadline safeguard.
+        mix.relayPool = MixNodePool.new(mix.switch.peerStore)
+      var built = mix.createSurb(MixDestination.exitNode(destination))
+      require built.isOk
+      defer:
+        built.get().credential.wipe()
+      check:
+        built.get().dispatchBefore.isSome == hasDeadlines
+        built.get().credentialsExpireAt.isSome == hasDeadlines
+        built.get().replyHoldTime.isSome
+        built.get().replyTransitAllowance.isSome
+      let prepared = transport.createReplySurbs(destination, destination, 1)
+      if hasDeadlines:
+        require prepared.isOk
+        let encoded = prepared.get().encoded[0]
+        let budget = transport.replyCredentials.holdingBudgetMillis(encoded)
+        check budget > 0 and
+          budget <= uint64(built.get().replyHoldTime.get().milliseconds)
+        check transport.replyCredentials.len == 1
+        transport.replyCredentials.clear()
+      else:
+        require prepared.isErr
+        check:
+          prepared.error == "Mix key rotation requires reply-path record deadlines"
+          transport.replyCredentials.len == 0
 
   test "recipient reuses its anonymous session and opens bidirectional streams":
     proc run() {.async.} =
@@ -623,6 +711,7 @@ suite "MixTransport session and stream handshakes":
         @[0'u8],
         testSurb(2).serializeSurb().expect("valid test SURB"),
       ],
+      surbHoldMillis: @[1000'u64, 1000'u64, 1000'u64],
     )
 
     # Invoke the same delivery callback that Mix uses for proactive supply.
@@ -932,6 +1021,66 @@ suite "connect behavior under multiple callers":
       stream.closed
     expect LPStreamResetError:
       discard waitFor pendingRead
+
+  test "an idle session replenishes reply paths across rotation and grace expiry":
+    let outcome = waitFor establishSessionAndStream(rotation = true)
+    check:
+      outcome.receivedRequest == TestRequest.toBytes()
+      outcome.receivedResponse == TestResponse.toBytes()
+
+  test "idle maintenance retires credentials without waiting for another packet":
+    proc run() {.async.} =
+      let mix = createMixNodes(5)[0]
+      let transport = newMixTransport(mix)
+      (await transport.start()).expect("start")
+      defer:
+        await transport.stop()
+      var built = mix.createSurb(MixDestination.exitNode(mix.nodePool.peerIds()[0]))
+      doAssert built.isOk
+      let
+        sessionId = PeerId.random(newRng()).expect("session id")
+        id = built.get().credential.identifier
+        encoded = built.get().surb.serializeSurb().expect("reply block")
+      built.get().credentialsExpireAt = Opt.some(Moment.now() + 20.milliseconds)
+      var credentials = [move(built.get().credential)]
+      transport.replyCredentials.add(sessionId, credentials).expect("store")
+      transport.replyCredentials.setSurbBounds(id, built.get(), encoded)
+      transport.expiryChanged.fire()
+      await sleepAsync(100.milliseconds)
+      doAssert transport.replyCredentials.len == 0
+
+    waitFor run()
+
+  test "lost discovery updates close the idle session after bounded probes":
+    proc run() {.async.} =
+      let nodes = createMixNodes(5, rotation = true)
+      let initiator = newMixTransport(
+        nodes[0],
+        reverseActivityTimeout = 1.seconds,
+        surbStatusProbeRetryInterval = 200.milliseconds,
+        maxSurbStatusProbeAttempts = 3,
+      )
+      let recipient = newMixTransport(nodes[^1])
+      for node in nodes:
+        await node.switch.start()
+        await node.start()
+      defer:
+        await initiator.stop()
+        await recipient.stop()
+        for node in nodes:
+          await node.stop()
+          await node.switch.stop()
+      (await initiator.start()).expect("initiator")
+      (await recipient.start()).expect("recipient")
+      let session =
+        (await initiator.connect(nodes[^1].switch.peerInfo.peerId)).expect("connect")
+      for node in nodes:
+        node.keyRing.get().setKeyHandler(nil)
+      await sleepAsync(5.seconds)
+      doAssert session.state == SessionState.Closed
+      doAssert initiator.sessions.get(session.sessionId).isNone
+
+    waitFor run()
 
 suite "MixTransport stream closure":
   proc recipientEndpoint(): Future[(MixTransport, TransportSession)] {.async.} =
